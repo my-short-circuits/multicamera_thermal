@@ -1,10 +1,26 @@
 # Multicamera Thermal
 
-DIY ESP32-S3 visible-plus-thermal camera built around an OV3660 (or OV2640) parallel-DVP camera, a Melexis MLX90640 thermal array, and a 3.5-inch ILI9488 touch display.
+A handheld DIY thermal-imaging camera. Point it at something and a 3.5-inch touchscreen shows you where the heat is — overlaid on a regular camera view, or on its own as a pure heat map. Tap to tune the colour range, slide to line up the two cameras, press the side button to freeze a frame and pull it off the device over WiFi from any phone or laptop.
 
-The firmware renders a live RGB camera feed, a thermal-only view, or an additive thermal overlay, with on-screen touch controls for alignment, palette range, zoom, tint, and camera brightness. A physical button freezes the current frame and temporarily opens a WiFi access point so the frozen overlay, camera image, thermal image, and thermal CSV can be saved from a phone or computer.
+## What you can do with it
+
+- **Find heat leaks** around windows, doors, attic hatches, and behind drywall.
+- **Debug electronics** by spotting the component running too hot before it lets out the magic smoke.
+- **See in the dark** — people, pets, or anything warm against a cooler background.
+- **Watch temperature change in real time** — cooking food, kettles, engines, brake discs, soldering irons.
+- **Save what you see**: short-press the button and the device freezes the frame and exposes it as `camera.bmp`, `thermal.bmp`, `overlay.bmp`, and `thermal.csv` (raw 32x24 grid, deg C) over a temporary WiFi hotspot. Open `http://192.168.4.1` from your phone to download. WiFi turns off again as soon as you unfreeze.
+
+## How it works (short version)
+
+A Melexis MLX90640 thermal sensor (32x24 pixels, ~55x35 deg FOV) gives the heat map. An OV3660 visible camera (OV2640 also supported, auto-detected) gives the regular picture behind it. An ESP32-S3 microcontroller handles real-time alignment, colour mapping, the touch UI, and the WiFi share server. Everything runs on the device — no app, no cloud, no internet required.
+
+## What it isn't
+
+A hobby build, not a calibrated instrument. The thermal sensor has 768 pixels total, which is the hard ceiling on how fine a detail you can resolve — don't expect to see individual veins in your hand or a fine solder joint. It is not safety-rated and does not give medical-grade temperature readings. The advertised numbers are useful for relative comparison ("this transistor is much hotter than that one") more than for absolute measurement.
 
 No photos are included in this repository.
+
+---
 
 ## Hardware
 
