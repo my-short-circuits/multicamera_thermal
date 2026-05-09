@@ -250,16 +250,7 @@ Local-only artifacts excluded by `.gitignore`: editor and tooling state (`.vscod
 
 ## Notes and Limitations
 
-- This is not a calibrated medical or safety instrument.
+
 - Manual alignment depends on the camera lens, MLX90640 variant, and physical mounting. Reset is intentionally gated behind the ADJ lock so the alignment doesn't reset when you grab the device.
 - The WiFi export AP is open while freeze mode is active. There is no password, on purpose, because the AP is short-lived.
-- Battery display is hidden unless `BATTERY_ADC_PIN` is wired to an ADC GPIO and the divider is sized for the cell.
-- The MLX cell pitch maps to about 1.7 deg per cell horizontally — anything sub-cell-width (a thin pen, the gap between two fingers) will be averaged into its neighbours by the sensor itself before any firmware filter touches it. There is no firmware fix for that; it is the inherent resolution.
-- Photos are intentionally not part of the initial repository.
-
-## Acknowledgements
-
-- Melexis for the [MLX90640 driver](https://github.com/melexis/mlx90640-library) (Apache 2.0).
-- [LovyanGFX](https://github.com/lovyan03/LovyanGFX) for the display and DMA infrastructure.
-- DFRobot for the AXP313A driver and the FireBeetle 2 / Fermion display reference designs.
-- Espressif for the ESP32-S3 Arduino core and the [esp32-camera](https://github.com/espressif/esp32-camera) DVP driver.
+- Battery display is hidden unless `BATTERY_ADC_PIN` is wired to an ADC GPIO and the divider is sized for the cell
