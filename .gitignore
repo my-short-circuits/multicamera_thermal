@@ -1,0 +1,26 @@
+# Local/editor state
+.claude/
+.sixth/
+.vscode/
+.idea/
+
+# Arduino/ESP32 build output
+build/
+out/
+.pio/
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+*.partitions.bin
+*.bootloader.bin
+
+# Local debug artifacts not required to build the sketch
+debug.cfg
+debug_custom.json
+esp32.svd
+
+# OS cruft
+Thumbs.db
+Desktop.ini
