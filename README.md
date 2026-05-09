@@ -109,21 +109,8 @@ The GT911 UI provides:
 - **Top bar**: mode and range cycle buttons.
 - **Bottom bar**: 5-step camera brightness control (-2..+2). Brightness is applied via the OV2640/OV3660 hardware register over SCCB, so it costs zero CPU per pixel — one I2C write when the value changes and the sensor's analogue front-end does the rest.
 
-Settings persist in NVS via `Preferences` after a debounce period. Keys include `mlo` / `mhi` (manual range), `ptab` (last side-panel tab), `mode`, `rng`, alignment, etc.
-
-### Thermal processing pipeline
-
- In order:
-
-1. **MLX hardware**: chess-pattern subpages, 19-bit ADC resolution, refresh-rate code 0x05 (16 Hz subpage rate, ~8 complete frames/s).
-2. **Fast subpage read** (`readMLXFrameDataFast`): bypasses the Melexis retry-on-new-subpage-arrival and accepts the read as-is. The retry is what keeps the stock library coherent at low refresh, but at higher rates it can burn most of the frame budget chasing newer data.
-3. **Subpage publish gate**: a complete frame is only published once *both* chess subpages have been collected since the last publish (`mlx_subpage_mask`). Render code reads from `mlx_temps_full`, a separate buffer that is only updated at this gate. This is what keeps the chess interleave invisible at the data level.
-4. **Bad/dead pixel repair**: two unit-specific cells get neighbour-averaged, then a generic L→R sweep replaces any out-of-range or NaN cell with its previous valid neighbour.
-5. **Adaptive temporal IIR**: per-cell IIR with a low alpha for small frame-to-frame deltas (smoothing) and a high alpha for large deltas (motion catches up immediately). Default alphas: 0.45 still, 0.85 fast, 0.40 deg C delta crossover.
-6. **Edge-aware spatial pass**: 4-neighbour weighted average that only includes neighbours within `MLX_SPATIAL_EDGE_C` of the centre cell. Default `0.0` disables it; raise toward 0.20 if cell-block noise becomes objectionable.
-7. **Auto-range computation**: percentile-clipped (5/5%) min/max with the optional AUT2 subject filter applied on top, plus an asymmetric IIR that expands fast (so a hand entering frame is captured immediately) and shrinks slowly (so a hand briefly leaving frame doesn't crush the palette).
-8. **Palette-frame snapshot**: per-cell temperatures map to palette indices in a separate `therm_idx[]` byte array. Bilinear interpolation is then done over these byte indices, not over RGB triples — three bilinear lookups per pixel become one.
-9. **Render**: per-pixel byte-pre-swapped RGB565 written into a 16-row chunk buffer, then pushed to the LCD with `lcd.setSwapBytes(false)` so LovyanGFX uses the DMA fast path with no internal byte-swap copy.
+Settings persist in NVS via `Preferences` after a debounce period. 
+ 
 
 ### Freeze and WiFi export
 
@@ -140,19 +127,7 @@ When the frame is frozen:
   - `camera.bmp` — visible camera frame.
   - `thermal.csv` — 32x24 raw thermal grid in degrees Celsius.
 
-When the frame is unfrozen:
 
-- HTTP server stops.
-- Captive DNS stops.
-- Soft-AP disconnects.
-- WiFi peripheral is turned off.
-- The frozen-frame PSRAM buffer is freed.
-
-The AP is intentionally temporary and open. Use it only while saving a frame.
-
-### SD card status
-
-The repository contains historical SD-card bring-up and BMP-writing code (bit-banged CMD0 idle, two-phase mount via `esp_vfs_fat_sdspi_mount`, etc.), but the SD path is disabled in `setup()`. I couldn't get it to work
 
 ## Build Requirements
 
