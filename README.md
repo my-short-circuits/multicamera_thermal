@@ -71,30 +71,6 @@ XCLK is intentionally 16 MHz rather than 24 MHz: it gives the camera enough head
 
 The MLX90640 runs on `Wire1` at 1 MHz so its high-bandwidth bursts never stall the shared `Wire` bus. The included `MLX90640_I2C_Driver.cpp` is patched: every `Wire.` reference has been changed to `Wire1.`.
 
-### Power and miscellaneous
-
-The AXP313A enables camera power; no special wiring beyond the bundled DFRobot board. A battery-voltage indicator is plumbed but disabled by default — set `BATTERY_ADC_PIN` to a wired ADC GPIO to enable it.
-
-## Init order
-
-The init order in `setup()` is load-bearing. Do not reorder casually:
-
-1. `SD_CS` (GPIO9) parked HIGH before any SPI traffic, even with SD disabled.
-2. `Wire.begin(1, 2)` at 100 kHz — shared bus for AXP / GT911 / SCCB.
-3. AXP313A enable camera power, then a 500 ms settling delay.
-4. `esp_camera_init()` BEFORE `lcd.init()`. LovyanGFX touches `Wire` internals during display init and the camera SCCB needs a clean bus first.
-5. GT911 manual reset pulse: INT held low for 11 ms, then released to input, then 50 ms wait. This selects the 0x5D I2C address.
-6. `lcd.init()` and rotation 1.
-7. `Wire1.begin(11, 14)` at 1 MHz, MLX90640 init.
-
-## Display and panel layout
-
-The 480x320 panel is laid out in landscape with rotation 1:
-
-- Live image area (camera or thermal): 320x240 at panel coords `(24, 40)`.
-- Side colour-scale and temperature labels: left of the image area.
-- Right side panel from x=348: mode/range/tab buttons, contextual sliders, ADJ lock, RST.
-- Bottom bar: brightness, top-bar info (centre temp, FPS, range, mode badge).
 
 ## Firmware Features
 
@@ -137,7 +113,7 @@ Settings persist in NVS via `Preferences` after a debounce period. Keys include 
 
 ### Thermal processing pipeline
 
-The MLX90640 path is intentionally tuned to preserve small skin-temperature features such as fingers. In order:
+ In order:
 
 1. **MLX hardware**: chess-pattern subpages, 19-bit ADC resolution, refresh-rate code 0x05 (16 Hz subpage rate, ~8 complete frames/s).
 2. **Fast subpage read** (`readMLXFrameDataFast`): bypasses the Melexis retry-on-new-subpage-arrival and accepts the read as-is. The retry is what keeps the stock library coherent at low refresh, but at higher rates it can burn most of the frame budget chasing newer data.
@@ -176,18 +152,11 @@ The AP is intentionally temporary and open. Use it only while saving a frame.
 
 ### SD card status
 
-The repository contains historical SD-card bring-up and BMP-writing code (bit-banged CMD0 idle, two-phase mount via `esp_vfs_fat_sdspi_mount`, etc.), but the SD path is disabled in `setup()`. On this hardware the ILI9488 panel keeps driving MISO even when its CS is high, which contends with the SD card's MISO line and can blank the LCD when the card is hot-plugged. The freeze/WiFi server is the practical save path on this panel; SD requires a hardware fix (cut the GDI ribbon's MISO trace and treat the LCD as write-only, add a Schottky diode + pullup, etc.) that is out of scope for this firmware.
+The repository contains historical SD-card bring-up and BMP-writing code (bit-banged CMD0 idle, two-phase mount via `esp_vfs_fat_sdspi_mount`, etc.), but the SD path is disabled in `setup()`. I couldn't get it to work
 
 ## Build Requirements
 
-Tested with:
-
-- Arduino CLI (Arduino IDE 2.x).
-- ESP32 Arduino core 2.0.11.
-- Board FQBN: `esp32:esp32:dfrobot_firebeetle2_esp32s3`.
-- LovyanGFX 1.2.20.
-- DFRobot_AXP313A 1.0.0.
-- ESP32 bundled `WiFi`, `WebServer`, `DNSServer`, `Wire`, `SPI`, `Preferences`, `FS`.
+make sure you get this: DFRobot_AXP313A 1.0.1 and all the other libraries listed.
 
 The Melexis MLX90640 API sources needed by the sketch are included in this repository:
 
@@ -206,47 +175,7 @@ The Melexis MLX90640 API sources needed by the sketch are included in this repos
 | Partition Scheme | 16M Flash (3MB APP / 9.9MB FATFS) |
 | PSRAM | OPI PSRAM |
 
-### Build via Arduino IDE
 
-1. Install the ESP32 boards package (Arduino IDE → Boards Manager → "esp32" by Espressif Systems → 2.0.11).
-2. Install LovyanGFX (1.2.20) and DFRobot_AXP313A (1.0.0) via Library Manager.
-3. Clone this repository into your Arduino sketches folder so the directory name matches the `.ino` file name (`multicamera_thermal/`).
-4. Apply the board settings above (Tools menu).
-5. Verify, then upload.
-
-### Build via Arduino CLI
-
-```bash
-arduino-cli compile \
-  -b esp32:esp32:dfrobot_firebeetle2_esp32s3:CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
-  --warnings all .
-```
-
-## Performance and tuning notes
-
-The renderer is set up for an ESP32-S3 at 240 MHz pushing a 320x240 image to a 16-bit SPI display. Several knobs are tuned for that target:
-
-- **Chunked LCD push** with `CHUNK_H = 16` rows per `pushImage()`. Smaller chunks pay the per-call SPI/DMA setup overhead repeatedly; larger chunks (e.g. 32) leave the LovyanGFX byte-swap path and force a CPU-side staging copy. 16 rows is the local sweet spot.
-- **Pre-swapped RGB565** in the chunk buffer plus `lcd.setSwapBytes(false)` so the buffer can go straight to DMA.
-- **Bilinear over byte indices**, not over R/G/B independently — single byte lookup per pixel for the palette-mapped output.
-- **`fb_count = 3` and `CAMERA_GRAB_LATEST`** keeps the camera DMA from ever waiting on the LCD push.
-- **MLX on a dedicated `Wire1` at 1 MHz** so its bursty I2C reads do not stall the shared bus during render.
-
-If you fork this and the render gets slow, the highest-impact tuning targets in order are usually:
-1. SPI write clock (`TFT_WRITE_FREQ_HZ`) — every doubling roughly halves the LCD push time.
-2. `CHUNK_H` — the per-call overhead is a few hundred microseconds, and that adds up if you go below 8.
-3. The temporal/spatial filter alphas in the thermal pipeline — pure compute, scales with refresh rate.
-
-## Repository Contents
-
-Required source files:
-
-- `multicamera_thermal.ino` — main firmware, UI, rendering, freeze/share server, acquisition pipeline.
-- `MLX90640_API.cpp`, `MLX90640_API.h` — Melexis thermal calculation API.
-- `MLX90640_I2C_Driver.cpp`, `MLX90640_I2C_Driver.h` — I2C access layer patched for the dedicated `Wire1` MLX bus.
-- `README.md` — this document.
-
-Local-only artifacts excluded by `.gitignore`: editor and tooling state (`.vscode/`, `.idea/`, `.claude/`, `.sixth/`), Arduino build output (`build/`, `.pio/`, `*.bin`, `*.elf`, `*.map`, `*.partitions.bin`, `*.bootloader.bin`), local debug configs (`debug.cfg`, `debug_custom.json`, `esp32.svd`), and OS cruft (`Thumbs.db`, `Desktop.ini`).
 
 ## Notes and Limitations
 
