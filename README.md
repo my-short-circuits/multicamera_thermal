@@ -18,8 +18,6 @@ A Melexis MLX90640 thermal sensor (32x24 pixels, ~55x35 deg FOV) gives the heat 
 
 A hobby build, not a calibrated instrument. The thermal sensor has 768 pixels total, which is the hard ceiling on how fine a detail you can resolve — don't expect to see individual veins in your hand or a fine solder joint. It is not safety-rated and does not give medical-grade temperature readings. The advertised numbers are useful for relative comparison ("this transistor is much hotter than that one") more than for absolute measurement.
 
-No photos are included in this repository.
-
 ---
 
 ## Hardware
@@ -32,7 +30,6 @@ The sketch is configured for this hardware stack:
 | DFRobot Fermion 3.5-inch display (DFR0669 class) | LCD and touch UI | 480x320 ILI9488 SPI display with GT911 capacitive touch. Bundled GDI ribbon. |
 | OV3660 (tested) or OV2640 (auto-detected via PID) | Visible camera | Captured as 320x240 RGB565 into PSRAM. The OV3660 is mounted with `vflip=1` because it is upside-down relative to the OV2640 it replaced; sensor type is detected at runtime in `initCamera()`. |
 | Melexis MLX90640 (32x24, ~55x35 deg FOV) | Thermal sensor | Standard FOV variant assumed. Runs on a dedicated `Wire1` bus at 1 MHz. |
-| DFRobot AXP313A | Camera power management | Initialized before camera bring-up. |
 | Momentary pushbutton | Freeze / share control | Normally-open between GPIO10 and GND, using `INPUT_PULLUP`. Short press toggles freeze + WiFi share. |
 | Optional SD card | Currently disabled | Historical SD bring-up code is retained but commented out — the freeze/WiFi server is the active save path. See "SD card status" below. |
 
