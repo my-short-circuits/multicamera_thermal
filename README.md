@@ -128,7 +128,41 @@ When the frame is frozen:
   - `thermal.csv` — 32x24 raw thermal grid in degrees Celsius.
 
 
+When the frame is unfrozen:
 
+- HTTP server stops.
+- Captive DNS stops.
+- Soft-AP disconnects.
+- WiFi peripheral is turned off.
+- The frozen-frame PSRAM buffer is freed.
+
+The AP is intentionally temporary and open. Use it only while saving a frame.
+
+### Browser video portal
+
+Holding the physical button for about 3 seconds starts a live browser portal.
+The LCD stops drawing the live thermal/camera image and shows only connection
+details while the sensors keep running. Connect to the `ThermalCam-XXXX` access
+point and open `http://192.168.4.1/`.
+
+The portal fetches the camera and thermal data separately:
+
+- `/cam.jpg` - latest 320x240 camera frame as JPEG.
+- `/thermal.bin` - latest processed 32x24 thermal grid as signed int16
+  centi-degrees Celsius, little-endian.
+- `/api/state` - live temperatures, FPS, controls, and diagnostics as JSON.
+- `/api/control` - browser control updates for range, parallax, zoom, tint,
+  manual LO/HI, camera brightness, HUD, crosshair, reset, and stop.
+
+The browser performs the display composition. You can switch between overlay,
+camera-only, and thermal-only views without changing the sensor pipeline. Video
+recording is also browser-side via `canvas.captureStream()` and
+`MediaRecorder`; the ESP32-S3 does not store video locally. The portal falls
+back to live preview/control if the connected browser cannot record.
+
+### SD card status
+
+The repository contains historical SD-card bring-up and BMP-writing code (bit-banged CMD0 idle, two-phase mount via `esp_vfs_fat_sdspi_mount`, etc.), but the SD path is disabled in `setup()`. On this hardware the ILI9488 panel keeps driving MISO even when its CS is high, which contends with the SD card's MISO line and can blank the LCD when the card is hot-plugged. The freeze/WiFi server is the practical save path on this panel; SD requires a hardware fix (cut the GDI ribbon's MISO trace and treat the LCD as write-only, add a Schottky diode + pullup, etc.) that is out of scope for this firmware.
 ## Build Requirements
 
 make sure you get this: DFRobot_AXP313A 1.0.1 and all the other libraries listed.

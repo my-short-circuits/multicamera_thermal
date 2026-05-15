@@ -73,6 +73,7 @@
 #include <driver/sdspi_host.h>
 #include <sdmmc_cmd.h>
 #include "esp_camera.h"
+#include "img_converters.h"
 #include "DFRobot_AXP313A.h"
 #include "MLX90640_API.h"
 #include "MLX90640_I2C_Driver.h"
@@ -864,6 +865,10 @@ volatile uint8_t tint_pct = 70;
 volatile DisplayMode display_mode = MODE_TINT;
 volatile RangeMode range_mode = RANGE_AUTO;
 volatile bool freeze_mode = false;
+volatile bool stream_mode = false;
+volatile uint8_t stream_view_mode = 0;  // 0=overlay, 1=camera, 2=thermal
+volatile bool stream_hud_enabled = true;
+volatile bool stream_crosshair_enabled = true;
 
 // MANUAL-mode lo/hi setpoints. Used only when range_mode == RANGE_MANUAL.
 // On entering MANUAL we seed these from whatever range was active so the
@@ -1526,8 +1531,8 @@ void handleTouch() {
   }
 }
 
-// Short press = freeze/share toggle. It fires once when the debounced press is
-// detected, so there is no long-press branch in the active button path.
+// Short release = freeze/share toggle. Holding for 3 s toggles the browser
+// stream portal and suppresses the short-press event on release.
 // 15 ms debounce on transitions.
 //
 // Return code is plain int rather than an enum because the Arduino IDE
@@ -1535,11 +1540,15 @@ void handleTouch() {
 // any user-defined enum exists — using `int` dodges that trap.
 #define BTN_NONE  0
 #define BTN_SHORT 1
+#define BTN_LONG  2
+static constexpr uint32_t BTN_LONG_MS = 3000;
 
 struct BtnState {
   bool last = HIGH;
   bool stable = HIGH;
   uint32_t last_change_ms = 0;
+  uint32_t pressed_ms = 0;
+  bool long_fired = false;
 } btn;
 
 int pollButton() {
@@ -1556,11 +1565,20 @@ int pollButton() {
   if (now - btn.last_change_ms >= 15 && btn.stable != btn.last) {
     bool prev = btn.stable;
     btn.stable = btn.last;
-    
-    // Fire the event IMMEDIATELY when the button goes LOW (pressed)
+
     if (prev == HIGH && btn.stable == LOW) {
-      return BTN_SHORT;
+      btn.pressed_ms = now;
+      btn.long_fired = false;
+    } else if (prev == LOW && btn.stable == HIGH) {
+      uint32_t held = now - btn.pressed_ms;
+      if (!btn.long_fired && held < BTN_LONG_MS) return BTN_SHORT;
     }
+  }
+
+  if (btn.stable == LOW && !btn.long_fired &&
+      btn.pressed_ms && now - btn.pressed_ms >= BTN_LONG_MS) {
+    btn.long_fired = true;
+    return BTN_LONG;
   }
   
   return BTN_NONE;
@@ -1967,6 +1985,81 @@ int freeze_zoom_pct = 124;
 int freeze_parallax_x = 0, freeze_parallax_y = 0;
 uint8_t freeze_tint_pct = 70;
 DRAM_ATTR uint8_t share_bmp_line[IMG_W * 3];
+DRAM_ATTR int16_t stream_thermal_packet[768];
+uint32_t stream_started_ms = 0;
+uint32_t stream_last_status_ms = 0;
+uint32_t stream_api_count = 0;
+uint32_t stream_api_timer_ms = 0;
+float stream_api_fps = 0.0f;
+
+static constexpr uint8_t STREAM_VIEW_OVERLAY = 0;
+static constexpr uint8_t STREAM_VIEW_CAMERA  = 1;
+static constexpr uint8_t STREAM_VIEW_THERMAL = 2;
+static constexpr uint8_t STREAM_JPEG_QUALITY = 72;
+
+void setStreamMode(bool enabled);
+extern float current_fps, cam_fps, mlx_fps;
+extern uint32_t last_ui_ms;
+
+static const char STREAM_PORTAL_HTML[] PROGMEM = R"STREAMHTML(
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Thermal Stream</title>
+<style>
+body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:12px}.top{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}.badge{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px;color:#b8c7d3}canvas{width:100%;height:auto;background:#000;image-rendering:auto}.grid{display:grid;grid-template-columns:minmax(280px,640px) 1fr;gap:12px;margin-top:10px}.panel{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:10px}.row{display:grid;grid-template-columns:96px 1fr 52px;gap:8px;align-items:center;margin:8px 0}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:8px}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:8px}button.primary{background:#1f7a4d}button.danger{background:#8a2630}input[type=range]{width:100%}.val{color:#9fe870;text-align:right;font-variant-numeric:tabular-nums}.hud{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}.hud div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}.small{font-size:12px;color:#9aa8b3}.rec{color:#ffb4b4}.hidden{display:none}@media(max-width:760px){.grid,.twocol{grid-template-columns:1fr}.row{grid-template-columns:82px 1fr 48px}}
+</style></head><body><main>
+<div class="top"><h2>Thermal Stream</h2><div><span class="badge" id="ssid">AP</span> <span class="badge" id="ip">192.168.4.1</span> <span class="badge" id="recState">idle</span></div></div>
+<div class="grid">
+<section class="panel"><canvas id="view" width="320" height="240"></canvas><canvas id="recCanvas" width="320" height="240" class="hidden"></canvas>
+<div class="hud"><div>Center <b id="tCenter">--</b>C</div><div>Scene <b id="tSpan">--</b>C</div><div>Range <b id="tRange">--</b>C</div><div>Cam <b id="camFps">--</b>fps</div><div>MLX <b id="mlxFps">--</b>fps</div><div>API <b id="apiFps">--</b>fps</div><div>Marker <b id="markerTemp">--</b>C</div><div>Heap <b id="heap">--</b></div><div>Seq <b id="seq">--</b></div></div>
+<div class="twocol" style="margin-top:10px"><button class="primary" id="recBtn">Start recording</button><button class="danger" id="stopPortal">Stop portal</button></div>
+<p class="small" id="saveMsg">Recording uses the browser. If recording is not supported, use the phone screen recorder.</p></section>
+<section class="panel">
+<div class="row"><label>View</label><select id="viewMode"><option value="0">Overlay</option><option value="1">Camera only</option><option value="2">Thermal only</option></select><span></span></div>
+<div class="row"><label>Range</label><select id="rangeMode"><option value="0">AUTO</option><option value="1">AUT2</option><option value="2">SKIN</option><option value="3">BODY</option><option value="4">WARM</option><option value="5">HOT</option><option value="6">VHOT</option><option value="7">MAN</option></select><span></span></div>
+<div class="row"><label>X</label><input id="px" type="range" min="-90" max="90" step="1"><span class="val" id="pxv"></span></div>
+<div class="row"><label>Y</label><input id="py" type="range" min="-90" max="90" step="1"><span class="val" id="pyv"></span></div>
+<div class="row"><label>Zoom</label><input id="zoom" type="range" min="100" max="250" step="1"><span class="val" id="zoomv"></span></div>
+<div class="row"><label>Tint</label><input id="tint" type="range" min="0" max="100" step="1"><span class="val" id="tintv"></span></div>
+<div class="row"><label>Manual LO</label><input id="mlo" type="range" min="5" max="60" step="0.1"><span class="val" id="mlov"></span></div>
+<div class="row"><label>Manual HI</label><input id="mhi" type="range" min="5" max="60" step="0.1"><span class="val" id="mhiv"></span></div>
+<div class="row"><label>Brightness</label><input id="brt" type="range" min="-2" max="2" step="1"><span class="val" id="brtv"></span></div>
+<div class="twocol"><button id="resetAlign">Reset alignment</button><button id="snap">Snapshot</button></div>
+<p><label><input type="checkbox" id="hud" checked> Show HUD</label></p>
+<p><label><input type="checkbox" id="recHud" checked> Record HUD</label></p>
+<p><label><input type="checkbox" id="crosshair" checked> Crosshair</label></p>
+</section></div></main>
+<script>
+const W=320,H=240,canvas=document.getElementById('view'),ctx=canvas.getContext('2d'),recCanvas=document.getElementById('recCanvas'),recCtx=recCanvas.getContext('2d');
+const thermalCanvas=document.createElement('canvas');thermalCanvas.width=W;thermalCanvas.height=H;const thermalCtx=thermalCanvas.getContext('2d');
+let S={view:0,range:0,px:0,py:0,zoom:124,tint:70,mlo:22,mhi:38,brt:0,hud:1,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0};
+let camImg=null,thermal=null,dirtyThermal=true,marker=null,markerTemp=null,rec=null,chunks=[],recUrl=null,uiReady=false;
+const $=id=>document.getElementById(id);
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+function pal(i){let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]}
+const PAL=Array.from({length:256},(_,i)=>pal(i));
+function tempAt(x,y){if(!thermal)return null;let tx=x*32/W,ty=y*24/H,x0=clamp(Math.floor(tx),0,31),y0=clamp(Math.floor(ty),0,23),x1=clamp(x0+1,0,31),y1=clamp(y0+1,0,23),fx=tx-x0,fy=ty-y0;function t(r,c){return thermal[r*32+(31-c)]}let a=t(y0,x0),b=t(y0,x1),c=t(y1,x0),d=t(y1,x1);return (a*(1-fx)+b*fx)*(1-fy)+(c*(1-fx)+d*fx)*fy}
+function rebuildThermal(){if(!thermal)return;let img=thermalCtx.createImageData(W,H),d=img.data,lo=S.lo,hi=S.hi,den=(hi-lo)||1;for(let y=0;y<H;y++){for(let x=0;x<W;x++){let t=tempAt(x,y),idx=clamp(Math.round((t-lo)/den*255),0,255),p=PAL[idx],o=(y*W+x)*4;d[o]=p[0];d[o+1]=p[1];d[o+2]=p[2];d[o+3]=255}}thermalCtx.putImageData(img,0,0);dirtyThermal=false}
+function drawCamera(c){if(!camImg)return;let z=clamp(+S.zoom||100,100,250),cw=Math.round(W*100/z),ch=Math.round(H*100/z),sx=(W-cw)/2-(S.px||0)*cw/W,sy=(H-ch)/2-(S.py||0)*ch/H;sx=clamp(sx,0,W-cw);sy=clamp(sy,0,H-ch);c.drawImage(camImg,sx,sy,cw,ch,0,0,W,H)}
+function drawHud(c){c.save();c.font='12px system-ui';c.fillStyle='rgba(0,0,0,.62)';c.fillRect(4,4,164,54);c.fillStyle='#fff';c.fillText(`Ctr ${fmt(S.tCenter)}C  Scene ${fmt(S.tMin)}-${fmt(S.tMax)}C`,10,20);c.fillText(`Range ${fmt(S.lo)}-${fmt(S.hi)}C  MLX ${fmt(S.mlxFps)}fps`,10,36);if(marker&&markerTemp!=null)c.fillText(`Marker ${fmt(markerTemp)}C`,10,52);c.restore()}
+function drawCross(c){c.save();c.strokeStyle='#fff';c.lineWidth=1;c.beginPath();c.moveTo(W/2-10,H/2);c.lineTo(W/2+10,H/2);c.moveTo(W/2,H/2-10);c.lineTo(W/2,H/2+10);c.rect(W/2-10,H/2-10,20,20);c.stroke();c.restore()}
+function drawScene(c,withHud){c.clearRect(0,0,W,H);c.fillStyle='#000';c.fillRect(0,0,W,H);let v=+S.view;if((v===0||v===1)&&camImg)drawCamera(c);if((v===0||v===2)&&thermal){if(dirtyThermal)rebuildThermal();c.save();if(v===0){c.globalCompositeOperation='lighter';c.globalAlpha=(+S.tint||0)/100}c.drawImage(thermalCanvas,0,0);c.restore()}if(S.crosshair)drawCross(c);if(marker){c.strokeStyle='#9fe870';c.beginPath();c.arc(marker.x,marker.y,6,0,Math.PI*2);c.stroke()}if(withHud)drawHud(c)}
+function render(){drawScene(ctx,$('hud').checked);if(rec)drawScene(recCtx,$('recHud').checked);requestAnimationFrame(render)}
+function fmt(v){return Number.isFinite(+v)?(+v).toFixed(1):'--'}
+function setVal(id,v){let e=$(id);if(document.activeElement!==e)e.value=v}
+function updateLabels(){['px','py','zoom','tint','mlo','mhi','brt'].forEach(id=>$(id+'v').textContent=$(id).value+(id==='zoom'||id==='tint'?'%':id==='mlo'||id==='mhi'?'C':''));$('tCenter').textContent=fmt(S.tCenter);$('tSpan').textContent=`${fmt(S.tMin)}-${fmt(S.tMax)}`;$('tRange').textContent=`${fmt(S.lo)}-${fmt(S.hi)}`;$('camFps').textContent=fmt(S.camFps);$('mlxFps').textContent=fmt(S.mlxFps);$('apiFps').textContent=fmt(S.apiFps);$('heap').textContent=S.heap?Math.round(S.heap/1024)+'K':'--';$('seq').textContent=S.seq||'--';$('markerTemp').textContent=markerTemp==null?'--':fmt(markerTemp)}
+function applyState(s){Object.assign(S,s);if(!uiReady){setVal('px',S.px);setVal('py',S.py);setVal('zoom',S.zoom);setVal('tint',S.tint);setVal('mlo',S.mlo);setVal('mhi',S.mhi);setVal('brt',S.brt);$('rangeMode').value=S.range;$('viewMode').value=S.view;$('hud').checked=!!S.hud;$('crosshair').checked=!!S.crosshair;uiReady=true}S.lo=s.rangeLo;S.hi=s.rangeHi;dirtyThermal=true;updateLabels();$('ssid').textContent=s.ssid||'ThermalCam';$('ip').textContent=s.ip||'192.168.4.1'}
+async function getState(){try{let r=await fetch('/api/state',{cache:'no-store'});applyState(await r.json())}catch(e){}setTimeout(getState,700)}
+async function getThermal(){try{let r=await fetch('/thermal.bin',{cache:'no-store'}),b=await r.arrayBuffer(),dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;thermal=a;S.seq=+(r.headers.get('X-Frame-Seq')||S.seq);S.lo=+(r.headers.get('X-Range-Lo')||S.lo);S.hi=+(r.headers.get('X-Range-Hi')||S.hi);dirtyThermal=true;if(marker)markerTemp=tempAt(marker.x,marker.y);updateLabels()}catch(e){}setTimeout(getThermal,120)}
+async function getCam(){try{let r=await fetch('/cam.jpg',{cache:'no-store'});if(r.ok){let blob=await r.blob(),url=URL.createObjectURL(blob),img=new Image();img.onload=()=>{if(camImg&&camImg.src)URL.revokeObjectURL(camImg.src);camImg=img};img.src=url}}catch(e){}setTimeout(getCam,20)}
+let sendTimer=null,pending={};function send(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(async()=>{let p=new URLSearchParams(pending);pending={};try{await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p})}catch(e){}},90)}
+['px','py','zoom','tint','mlo','mhi','brt'].forEach(id=>$(id).addEventListener('input',e=>{S[id]=+e.target.value;dirtyThermal=true;updateLabels();send({[id]:e.target.value})}));
+$('rangeMode').onchange=e=>{S.range=+e.target.value;send({range:S.range})};$('viewMode').onchange=e=>{S.view=+e.target.value;send({view:S.view})};$('hud').onchange=e=>{S.hud=e.target.checked?1:0;send({hud:S.hud})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;send({crosshair:S.crosshair})};$('resetAlign').onclick=()=>send({reset_alignment:1});$('stopPortal').onclick=()=>send({stop_stream:1});$('snap').onclick=()=>{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()};
+canvas.onclick=e=>{let r=canvas.getBoundingClientRect();marker={x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height};markerTemp=tempAt(marker.x,marker.y);updateLabels()};
+function recType(){let types=['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];return types.find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||''}
+$('recBtn').onclick=()=>{if(rec){rec.stop();return}if(!recCanvas.captureStream||!window.MediaRecorder){$('saveMsg').textContent='Browser recording is unavailable. Use screen recording.';return}chunks=[];let stream=recCanvas.captureStream(15),type=recType();rec=new MediaRecorder(stream,type?{mimeType:type}:undefined);rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};rec.onstop=()=>{let blob=new Blob(chunks,{type:type||'video/webm'});if(recUrl)URL.revokeObjectURL(recUrl);recUrl=URL.createObjectURL(blob);let a=document.createElement('a');a.href=recUrl;a.download='thermal-stream.'+(type.includes('mp4')?'mp4':'webm');a.textContent='Download recording';$('saveMsg').replaceChildren(a);$('recBtn').textContent='Start recording';$('recState').textContent='idle';rec=null};rec.start(1000);$('recBtn').textContent='Stop recording';$('recState').textContent='recording';$('recState').classList.add('rec')};
+getState();getThermal();getCam();render();
+</script></body></html>
+)STREAMHTML";
 
 // Plain constants avoid Arduino's auto-prototype pass referencing an enum type
 // before its declaration.
@@ -2187,13 +2280,251 @@ void handleShareCsv() {
   share_server.send(200, "text/csv", csv);
 }
 
+void handleLiveThermalCsv() {
+  float snap[768];
+  portENTER_CRITICAL(&mlx_mux);
+  memcpy(snap, mlx_temps_full, sizeof(snap));
+  bool ok = mlx_full_ready;
+  portEXIT_CRITICAL(&mlx_mux);
+  if (!ok) {
+    share_server.send(404, "text/plain", "No live thermal frame available");
+    return;
+  }
+
+  String csv;
+  csv.reserve(768 * 7);
+  for (int row = 0; row < 24; row++) {
+    for (int col = 0; col < 32; col++) {
+      csv += String(snap[row * 32 + col], 2);
+      csv += (col == 31) ? '\n' : ',';
+    }
+  }
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.sendHeader("Content-Disposition", "attachment; filename=\"thermal-live.csv\"");
+  share_server.send(200, "text/csv", csv);
+}
+
+void handleThermalCsvRoute() {
+  if (stream_mode) handleLiveThermalCsv();
+  else handleShareCsv();
+}
+
+void handlePortalIndex() {
+  if (stream_mode) {
+    share_server.sendHeader("Cache-Control", "no-store");
+    share_server.send_P(200, PSTR("text/html"), STREAM_PORTAL_HTML);
+  } else {
+    handleShareIndex();
+  }
+}
+
+void handleStreamCameraJpg() {
+  if (!stream_mode) {
+    share_server.send(404, "text/plain", "Stream portal is not active");
+    return;
+  }
+  if (!cam_have_frame || !cam_snapshot) {
+    share_server.send(404, "text/plain", "No camera frame available");
+    return;
+  }
+
+  uint8_t *jpg = nullptr;
+  size_t jpg_len = 0;
+  bool ok = fmt2jpg(cam_snapshot, cam_snapshot_len, IMG_W, IMG_H,
+                    PIXFORMAT_RGB565, STREAM_JPEG_QUALITY, &jpg, &jpg_len);
+  if (!ok || !jpg || !jpg_len) {
+    if (jpg) free(jpg);
+    share_server.send(500, "text/plain", "JPEG conversion failed");
+    return;
+  }
+
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.setContentLength(jpg_len);
+  share_server.send(200, "image/jpeg", "");
+  WiFiClient client = share_server.client();
+  client.write(jpg, jpg_len);
+  free(jpg);
+}
+
+void handleStreamThermalBin() {
+  if (!stream_mode) {
+    share_server.send(404, "text/plain", "Stream portal is not active");
+    return;
+  }
+
+  float snap[768];
+  uint32_t seq;
+  float mn, mx, center, lo, hi;
+  bool ok;
+  portENTER_CRITICAL(&mlx_mux);
+  memcpy(snap, mlx_temps_full, sizeof(snap));
+  seq = thermal_frame_seq;
+  mn = t_min; mx = t_max; center = t_center;
+  ok = mlx_full_ready;
+  portEXIT_CRITICAL(&mlx_mux);
+  getThermalRange(lo, hi);
+
+  if (!ok) {
+    share_server.send(404, "text/plain", "No thermal frame available");
+    return;
+  }
+
+  for (int i = 0; i < 768; i++) {
+    float v = snap[i] * 100.0f;
+    if (v > 32767.0f) v = 32767.0f;
+    if (v < -32768.0f) v = -32768.0f;
+    stream_thermal_packet[i] = (int16_t)(v >= 0.0f ? v + 0.5f : v - 0.5f);
+  }
+
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.sendHeader("X-Frame-Seq", String(seq));
+  share_server.sendHeader("X-Temp-Center", String(center, 2));
+  share_server.sendHeader("X-Temp-Min", String(mn, 2));
+  share_server.sendHeader("X-Temp-Max", String(mx, 2));
+  share_server.sendHeader("X-Range-Lo", String(lo, 2));
+  share_server.sendHeader("X-Range-Hi", String(hi, 2));
+  share_server.setContentLength(sizeof(stream_thermal_packet));
+  share_server.send(200, "application/octet-stream", "");
+  WiFiClient client = share_server.client();
+  client.write((const uint8_t*)stream_thermal_packet, sizeof(stream_thermal_packet));
+}
+
+static inline int argIntClamped(const char *name, int current, int lo, int hi) {
+  if (!share_server.hasArg(name)) return current;
+  int v = share_server.arg(name).toInt();
+  if (v < lo) v = lo; else if (v > hi) v = hi;
+  return v;
+}
+
+static inline float argFloatClamped(const char *name, float current, float lo, float hi) {
+  if (!share_server.hasArg(name)) return current;
+  float v = share_server.arg(name).toFloat();
+  if (v < lo) v = lo; else if (v > hi) v = hi;
+  return v;
+}
+
+void handleStreamControl() {
+  if (!stream_mode) {
+    share_server.send(409, "text/plain", "Stream portal is not active");
+    return;
+  }
+
+  bool dirty = false;
+  if (share_server.hasArg("view")) {
+    stream_view_mode = (uint8_t)argIntClamped("view", stream_view_mode, STREAM_VIEW_OVERLAY, STREAM_VIEW_THERMAL);
+  }
+  if (share_server.hasArg("range")) {
+    int r = argIntClamped("range", (int)range_mode, 0, RANGE_COUNT - 1);
+    if (r != (int)range_mode) { range_mode = (RangeMode)r; dirty = true; }
+  }
+  int px = argIntClamped("px", parallax_x, PARALLAX_MIN, PARALLAX_MAX);
+  int py = argIntClamped("py", parallax_y, PARALLAX_MIN, PARALLAX_MAX);
+  int z  = argIntClamped("zoom", zoom_pct, 100, 250);
+  int ti = argIntClamped("tint", tint_pct, 0, 100);
+  int br = argIntClamped("brt", cam_brightness, -2, 2);
+  if (px != parallax_x) { parallax_x = px; dirty = true; }
+  if (py != parallax_y) { parallax_y = py; dirty = true; }
+  if (z  != zoom_pct)   { zoom_pct = z; dirty = true; }
+  if (ti != tint_pct)   { tint_pct = (uint8_t)ti; dirty = true; }
+  if (br != cam_brightness) {
+    cam_brightness = (int8_t)br;
+    brightness_apply_pending = true;
+    dirty = true;
+  }
+  if (share_server.hasArg("mlo")) {
+    float before = manual_lo;
+    setManualLoValue(argFloatClamped("mlo", manual_lo, MANUAL_T_MIN, MANUAL_T_MAX));
+    dirty = dirty || (before != manual_lo);
+  }
+  if (share_server.hasArg("mhi")) {
+    float before = manual_hi;
+    setManualHiValue(argFloatClamped("mhi", manual_hi, MANUAL_T_MIN, MANUAL_T_MAX));
+    dirty = dirty || (before != manual_hi);
+  }
+  if (share_server.hasArg("hud")) {
+    stream_hud_enabled = share_server.arg("hud").toInt() != 0;
+  }
+  if (share_server.hasArg("crosshair")) {
+    stream_crosshair_enabled = share_server.arg("crosshair").toInt() != 0;
+  }
+  if (share_server.hasArg("reset_alignment")) {
+    parallax_x = 0; parallax_y = 0; zoom_pct = 100; dirty = true;
+  }
+  if (share_server.hasArg("stop_stream")) {
+    share_server.send(200, "application/json", "{\"ok\":true,\"stopping\":true}");
+    setStreamMode(false);
+    return;
+  }
+
+  if (dirty) markDirty();
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStreamState() {
+  stream_api_count++;
+  uint32_t now = millis();
+  if (!stream_api_timer_ms) stream_api_timer_ms = now;
+  if (now - stream_api_timer_ms >= 1000) {
+    stream_api_fps = stream_api_count * 1000.0f / (now - stream_api_timer_ms);
+    stream_api_count = 0;
+    stream_api_timer_ms = now;
+  }
+
+  float lo, hi;
+  getThermalRange(lo, hi);
+  uint32_t seq;
+  float mn, mx, center;
+  portENTER_CRITICAL(&mlx_mux);
+  seq = thermal_frame_seq;
+  mn = t_min; mx = t_max; center = t_center;
+  portEXIT_CRITICAL(&mlx_mux);
+
+  String json;
+  json.reserve(900);
+  json += F("{\"stream\":");
+  json += stream_mode ? F("true") : F("false");
+  json += F(",\"ssid\":\""); json += share_ap_ssid; json += F("\"");
+  json += F(",\"ip\":\""); json += WiFi.softAPIP().toString(); json += F("\"");
+  json += F(",\"view\":"); json += stream_view_mode;
+  json += F(",\"range\":"); json += (int)range_mode;
+  json += F(",\"px\":"); json += parallax_x;
+  json += F(",\"py\":"); json += parallax_y;
+  json += F(",\"zoom\":"); json += zoom_pct;
+  json += F(",\"tint\":"); json += tint_pct;
+  json += F(",\"mlo\":"); json += String(manual_lo, 1);
+  json += F(",\"mhi\":"); json += String(manual_hi, 1);
+  json += F(",\"brt\":"); json += (int)cam_brightness;
+  json += F(",\"hud\":"); json += stream_hud_enabled ? 1 : 0;
+  json += F(",\"crosshair\":"); json += stream_crosshair_enabled ? 1 : 0;
+  json += F(",\"rangeLo\":"); json += String(lo, 2);
+  json += F(",\"rangeHi\":"); json += String(hi, 2);
+  json += F(",\"tCenter\":"); json += String(center, 2);
+  json += F(",\"tMin\":"); json += String(mn, 2);
+  json += F(",\"tMax\":"); json += String(mx, 2);
+  json += F(",\"seq\":"); json += seq;
+  json += F(",\"camFps\":"); json += String(cam_fps, 1);
+  json += F(",\"mlxFps\":"); json += String(mlx_fps, 1);
+  json += F(",\"loopFps\":"); json += String(current_fps, 1);
+  json += F(",\"apiFps\":"); json += String(stream_api_fps, 1);
+  json += F(",\"heap\":"); json += ESP.getFreeHeap();
+  json += F(",\"psram\":"); json += ESP.getFreePsram();
+  json += F("}");
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.send(200, "application/json", json);
+}
+
 void configureShareRoutes() {
   if (share_routes_configured) return;
-  share_server.on("/", handleShareIndex);
+  share_server.on("/", handlePortalIndex);
   share_server.on("/camera.bmp", [](){ sendFreezeBmp(SHARE_BMP_CAMERA, "camera.bmp"); });
   share_server.on("/thermal.bmp", [](){ sendFreezeBmp(SHARE_BMP_THERMAL, "thermal.bmp"); });
   share_server.on("/overlay.bmp", [](){ sendFreezeBmp(SHARE_BMP_OVERLAY, "overlay.bmp"); });
-  share_server.on("/thermal.csv", handleShareCsv);
+  share_server.on("/thermal.csv", handleThermalCsvRoute);
+  share_server.on("/cam.jpg", HTTP_GET, handleStreamCameraJpg);
+  share_server.on("/thermal.bin", HTTP_GET, handleStreamThermalBin);
+  share_server.on("/api/state", HTTP_GET, handleStreamState);
+  share_server.on("/api/control", HTTP_POST, handleStreamControl);
   share_server.onNotFound([](){
     share_server.sendHeader("Location", "/", true);
     share_server.send(302, "text/plain", "");
@@ -2243,8 +2574,73 @@ void handleFreezeShareAP() {
   share_server.handleClient();
 }
 
+void drawStreamStatusScreen() {
+  lcd.fillScreen(TFT_BLACK);
+  lcd.setTextSize(2);
+  lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+  lcd.setCursor(18, 28); lcd.print("STREAM PORTAL");
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setCursor(18, 72); lcd.print("Connect WiFi:");
+  lcd.setCursor(18, 88); lcd.print(share_ap_ssid);
+  lcd.setCursor(18, 112); lcd.print("Open:");
+  lcd.setCursor(18, 128); lcd.print("http://192.168.4.1/");
+  lcd.setCursor(18, 160); lcd.print("Browser composes overlay/camera/thermal.");
+  lcd.setCursor(18, 176); lcd.print("Hold button 3s to exit.");
+  stream_last_status_ms = 0;
+}
+
+void drawStreamStatusDynamic() {
+  uint32_t now = millis();
+  if (now - stream_last_status_ms < 1000) return;
+  stream_last_status_ms = now;
+  lcd.fillRect(18, 206, 300, 48, TFT_BLACK);
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  lcd.setCursor(18, 206);
+  lcd.printf("Cam %.1ffps  MLX %.1ffps  API %.1ffps",
+             cam_fps, mlx_fps, stream_api_fps);
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setCursor(18, 224);
+  lcd.printf("Ctr %.1fC  Scene %.1f..%.1fC", t_center, t_min, t_max);
+  lcd.setCursor(18, 242);
+  lcd.printf("Heap %luK PSRAM %luK",
+             (unsigned long)(ESP.getFreeHeap() / 1024),
+             (unsigned long)(ESP.getFreePsram() / 1024));
+}
+
+void setStreamMode(bool enabled) {
+  if (enabled == stream_mode) return;
+
+  if (enabled) {
+    if (freeze_mode) {
+      stopFreezeShareAP();
+      releaseFreezeShareSnapshot();
+      freeze_mode = false;
+    }
+    stream_mode = true;
+    stream_started_ms = millis();
+    stream_api_count = 0;
+    stream_api_timer_ms = stream_started_ms;
+    stream_api_fps = 0.0f;
+    startFreezeShareAP();
+    drawStreamStatusScreen();
+  } else {
+    stopFreezeShareAP();
+    stream_mode = false;
+    stream_started_ms = 0;
+    lcd.setBrightness(255);
+    lcd.fillScreen(TFT_BLACK);
+    drawStaticUI();
+    last_ui_ms = millis();
+  }
+
+  Serial.printf("Stream portal: %s\n", stream_mode ? "ON" : "OFF");
+}
+
 void setFreezeMode(bool enabled) {
   if (enabled == freeze_mode) return;
+  if (enabled && stream_mode) return;
 
   if (enabled) {
     freeze_mode = true;
@@ -2724,12 +3120,14 @@ void setup() {
 // ---------------------------------------------------------------- Loop ---
 void loop() {
   int ev = pollButton();
-  if (ev == BTN_SHORT) {
+  if (ev == BTN_LONG) {
+    setStreamMode(!stream_mode);
+  } else if (ev == BTN_SHORT && !stream_mode) {
     setFreezeMode(!freeze_mode);
   }
   handleFreezeShareAP();
 
-  handleTouch();
+  if (!stream_mode) handleTouch();
 
   uint32_t now = millis();
 
@@ -2761,14 +3159,18 @@ void loop() {
     if (grabCamera()) cam_count++;
   }
 
-  switch (display_mode) {
-    case MODE_TINT:         renderTinted();      break;
-    case MODE_THERMAL_ONLY: renderThermalOnly(); break;
-    case MODE_CAMERA_ONLY:  renderCameraOnly();  break;
-    default: break;
+  if (stream_mode) {
+    drawStreamStatusDynamic();
+  } else {
+    switch (display_mode) {
+      case MODE_TINT:         renderTinted();      break;
+      case MODE_THERMAL_ONLY: renderThermalOnly(); break;
+      case MODE_CAMERA_ONLY:  renderCameraOnly();  break;
+      default: break;
+    }
   }
 
-  if (now - last_ui_ms >= 200) { drawDynamicUI(); last_ui_ms = now; }
+  if (!stream_mode && now - last_ui_ms >= 200) { drawDynamicUI(); last_ui_ms = now; }
 
   // Auto-save tuned settings 3 s after the last change.
   if (settings_dirty && now - settings_dirty_ms >= SETTINGS_DEBOUNCE_MS) {
