@@ -83,6 +83,12 @@
 // just avoids turning every MLX cell into an obvious display block.
 #define USE_BILINEAR_THERMAL 1
 
+// Experimental: reinitialize the camera as native JPEG while the browser
+// portal is active. Kept off by default until verified on the actual unit.
+#ifndef STREAM_CAMERA_NATIVE_JPEG
+#define STREAM_CAMERA_NATIVE_JPEG 0
+#endif
+
 // ---------------------------------------------------------------- Pins ----
 #define TFT_SCLK 17
 #define TFT_MOSI 15
@@ -686,21 +692,43 @@ void mlxTask(void *arg) {
 }
 
 // ---------------------------------------------------------------- Camera --
+extern volatile int8_t cam_brightness;
 uint8_t *cam_snapshot = nullptr;   // PSRAM, our copy of the latest frame
 size_t   cam_snapshot_len = 0;
 bool     cam_have_frame = false;
 bool     cam_ok = false;           // false => camera disconnected or init failed
+bool     camera_driver_active = false;
+bool     stream_native_jpeg_active = false;
 
-bool initCamera() {
-  // Always allocate the snapshot buffer first — render paths use it to draw
-  // fallback content (e.g. "NO CAMERA") when the sensor isn't available.
+bool ensureCameraSnapshotBuffer() {
   cam_snapshot_len = IMG_W * IMG_H * 2;
   if (!cam_snapshot) {
     cam_snapshot = (uint8_t*)heap_caps_malloc(cam_snapshot_len, MALLOC_CAP_SPIRAM);
     if (!cam_snapshot) return false;
     memset(cam_snapshot, 0, cam_snapshot_len);
   }
+  return true;
+}
 
+void applyCameraSensorDefaults() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_hmirror(s, 0);
+  } else {
+    s->set_vflip(s, 0);
+    s->set_hmirror(s, 0);
+  }
+  s->set_colorbar(s, 0);
+  s->set_brightness(s, (int)cam_brightness);
+}
+
+bool initCameraFormat(pixformat_t format, framesize_t frame_size,
+                      uint8_t fb_count, camera_grab_mode_t grab_mode) {
+  if (!ensureCameraSnapshotBuffer()) return false;
+  // Always allocate the snapshot buffer first — render paths use it to draw
+  // fallback content (e.g. "NO CAMERA") when the sensor isn't available.
   camera_config_t cfg = {};
   cfg.ledc_channel = LEDC_CHANNEL_0;
   cfg.ledc_timer   = LEDC_TIMER_0;
@@ -718,12 +746,13 @@ bool initCamera() {
   cfg.pin_pwdn = -1;
   cfg.pin_reset= -1;
   cfg.xclk_freq_hz = 16000000;
-  cfg.pixel_format = PIXFORMAT_RGB565;
-  cfg.frame_size   = FRAMESIZE_QVGA;
-  cfg.fb_count     = 3;             // headroom against EV-VSYNC-OVF
+  cfg.pixel_format = format;
+  cfg.frame_size   = frame_size;
+  cfg.fb_count     = fb_count;
   cfg.fb_location  = CAMERA_FB_IN_PSRAM;
-  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+  cfg.grab_mode    = grab_mode;
   if (esp_camera_init(&cfg) != ESP_OK) return false;
+  camera_driver_active = true;
 
   // Stay close to sensor defaults — every extra filter we turn on (dcw,
   // lenc, bpc, wpc, aec2) softens the image. The "raw feed" look the user
@@ -732,26 +761,61 @@ bool initCamera() {
   // OV3660 note: this sensor is physically mounted upside-down relative to
   // where the OV2640 sat, so vflip must be inverted. We detect the sensor
   // type at runtime via PID so the sketch works with either module.
-  sensor_t *s = esp_camera_sensor_get();
-  if (s) {
-    if (s->id.PID == OV3660_PID) {
-      s->set_vflip(s, 1);    // OV3660 is mounted inverted vs. OV2640
-      s->set_hmirror(s, 0);
-    } else {
-      s->set_vflip(s, 0);    // OV2640 original orientation
-      s->set_hmirror(s, 0);
-    }
-    s->set_colorbar(s, 0);
-  }
+  applyCameraSensorDefaults();
 
   cam_ok = true;
   return true;
 }
 
+bool initCamera() {
+  return initCameraFormat(PIXFORMAT_RGB565, FRAMESIZE_QVGA, 3,
+                          CAMERA_GRAB_LATEST);
+}
+
+void deinitCameraDriver() {
+  if (!camera_driver_active) return;
+  esp_camera_deinit();
+  camera_driver_active = false;
+  cam_ok = false;
+  cam_have_frame = false;
+}
+
+bool enterStreamCameraMode() {
+  stream_native_jpeg_active = false;
+#if STREAM_CAMERA_NATIVE_JPEG
+  if (!cam_ok && !camera_driver_active) return true;
+  deinitCameraDriver();
+  delay(50);
+  if (initCameraFormat(PIXFORMAT_JPEG, FRAMESIZE_QVGA, 3,
+                       CAMERA_GRAB_LATEST)) {
+    stream_native_jpeg_active = true;
+    Serial.println("Stream camera: native JPEG mode");
+    return true;
+  }
+  Serial.println("Stream camera: native JPEG init failed, restoring RGB565");
+  deinitCameraDriver();
+  delay(50);
+  if (!initCamera()) return false;
+#endif
+  return true;
+}
+
+void exitStreamCameraMode() {
+#if STREAM_CAMERA_NATIVE_JPEG
+  if (!stream_native_jpeg_active) return;
+  deinitCameraDriver();
+  delay(50);
+  if (!initCamera()) {
+    Serial.println("Stream camera: RGB565 restore failed");
+  }
+#endif
+  stream_native_jpeg_active = false;
+}
+
 // Pull latest frame, copy to our PSRAM buffer, return camera fb immediately.
 // Returns true if a new frame was captured. No-op if camera missing.
 bool grabCamera() {
-  if (!cam_ok) return false;
+  if (!cam_ok || stream_native_jpeg_active) return false;
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return false;
   if (fb->len == cam_snapshot_len) {
@@ -953,7 +1017,7 @@ void loadSettings() {
   if (manual_hi - manual_lo < 1.0f) manual_hi = manual_lo + 1.0f;
   display_mode = (m < MODE_COUNT)  ? (DisplayMode)m : MODE_TINT;
   range_mode   = (r < RANGE_COUNT) ? (RangeMode)r   : RANGE_AUTO;
-  panel_tab    = (pt < PANEL_TAB_COUNT) ? pt : PANEL_TAB_POS;
+  panel_tab    = (pt < PANEL_TAB_COUNT) ? (uint8_t)pt : (uint8_t)PANEL_TAB_POS;
   brightness_apply_pending = true;        // push into sensor on first frame
   Serial.printf("Loaded: PX=%+d,%+d Z=%d%% Tint=%d%% Brt=%+d Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
                 parallax_x, parallax_y, zoom_pct, tint_pct, cam_brightness,
@@ -1991,6 +2055,13 @@ uint32_t stream_last_status_ms = 0;
 uint32_t stream_api_count = 0;
 uint32_t stream_api_timer_ms = 0;
 float stream_api_fps = 0.0f;
+uint32_t stream_cam_req_count = 0;
+uint32_t stream_cam_req_timer_ms = 0;
+float stream_cam_req_fps = 0.0f;
+uint32_t stream_thermal_req_count = 0;
+uint32_t stream_thermal_req_timer_ms = 0;
+float stream_thermal_req_fps = 0.0f;
+bool stream_stop_pending = false;
 
 static constexpr uint8_t STREAM_VIEW_OVERLAY = 0;
 static constexpr uint8_t STREAM_VIEW_CAMERA  = 1;
@@ -2001,18 +2072,41 @@ void setStreamMode(bool enabled);
 extern float current_fps, cam_fps, mlx_fps;
 extern uint32_t last_ui_ms;
 
+void noteStreamRequest(uint32_t &count, uint32_t &timer_ms, float &fps) {
+  count++;
+  uint32_t now = millis();
+  if (!timer_ms) timer_ms = now;
+  if (now - timer_ms >= 1000) {
+    fps = count * 1000.0f / (now - timer_ms);
+    count = 0;
+    timer_ms = now;
+  }
+}
+
+void resetStreamDiagnostics(uint32_t now) {
+  stream_api_count = 0;
+  stream_api_timer_ms = now;
+  stream_api_fps = 0.0f;
+  stream_cam_req_count = 0;
+  stream_cam_req_timer_ms = now;
+  stream_cam_req_fps = 0.0f;
+  stream_thermal_req_count = 0;
+  stream_thermal_req_timer_ms = now;
+  stream_thermal_req_fps = 0.0f;
+}
+
 static const char STREAM_PORTAL_HTML[] PROGMEM = R"STREAMHTML(
 <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Thermal Stream</title>
 <style>
-body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:12px}.top{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}.badge{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px;color:#b8c7d3}canvas{width:100%;height:auto;background:#000;image-rendering:auto}.grid{display:grid;grid-template-columns:minmax(280px,640px) 1fr;gap:12px;margin-top:10px}.panel{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:10px}.row{display:grid;grid-template-columns:96px 1fr 52px;gap:8px;align-items:center;margin:8px 0}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:8px}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:8px}button.primary{background:#1f7a4d}button.danger{background:#8a2630}input[type=range]{width:100%}.val{color:#9fe870;text-align:right;font-variant-numeric:tabular-nums}.hud{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}.hud div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}.small{font-size:12px;color:#9aa8b3}.rec{color:#ffb4b4}.hidden{display:none}@media(max-width:760px){.grid,.twocol{grid-template-columns:1fr}.row{grid-template-columns:82px 1fr 48px}}
+body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:12px}.top{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}.badge{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px;color:#b8c7d3}.bad{background:#3a1b20;border-color:#8a2630;color:#ffd1d1}canvas{width:100%;height:auto;background:#000;image-rendering:auto}.grid{display:grid;grid-template-columns:minmax(280px,640px) 1fr;gap:12px;margin-top:10px}.panel{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:10px}.row{display:grid;grid-template-columns:96px 1fr 52px;gap:8px;align-items:center;margin:8px 0}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:8px}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:8px}button.primary{background:#1f7a4d}button.danger{background:#8a2630}input[type=range]{width:100%}.val{color:#9fe870;text-align:right;font-variant-numeric:tabular-nums}.hud{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}.hud div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}.small{font-size:12px;color:#9aa8b3}.rec{color:#ffb4b4}.hidden{display:none}@media(max-width:760px){.grid,.twocol{grid-template-columns:1fr}.row{grid-template-columns:82px 1fr 48px}}
 </style></head><body><main>
-<div class="top"><h2>Thermal Stream</h2><div><span class="badge" id="ssid">AP</span> <span class="badge" id="ip">192.168.4.1</span> <span class="badge" id="recState">idle</span></div></div>
+<div class="top"><h2>Thermal Stream</h2><div><span class="badge" id="ssid">AP</span> <span class="badge" id="ip">192.168.4.1</span> <span class="badge" id="connState">online</span> <span class="badge" id="recState">idle</span></div></div>
 <div class="grid">
 <section class="panel"><canvas id="view" width="320" height="240"></canvas><canvas id="recCanvas" width="320" height="240" class="hidden"></canvas>
-<div class="hud"><div>Center <b id="tCenter">--</b>C</div><div>Scene <b id="tSpan">--</b>C</div><div>Range <b id="tRange">--</b>C</div><div>Cam <b id="camFps">--</b>fps</div><div>MLX <b id="mlxFps">--</b>fps</div><div>API <b id="apiFps">--</b>fps</div><div>Marker <b id="markerTemp">--</b>C</div><div>Heap <b id="heap">--</b></div><div>Seq <b id="seq">--</b></div></div>
+<div class="hud"><div>Center <b id="tCenter">--</b>C</div><div>Scene <b id="tSpan">--</b>C</div><div>Range <b id="tRange">--</b>C</div><div>Cam <b id="camFps">--</b>fps</div><div>Cam Req <b id="camReqFps">--</b>fps</div><div>MLX <b id="mlxFps">--</b>fps</div><div>Therm Req <b id="thermalReqFps">--</b>fps</div><div>API <b id="apiFps">--</b>fps</div><div>Loop <b id="loopFps">--</b>fps</div><div>Marker <b id="markerTemp">--</b>C</div><div>Heap <b id="heap">--</b></div><div>PSRAM <b id="psram">--</b></div><div>Seq <b id="seq">--</b></div><div>Uptime <b id="uptime">--</b></div></div>
 <div class="twocol" style="margin-top:10px"><button class="primary" id="recBtn">Start recording</button><button class="danger" id="stopPortal">Stop portal</button></div>
-<p class="small" id="saveMsg">Recording uses the browser. If recording is not supported, use the phone screen recorder.</p></section>
+<p class="small" id="saveMsg">Recording is held in browser memory until stopped. Use short clips; if recording is not supported, use the phone screen recorder.</p></section>
 <section class="panel">
 <div class="row"><label>View</label><select id="viewMode"><option value="0">Overlay</option><option value="1">Camera only</option><option value="2">Thermal only</option></select><span></span></div>
 <div class="row"><label>Range</label><select id="rangeMode"><option value="0">AUTO</option><option value="1">AUT2</option><option value="2">SKIN</option><option value="3">BODY</option><option value="4">WARM</option><option value="5">HOT</option><option value="6">VHOT</option><option value="7">MAN</option></select><span></span></div>
@@ -2031,12 +2125,17 @@ body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-syst
 <script>
 const W=320,H=240,canvas=document.getElementById('view'),ctx=canvas.getContext('2d'),recCanvas=document.getElementById('recCanvas'),recCtx=recCanvas.getContext('2d');
 const thermalCanvas=document.createElement('canvas');thermalCanvas.width=W;thermalCanvas.height=H;const thermalCtx=thermalCanvas.getContext('2d');
-let S={view:0,range:0,px:0,py:0,zoom:124,tint:70,mlo:22,mhi:38,brt:0,hud:1,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0};
-let camImg=null,thermal=null,dirtyThermal=true,marker=null,markerTemp=null,rec=null,chunks=[],recUrl=null,uiReady=false;
+let S={view:0,range:0,px:0,py:0,zoom:124,tint:70,mlo:22,mhi:38,brt:0,hud:1,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camFps:0,camReqFps:0,mlxFps:0,thermalReqFps:0,apiFps:0,loopFps:0,heap:0,psram:0,portalMs:0};
+let camImg=null,camUrl=null,thermal=null,dirtyThermal=true,marker=null,markerTemp=null,rec=null,chunks=[],recUrl=null,uiReady=false,running=true,stopping=false;
+let camTimer=0,thermalTimer=0,stateTimer=0,camBusy=false,thermalBusy=false,stateBusy=false,camFail=0,thermalFail=0,stateFail=0,overlayCamMs=83,camFastStreak=0,recStarted=0,recTick=0,recStopResolve=null;
+const activeControls=new Set();
 const $=id=>document.getElementById(id);
 function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
 function pal(i){let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]}
 const PAL=Array.from({length:256},(_,i)=>pal(i));
+function fetchTimeout(url,opt={},ms=1500){if(!window.AbortController)return fetch(url,opt);let c=new AbortController(),t=setTimeout(()=>c.abort(),ms);return fetch(url,Object.assign({},opt,{signal:c.signal})).finally(()=>clearTimeout(t))}
+function setConn(txt,bad){let e=$('connState');e.textContent=txt;e.classList.toggle('bad',!!bad)}
+function backoff(n){return Math.min(2000,250*Math.pow(2,Math.min(n,3)))}
 function tempAt(x,y){if(!thermal)return null;let tx=x*32/W,ty=y*24/H,x0=clamp(Math.floor(tx),0,31),y0=clamp(Math.floor(ty),0,23),x1=clamp(x0+1,0,31),y1=clamp(y0+1,0,23),fx=tx-x0,fy=ty-y0;function t(r,c){return thermal[r*32+(31-c)]}let a=t(y0,x0),b=t(y0,x1),c=t(y1,x0),d=t(y1,x1);return (a*(1-fx)+b*fx)*(1-fy)+(c*(1-fx)+d*fx)*fy}
 function rebuildThermal(){if(!thermal)return;let img=thermalCtx.createImageData(W,H),d=img.data,lo=S.lo,hi=S.hi,den=(hi-lo)||1;for(let y=0;y<H;y++){for(let x=0;x<W;x++){let t=tempAt(x,y),idx=clamp(Math.round((t-lo)/den*255),0,255),p=PAL[idx],o=(y*W+x)*4;d[o]=p[0];d[o+1]=p[1];d[o+2]=p[2];d[o+3]=255}}thermalCtx.putImageData(img,0,0);dirtyThermal=false}
 function drawCamera(c){if(!camImg)return;let z=clamp(+S.zoom||100,100,250),cw=Math.round(W*100/z),ch=Math.round(H*100/z),sx=(W-cw)/2-(S.px||0)*cw/W,sy=(H-ch)/2-(S.py||0)*ch/H;sx=clamp(sx,0,W-cw);sy=clamp(sy,0,H-ch);c.drawImage(camImg,sx,sy,cw,ch,0,0,W,H)}
@@ -2045,18 +2144,35 @@ function drawCross(c){c.save();c.strokeStyle='#fff';c.lineWidth=1;c.beginPath();
 function drawScene(c,withHud){c.clearRect(0,0,W,H);c.fillStyle='#000';c.fillRect(0,0,W,H);let v=+S.view;if((v===0||v===1)&&camImg)drawCamera(c);if((v===0||v===2)&&thermal){if(dirtyThermal)rebuildThermal();c.save();if(v===0){c.globalCompositeOperation='lighter';c.globalAlpha=(+S.tint||0)/100}c.drawImage(thermalCanvas,0,0);c.restore()}if(S.crosshair)drawCross(c);if(marker){c.strokeStyle='#9fe870';c.beginPath();c.arc(marker.x,marker.y,6,0,Math.PI*2);c.stroke()}if(withHud)drawHud(c)}
 function render(){drawScene(ctx,$('hud').checked);if(rec)drawScene(recCtx,$('recHud').checked);requestAnimationFrame(render)}
 function fmt(v){return Number.isFinite(+v)?(+v).toFixed(1):'--'}
-function setVal(id,v){let e=$(id);if(document.activeElement!==e)e.value=v}
-function updateLabels(){['px','py','zoom','tint','mlo','mhi','brt'].forEach(id=>$(id+'v').textContent=$(id).value+(id==='zoom'||id==='tint'?'%':id==='mlo'||id==='mhi'?'C':''));$('tCenter').textContent=fmt(S.tCenter);$('tSpan').textContent=`${fmt(S.tMin)}-${fmt(S.tMax)}`;$('tRange').textContent=`${fmt(S.lo)}-${fmt(S.hi)}`;$('camFps').textContent=fmt(S.camFps);$('mlxFps').textContent=fmt(S.mlxFps);$('apiFps').textContent=fmt(S.apiFps);$('heap').textContent=S.heap?Math.round(S.heap/1024)+'K':'--';$('seq').textContent=S.seq||'--';$('markerTemp').textContent=markerTemp==null?'--':fmt(markerTemp)}
-function applyState(s){Object.assign(S,s);if(!uiReady){setVal('px',S.px);setVal('py',S.py);setVal('zoom',S.zoom);setVal('tint',S.tint);setVal('mlo',S.mlo);setVal('mhi',S.mhi);setVal('brt',S.brt);$('rangeMode').value=S.range;$('viewMode').value=S.view;$('hud').checked=!!S.hud;$('crosshair').checked=!!S.crosshair;uiReady=true}S.lo=s.rangeLo;S.hi=s.rangeHi;dirtyThermal=true;updateLabels();$('ssid').textContent=s.ssid||'ThermalCam';$('ip').textContent=s.ip||'192.168.4.1'}
-async function getState(){try{let r=await fetch('/api/state',{cache:'no-store'});applyState(await r.json())}catch(e){}setTimeout(getState,700)}
-async function getThermal(){try{let r=await fetch('/thermal.bin',{cache:'no-store'}),b=await r.arrayBuffer(),dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;thermal=a;S.seq=+(r.headers.get('X-Frame-Seq')||S.seq);S.lo=+(r.headers.get('X-Range-Lo')||S.lo);S.hi=+(r.headers.get('X-Range-Hi')||S.hi);dirtyThermal=true;if(marker)markerTemp=tempAt(marker.x,marker.y);updateLabels()}catch(e){}setTimeout(getThermal,120)}
-async function getCam(){try{let r=await fetch('/cam.jpg',{cache:'no-store'});if(r.ok){let blob=await r.blob(),url=URL.createObjectURL(blob),img=new Image();img.onload=()=>{if(camImg&&camImg.src)URL.revokeObjectURL(camImg.src);camImg=img};img.src=url}}catch(e){}setTimeout(getCam,20)}
-let sendTimer=null,pending={};function send(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(async()=>{let p=new URLSearchParams(pending);pending={};try{await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p})}catch(e){}},90)}
-['px','py','zoom','tint','mlo','mhi','brt'].forEach(id=>$(id).addEventListener('input',e=>{S[id]=+e.target.value;dirtyThermal=true;updateLabels();send({[id]:e.target.value})}));
-$('rangeMode').onchange=e=>{S.range=+e.target.value;send({range:S.range})};$('viewMode').onchange=e=>{S.view=+e.target.value;send({view:S.view})};$('hud').onchange=e=>{S.hud=e.target.checked?1:0;send({hud:S.hud})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;send({crosshair:S.crosshair})};$('resetAlign').onclick=()=>send({reset_alignment:1});$('stopPortal').onclick=()=>send({stop_stream:1});$('snap').onclick=()=>{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()};
+function kb(v){return v?Math.round(v/1024)+'K':'--'}
+function mmss(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60);s%=60;return m+':'+String(s).padStart(2,'0')}
+function setVal(id,v){let e=$(id);if(e&&!activeControls.has(id))e.value=v}
+function setCheck(id,v){let e=$(id);if(e&&!activeControls.has(id))e.checked=!!v}
+function updateLabels(){$('pxv').textContent=S.px;$('pyv').textContent=S.py;$('zoomv').textContent=S.zoom+'%';$('tintv').textContent=S.tint+'%';$('mlov').textContent=fmt(S.mlo)+'C';$('mhiv').textContent=fmt(S.mhi)+'C';$('brtv').textContent=S.brt;$('tCenter').textContent=fmt(S.tCenter);$('tSpan').textContent=`${fmt(S.tMin)}-${fmt(S.tMax)}`;$('tRange').textContent=`${fmt(S.lo)}-${fmt(S.hi)}`;$('camFps').textContent=fmt(S.camFps);$('camReqFps').textContent=fmt(S.camReqFps);$('mlxFps').textContent=fmt(S.mlxFps);$('thermalReqFps').textContent=fmt(S.thermalReqFps);$('apiFps').textContent=fmt(S.apiFps);$('loopFps').textContent=fmt(S.loopFps);$('heap').textContent=kb(S.heap);$('psram').textContent=kb(S.psram);$('seq').textContent=S.seq||'--';$('uptime').textContent=mmss(S.portalMs);$('markerTemp').textContent=markerTemp==null?'--':fmt(markerTemp)}
+function syncControls(){setVal('px',S.px);setVal('py',S.py);setVal('zoom',S.zoom);setVal('tint',S.tint);setVal('mlo',S.mlo);setVal('mhi',S.mhi);setVal('brt',S.brt);setVal('rangeMode',S.range);setVal('viewMode',S.view);setCheck('hud',S.hud);setCheck('crosshair',S.crosshair);uiReady=true}
+function applyState(s){Object.assign(S,s);S.lo=s.rangeLo;S.hi=s.rangeHi;syncControls();dirtyThermal=true;updateLabels();$('ssid').textContent=s.ssid||'ThermalCam';$('ip').textContent=s.ip||'192.168.4.1'}
+function camTargetMs(){let v=+S.view;if(v===2)return 0;if(v===1)return 67;return overlayCamMs}
+function thermalTargetMs(){return +S.view===1?500:125}
+function tuneOverlay(dur){if(+S.view!==0)return;if(dur<60){camFastStreak++;if(camFastStreak>=15)overlayCamMs=67}else camFastStreak=0;if(dur>110)overlayCamMs=120;else if(dur>85)overlayCamMs=100;else if(dur<75&&overlayCamMs>83)overlayCamMs=83}
+function scheduleCam(dur=0,fail=false){clearTimeout(camTimer);if(!running||+S.view===2)return;let d=fail?backoff(camFail):Math.max(0,camTargetMs()-dur);camTimer=setTimeout(getCam,d)}
+function scheduleThermal(dur=0,fail=false){clearTimeout(thermalTimer);if(!running)return;let d=fail?backoff(thermalFail):Math.max(0,thermalTargetMs()-dur);thermalTimer=setTimeout(getThermal,d)}
+function scheduleState(dur=0,fail=false){clearTimeout(stateTimer);if(!running)return;let d=fail?backoff(stateFail):Math.max(0,700-dur);stateTimer=setTimeout(getState,d)}
+function kickStreams(){if(+S.view!==2)scheduleCam(999,false);scheduleThermal(999,false)}
+async function getState(){if(stateBusy||!running)return;let t=performance.now();stateBusy=true;try{let r=await fetchTimeout('/api/state',{cache:'no-store'},1500);if(!r.ok)throw new Error(r.status);applyState(await r.json());stateFail=0;setConn('online',false)}catch(e){stateFail++;setConn('state retry',true)}finally{stateBusy=false;scheduleState(performance.now()-t,stateFail>0)}}
+async function getThermal(){if(thermalBusy||!running)return;let t=performance.now();thermalBusy=true;try{let r=await fetchTimeout('/thermal.bin',{cache:'no-store'},1500);if(!r.ok)throw new Error(r.status);let b=await r.arrayBuffer();if(b.byteLength<1536)throw new Error('short thermal');let dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;thermal=a;S.seq=+(r.headers.get('X-Frame-Seq')||S.seq);S.lo=+(r.headers.get('X-Range-Lo')||S.lo);S.hi=+(r.headers.get('X-Range-Hi')||S.hi);dirtyThermal=true;if(marker)markerTemp=tempAt(marker.x,marker.y);thermalFail=0;setConn('online',false);updateLabels()}catch(e){thermalFail++;setConn('thermal retry',true)}finally{thermalBusy=false;scheduleThermal(performance.now()-t,thermalFail>0)}}
+async function getCam(){if(camBusy||!running||+S.view===2)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1500);if(!r.ok)throw new Error(r.status);let blob=await r.blob(),url=URL.createObjectURL(blob),img=new Image();img.onload=()=>{if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img};img.onerror=()=>URL.revokeObjectURL(url);img.src=url;camFail=0;setConn('online',false);tuneOverlay(performance.now()-t)}catch(e){camFail++;setConn('cam retry',true)}finally{camBusy=false;scheduleCam(performance.now()-t,camFail>0)}}
+let sendTimer=null,pending={};async function postControl(o){let p=new URLSearchParams(o);let r=await fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p},1800);if(!r.ok)throw new Error(r.status);return r}
+function flushSend(){let p=pending;pending={};postControl(p).then(()=>setConn('online',false)).catch(()=>setConn('control retry',true))}
+function send(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(flushSend,90)}
+['px','py','zoom','tint','mlo','mhi','brt'].forEach(id=>{let e=$(id);['pointerdown','touchstart','focus'].forEach(ev=>e.addEventListener(ev,()=>activeControls.add(id)));['pointerup','pointercancel','touchend','blur','change'].forEach(ev=>e.addEventListener(ev,()=>activeControls.delete(id)));e.addEventListener('input',ev=>{S[id]=+ev.target.value;dirtyThermal=true;updateLabels();send({[id]:ev.target.value})})});
+['rangeMode','viewMode','hud','crosshair'].forEach(id=>{let e=$(id);['focus','pointerdown','touchstart'].forEach(ev=>e.addEventListener(ev,()=>activeControls.add(id)));['blur','change','pointerup','touchend'].forEach(ev=>e.addEventListener(ev,()=>activeControls.delete(id)))});
+$('rangeMode').onchange=e=>{S.range=+e.target.value;send({range:S.range})};$('viewMode').onchange=e=>{S.view=+e.target.value;dirtyThermal=true;send({view:S.view});kickStreams()};$('hud').onchange=e=>{S.hud=e.target.checked?1:0;send({hud:S.hud})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;send({crosshair:S.crosshair})};$('resetAlign').onclick=()=>send({reset_alignment:1});$('stopPortal').onclick=stopPortal;$('snap').onclick=()=>{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()};
 canvas.onclick=e=>{let r=canvas.getBoundingClientRect();marker={x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height};markerTemp=tempAt(marker.x,marker.y);updateLabels()};
 function recType(){let types=['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];return types.find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||''}
-$('recBtn').onclick=()=>{if(rec){rec.stop();return}if(!recCanvas.captureStream||!window.MediaRecorder){$('saveMsg').textContent='Browser recording is unavailable. Use screen recording.';return}chunks=[];let stream=recCanvas.captureStream(15),type=recType();rec=new MediaRecorder(stream,type?{mimeType:type}:undefined);rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};rec.onstop=()=>{let blob=new Blob(chunks,{type:type||'video/webm'});if(recUrl)URL.revokeObjectURL(recUrl);recUrl=URL.createObjectURL(blob);let a=document.createElement('a');a.href=recUrl;a.download='thermal-stream.'+(type.includes('mp4')?'mp4':'webm');a.textContent='Download recording';$('saveMsg').replaceChildren(a);$('recBtn').textContent='Start recording';$('recState').textContent='idle';rec=null};rec.start(1000);$('recBtn').textContent='Stop recording';$('recState').textContent='recording';$('recState').classList.add('rec')};
+function updateRecElapsed(){if(!rec)return;let elapsed=Date.now()-recStarted;$('recState').textContent='rec '+mmss(elapsed);if(elapsed>60000)$('saveMsg').textContent='Recording is still in browser memory. Stop before leaving this page.'}
+function stopRecording(){if(!rec)return Promise.resolve();return new Promise(resolve=>{recStopResolve=resolve;rec.stop()})}
+$('recBtn').onclick=async()=>{if(rec){await stopRecording();return}if(!recCanvas.captureStream||!window.MediaRecorder){$('saveMsg').textContent='Browser recording is unavailable. Use screen recording.';return}chunks=[];let stream=recCanvas.captureStream(15),type=recType();rec=new MediaRecorder(stream,type?{mimeType:type}:undefined);rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};rec.onstop=()=>{clearInterval(recTick);let blob=new Blob(chunks,{type:type||'video/webm'});if(recUrl)URL.revokeObjectURL(recUrl);recUrl=URL.createObjectURL(blob);let a=document.createElement('a');a.href=recUrl;a.download='thermal-stream.'+(type.includes('mp4')?'mp4':'webm');a.textContent='Download recording';$('saveMsg').replaceChildren(a);$('recBtn').textContent='Start recording';$('recState').textContent='idle';$('recState').classList.remove('rec');rec=null;if(recStopResolve){recStopResolve();recStopResolve=null}};rec.start(1000);recStarted=Date.now();recTick=setInterval(updateRecElapsed,500);$('recBtn').textContent='Stop recording';$('recState').classList.add('rec');updateRecElapsed()};
+async function stopPortal(){if(stopping)return;stopping=true;$('stopPortal').disabled=true;clearTimeout(sendTimer);pending={};if(rec)await stopRecording();running=false;clearTimeout(camTimer);clearTimeout(thermalTimer);clearTimeout(stateTimer);setConn('stopping',true);try{await postControl({stop_stream:1});$('saveMsg').textContent='Portal stopping. Hold the button for 3 seconds if the browser loses connection first.'}catch(e){$('saveMsg').textContent='Stop request failed. Hold the physical button for 3 seconds to exit.';setConn('stop failed',true)}}
 getState();getThermal();getCam();render();
 </script></body></html>
 )STREAMHTML";
@@ -2318,32 +2434,60 @@ void handlePortalIndex() {
   }
 }
 
+size_t streamJpgChunk(void *arg, size_t index, const void *data, size_t len) {
+  (void)index;
+  WebServer *server = (WebServer*)arg;
+  server->sendContent((const char*)data, len);
+  return len;
+}
+
 void handleStreamCameraJpg() {
   if (!stream_mode) {
     share_server.send(404, "text/plain", "Stream portal is not active");
     return;
   }
+
+  noteStreamRequest(stream_cam_req_count, stream_cam_req_timer_ms,
+                    stream_cam_req_fps);
+
+#if STREAM_CAMERA_NATIVE_JPEG
+  if (stream_native_jpeg_active) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      share_server.send(404, "text/plain", "No camera frame available");
+      return;
+    }
+
+    share_server.sendHeader("Cache-Control", "no-store");
+    if (fb->format == PIXFORMAT_JPEG) {
+      share_server.setContentLength(fb->len);
+      share_server.send(200, "image/jpeg", "");
+      WiFiClient client = share_server.client();
+      client.write(fb->buf, fb->len);
+    } else {
+      share_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+      share_server.send(200, "image/jpeg", "");
+      bool ok = frame2jpg_cb(fb, STREAM_JPEG_QUALITY, streamJpgChunk,
+                             &share_server);
+      if (!ok) Serial.println("Stream camera: JPEG callback failed");
+    }
+    esp_camera_fb_return(fb);
+    return;
+  }
+#endif
+
   if (!cam_have_frame || !cam_snapshot) {
     share_server.send(404, "text/plain", "No camera frame available");
     return;
   }
 
-  uint8_t *jpg = nullptr;
-  size_t jpg_len = 0;
-  bool ok = fmt2jpg(cam_snapshot, cam_snapshot_len, IMG_W, IMG_H,
-                    PIXFORMAT_RGB565, STREAM_JPEG_QUALITY, &jpg, &jpg_len);
-  if (!ok || !jpg || !jpg_len) {
-    if (jpg) free(jpg);
-    share_server.send(500, "text/plain", "JPEG conversion failed");
-    return;
-  }
-
   share_server.sendHeader("Cache-Control", "no-store");
-  share_server.setContentLength(jpg_len);
+  share_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   share_server.send(200, "image/jpeg", "");
-  WiFiClient client = share_server.client();
-  client.write(jpg, jpg_len);
-  free(jpg);
+  bool ok = fmt2jpg_cb(cam_snapshot, cam_snapshot_len, IMG_W, IMG_H,
+                       PIXFORMAT_RGB565, STREAM_JPEG_QUALITY,
+                       streamJpgChunk, &share_server);
+  if (!ok) Serial.println("Stream camera: RGB565 JPEG callback failed");
 }
 
 void handleStreamThermalBin() {
@@ -2351,6 +2495,9 @@ void handleStreamThermalBin() {
     share_server.send(404, "text/plain", "Stream portal is not active");
     return;
   }
+
+  noteStreamRequest(stream_thermal_req_count, stream_thermal_req_timer_ms,
+                    stream_thermal_req_fps);
 
   float snap[768];
   uint32_t seq;
@@ -2451,8 +2598,8 @@ void handleStreamControl() {
     parallax_x = 0; parallax_y = 0; zoom_pct = 100; dirty = true;
   }
   if (share_server.hasArg("stop_stream")) {
+    stream_stop_pending = true;
     share_server.send(200, "application/json", "{\"ok\":true,\"stopping\":true}");
-    setStreamMode(false);
     return;
   }
 
@@ -2462,13 +2609,17 @@ void handleStreamControl() {
 }
 
 void handleStreamState() {
-  stream_api_count++;
   uint32_t now = millis();
-  if (!stream_api_timer_ms) stream_api_timer_ms = now;
-  if (now - stream_api_timer_ms >= 1000) {
-    stream_api_fps = stream_api_count * 1000.0f / (now - stream_api_timer_ms);
-    stream_api_count = 0;
-    stream_api_timer_ms = now;
+  noteStreamRequest(stream_api_count, stream_api_timer_ms, stream_api_fps);
+  if (stream_cam_req_timer_ms && now - stream_cam_req_timer_ms > 1500) {
+    stream_cam_req_count = 0;
+    stream_cam_req_fps = 0.0f;
+    stream_cam_req_timer_ms = now;
+  }
+  if (stream_thermal_req_timer_ms && now - stream_thermal_req_timer_ms > 1500) {
+    stream_thermal_req_count = 0;
+    stream_thermal_req_fps = 0.0f;
+    stream_thermal_req_timer_ms = now;
   }
 
   float lo, hi;
@@ -2481,7 +2632,7 @@ void handleStreamState() {
   portEXIT_CRITICAL(&mlx_mux);
 
   String json;
-  json.reserve(900);
+  json.reserve(1100);
   json += F("{\"stream\":");
   json += stream_mode ? F("true") : F("false");
   json += F(",\"ssid\":\""); json += share_ap_ssid; json += F("\"");
@@ -2504,11 +2655,15 @@ void handleStreamState() {
   json += F(",\"tMax\":"); json += String(mx, 2);
   json += F(",\"seq\":"); json += seq;
   json += F(",\"camFps\":"); json += String(cam_fps, 1);
+  json += F(",\"camReqFps\":"); json += String(stream_cam_req_fps, 1);
   json += F(",\"mlxFps\":"); json += String(mlx_fps, 1);
+  json += F(",\"thermalReqFps\":"); json += String(stream_thermal_req_fps, 1);
   json += F(",\"loopFps\":"); json += String(current_fps, 1);
   json += F(",\"apiFps\":"); json += String(stream_api_fps, 1);
+  json += F(",\"portalMs\":"); json += stream_started_ms ? (now - stream_started_ms) : 0;
   json += F(",\"heap\":"); json += ESP.getFreeHeap();
   json += F(",\"psram\":"); json += ESP.getFreePsram();
+  json += F(",\"nativeJpeg\":"); json += stream_native_jpeg_active ? 1 : 0;
   json += F("}");
   share_server.sendHeader("Cache-Control", "no-store");
   share_server.send(200, "application/json", json);
@@ -2532,7 +2687,7 @@ void configureShareRoutes() {
   share_routes_configured = true;
 }
 
-void startFreezeShareAP() {
+bool startFreezeShareAP() {
   configureShareRoutes();
   uint64_t mac = ESP.getEfuseMac();
   snprintf(share_ap_ssid, sizeof(share_ap_ssid), "ThermalCam-%04X",
@@ -2546,13 +2701,14 @@ void startFreezeShareAP() {
   if (!WiFi.softAP(share_ap_ssid)) {
     share_ap_running = false;
     Serial.println("Share AP: start failed");
-    return;
+    return false;
   }
   share_dns.start(SHARE_DNS_PORT, "*", ip);
   share_server.begin();
   share_ap_running = true;
   Serial.printf("Share AP: connect to %s, open http://%s/\n",
                 share_ap_ssid, ip.toString().c_str());
+  return true;
 }
 
 void stopFreezeShareAP() {
@@ -2598,8 +2754,8 @@ void drawStreamStatusDynamic() {
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
   lcd.setCursor(18, 206);
-  lcd.printf("Cam %.1ffps  MLX %.1ffps  API %.1ffps",
-             cam_fps, mlx_fps, stream_api_fps);
+  lcd.printf("Cam %.1f/%.1ffps  MLX %.1f/%.1ffps",
+             cam_fps, stream_cam_req_fps, mlx_fps, stream_thermal_req_fps);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
   lcd.setCursor(18, 224);
   lcd.printf("Ctr %.1fC  Scene %.1f..%.1fC", t_center, t_min, t_max);
@@ -2618,16 +2774,36 @@ void setStreamMode(bool enabled) {
       releaseFreezeShareSnapshot();
       freeze_mode = false;
     }
-    stream_mode = true;
+
+    stream_stop_pending = false;
+    if (!enterStreamCameraMode()) {
+      Serial.println("Stream portal: camera mode switch failed, continuing");
+    }
     stream_started_ms = millis();
-    stream_api_count = 0;
-    stream_api_timer_ms = stream_started_ms;
-    stream_api_fps = 0.0f;
-    startFreezeShareAP();
+    resetStreamDiagnostics(stream_started_ms);
+    if (!startFreezeShareAP()) {
+      stopFreezeShareAP();
+      exitStreamCameraMode();
+      stream_started_ms = 0;
+      lcd.fillScreen(TFT_BLACK);
+      lcd.setTextColor(TFT_RED, TFT_BLACK);
+      lcd.setTextSize(2);
+      lcd.setCursor(18, 130); lcd.print("STREAM AP FAIL");
+      lcd.setTextSize(1);
+      delay(1200);
+      lcd.fillScreen(TFT_BLACK);
+      drawStaticUI();
+      last_ui_ms = millis();
+      Serial.println("Stream portal: AP failed, staying in normal mode");
+      return;
+    }
+    stream_mode = true;
     drawStreamStatusScreen();
   } else {
     stopFreezeShareAP();
+    exitStreamCameraMode();
     stream_mode = false;
+    stream_stop_pending = false;
     stream_started_ms = 0;
     lcd.setBrightness(255);
     lcd.fillScreen(TFT_BLACK);
@@ -2645,7 +2821,9 @@ void setFreezeMode(bool enabled) {
   if (enabled) {
     freeze_mode = true;
     captureFreezeShareSnapshot();
-    startFreezeShareAP();
+    if (!startFreezeShareAP()) {
+      Serial.println("Freeze: AP start failed, frozen frame remains local");
+    }
   } else {
     stopFreezeShareAP();
     releaseFreezeShareSnapshot();
@@ -3126,6 +3304,9 @@ void loop() {
     setFreezeMode(!freeze_mode);
   }
   handleFreezeShareAP();
+  if (stream_stop_pending) {
+    setStreamMode(false);
+  }
 
   if (!stream_mode) handleTouch();
 
