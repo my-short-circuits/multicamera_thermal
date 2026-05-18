@@ -15,7 +15,7 @@ The sketch is configured for this hardware stack:
 | OV3660 (tested) or OV2640 (auto-detected via PID) | Visible camera | Captured as 320x240 RGB565 into PSRAM. The OV3660 is mounted with `vflip=1` because it is upside-down relative to the OV2640 it replaced; sensor type is detected at runtime in `initCamera()`. |
 | Melexis MLX90640 (32x24, ~55x35 deg FOV) | Thermal sensor | Standard FOV variant assumed. Runs on a dedicated `Wire1` bus at 1 MHz. |
 | Momentary pushbutton | Freeze / share control | Normally-open between GPIO10 and GND, using `INPUT_PULLUP`. Short press toggles freeze + WiFi share. |
-| Optional SD card | Currently disabled | Historical SD bring-up code is retained but commented out — the freeze/WiFi server is the active save path. See "SD card status" below. |
+| Optional SD card | Not used | SD storage is intentionally disabled on this hardware. The freeze/WiFi export and browser portal are the supported save paths. |
 
 ## Pinout
 
@@ -104,12 +104,12 @@ Selecting `MAN` automatically switches the side panel to the RANGE tab so the ma
 The GT911 UI provides:
 
 - **Top of side panel**: tab row to switch between `POS` (alignment) and `RANGE` (manual range) views.
-- **POS tab**: `X` and `Y` parallax sliders, `ZOOM` slider, `TINT` slider, `ADJ` lock and `RST` (alignment reset). RST and the alignment sliders are dimmed when ADJ is locked, to prevent accidental touches.
+- **POS tab**: `X` and `Y` parallax sliders, `ZOOM` slider, `TINT` slider, `ADJ` lock, `ROT` orientation toggle, and `RST` (alignment reset). RST and the alignment sliders are dimmed when ADJ is locked, to prevent accidental touches.
 - **RANGE tab**: `LO` and `HI` sliders. Each has `-` and `+` nudge buttons that move by 0.1 deg C while preserving a minimum 1.0 deg C span.
 - **Top bar**: mode and range cycle buttons.
 - **Bottom bar**: 5-step camera brightness control (-2..+2). Brightness is applied via the OV2640/OV3660 hardware register over SCCB, so it costs zero CPU per pixel — one I2C write when the value changes and the sensor's analogue front-end does the rest.
 
-Settings persist in NVS via `Preferences` after a debounce period. 
+Landscape/portrait orientation and the alignment/range settings persist in NVS via `Preferences` after a debounce period.
  
 
 ### Freeze and WiFi export
@@ -162,10 +162,15 @@ back to live preview/control if the connected browser cannot record.
 
 ### SD card status
 
-The repository contains historical SD-card bring-up and BMP-writing code (bit-banged CMD0 idle, two-phase mount via `esp_vfs_fat_sdspi_mount`, etc.), but the SD path is disabled in `setup()`. On this hardware the ILI9488 panel keeps driving MISO even when its CS is high, which contends with the SD card's MISO line and can blank the LCD when the card is hot-plugged. The freeze/WiFi server is the practical save path on this panel; SD requires a hardware fix (cut the GDI ribbon's MISO trace and treat the LCD as write-only, add a Schottky diode + pullup, etc.) that is out of scope for this firmware.
+The firmware does not use local SD storage. On this hardware the LCD/SD shared SPI wiring has been unreliable enough that the supported save paths are WiFi freeze export and browser-side video recording. Treat SD support as a future hardware investigation, not a firmware feature in this repository.
+
 ## Build Requirements
 
-make sure you get this: DFRobot_AXP313A 1.0.1 and all the other libraries listed.
+Install these Arduino dependencies before compiling:
+
+- ESP32 board package 2.x with `DFRobot FireBeetle 2 ESP32-S3` support.
+- LovyanGFX, tested with 1.2.x.
+- DFRobot_AXP313A, tested with 1.0.x.
 
 The Melexis MLX90640 API sources needed by the sketch are included in this repository:
 
@@ -191,4 +196,4 @@ The Melexis MLX90640 API sources needed by the sketch are included in this repos
 
 - Manual alignment depends on the camera lens, MLX90640 variant, and physical mounting. Reset is intentionally gated behind the ADJ lock so the alignment doesn't reset when you grab the device.
 - The WiFi export AP is open while freeze mode is active. There is no password, on purpose, because the AP is short-lived.
-- Battery display is hidden unless `BATTERY_ADC_PIN` is wired to an ADC GPIO and the divider is sized for the cell
+- Battery display is hidden unless `BATTERY_ADC_PIN` is wired to an ADC GPIO and the divider is sized for the cell.

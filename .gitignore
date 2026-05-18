@@ -19,6 +19,7 @@ out/
 # Local debug artifacts not required to build the sketch
 debug.cfg
 debug_custom.json
+debug.log
 esp32.svd
 
 # OS cruft

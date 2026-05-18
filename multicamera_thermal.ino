@@ -8,23 +8,16 @@
  * Thermal  : Melexis MLX90640 32x24, on dedicated Wire1 @ 1 MHz
  *
  * Init order (every step is load-bearing — don't reorder casually):
- *   1. SD_CS (GPIO9) HIGH before any SPI traffic.
- *   2. Wire.begin(1, 2) @ 100 kHz — shared bus for AXP / GT911 / SCCB.
- *   3. AXP313A enable camera power, then 500 ms.
- *   4. esp_camera_init BEFORE lcd.init (LCD touches Wire internals).
+ *   1. Wire.begin(1, 2) @ 100 kHz — shared bus for AXP / GT911 / SCCB.
+ *   2. AXP313A enable camera power, then 500 ms.
+ *   3. esp_camera_init BEFORE lcd.init (LCD touches Wire internals).
  *      Camera shares Wire's I2C driver via pin_sccb_*=-1, sccb_i2c_port=0.
- *   5. GT911 manual reset pulse: INT low 11 ms → input → 50 ms (selects 0x5D).
- *   6. SD.begin BEFORE lcd.init. The card sits in 4-bit "SD-mode" until it
- *      sees CMD0 and only then tristates MISO when CS is HIGH. If lcd.init
- *      runs first, its panel-ID read returns garbage and the ILI9488 ends
- *      up in a wonky state — backlight on, screen never paints. Mounting
- *      the card first is what the ESP-IDF SDSPI sharing docs recommend
- *      (esp_vfs_fat_sdspi_mount) and matches LovyanGFX issue #248.
- *   7. lcd.init, rotation 1.
- *   8. Wire1.begin(11, 14) @ 1 MHz, MLX init.
+ *   4. GT911 manual reset pulse: INT low 11 ms → input → 50 ms (selects 0x5D).
+ *   5. lcd.init, then apply the saved landscape/portrait orientation.
+ *   6. Wire1.begin(11, 14) @ 1 MHz, MLX init.
  *
  * Pinout — verified, do not change without re-verifying GDI ribbon:
- *   GDI    : SCLK=17 MOSI=15 MISO=16 DC=3 RST=38 CS=18 SD_CS=9 BL=21
+ *   GDI    : SCLK=17 MOSI=15 MISO=16 DC=3 RST=38 CS=18 BL=21
  *            TOUCH SDA=1 SCL=2 INT=13   (TCS=GPIO12 is on the ribbon — avoid!)
  *   CAMERA : XCLK=45 SIOD=1 SIOC=2 D0..D7=39,40,41,4,7,8,46,48
  *            VSYNC=6 HREF=42 PCLK=5
@@ -52,10 +45,10 @@
  *   PSRAM buffer immediately and esp_camera_fb_return() before rendering, so
  *   the camera DMA never has to wait on the LCD push.
  *
- * Known unsolved: SD card on shared SPI kills the LCD. Not addressed here —
- * SD path stays disabled; SD_CS parked HIGH at boot.
+ * Known unsolved: SD card on shared SPI kills the LCD. SD storage is disabled;
+ * use the freeze export or browser portal instead.
  *
- * Build: ESP32 Arduino core 3.x, "DFRobot FireBeetle 2 ESP32-S3", USB CDC On
+ * Build: ESP32 Arduino core 2.x, "DFRobot FireBeetle 2 ESP32-S3", USB CDC On
  *        Boot, 16MB Flash, partition 16M (3MB APP / 9.9MB FATFS), OPI PSRAM.
  * Libs : LovyanGFX, DFRobot_AXP313A, Melexis MLX90640_API (with Wire1 patch).
  * ============================================================================
@@ -69,9 +62,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#include <esp_vfs_fat.h>
-#include <driver/sdspi_host.h>
-#include <sdmmc_cmd.h>
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "DFRobot_AXP313A.h"
@@ -88,6 +78,9 @@
 #ifndef STREAM_CAMERA_NATIVE_JPEG
 #define STREAM_CAMERA_NATIVE_JPEG 0
 #endif
+#ifndef STREAM_CAMERA_CHUNKED_JPEG
+#define STREAM_CAMERA_CHUNKED_JPEG 0
+#endif
 
 // ---------------------------------------------------------------- Pins ----
 #define TFT_SCLK 17
@@ -97,7 +90,6 @@
 #define TFT_RST  38
 #define TFT_CS   18
 #define TFT_BL   21
-//#define SD_CS     9
 #define TOUCH_SDA 1
 #define TOUCH_SCL 2
 #define TOUCH_INT 13
@@ -165,8 +157,8 @@ LGFX lcd;
 DFRobot_AXP313A axp;
 
 // ---------------------------------------------------------------- Layout --
-static constexpr int IMG_X = 24;
-static constexpr int IMG_Y = 40;
+static int IMG_X = 24;
+static int IMG_Y = 40;
 static constexpr int IMG_W = 320;
 static constexpr int IMG_H = 240;
 static constexpr int CROSS_CX = IMG_W / 2;
@@ -930,6 +922,7 @@ volatile DisplayMode display_mode = MODE_TINT;
 volatile RangeMode range_mode = RANGE_AUTO;
 volatile bool freeze_mode = false;
 volatile bool stream_mode = false;
+volatile bool ui_portrait = false;
 volatile uint8_t stream_view_mode = 0;  // 0=overlay, 1=camera, 2=thermal
 volatile bool stream_hud_enabled = true;
 volatile bool stream_crosshair_enabled = true;
@@ -1003,6 +996,7 @@ void loadSettings() {
   manual_lo    = prefs.getFloat("mlo", 22.0f);
   manual_hi    = prefs.getFloat("mhi", 38.0f);
   uint8_t pt   = prefs.getUChar("ptab", PANEL_TAB_POS);
+  ui_portrait  = prefs.getBool ("port", false);
   prefs.end();
   // Defensive clamps in case ranges have moved across firmware versions.
   if (parallax_x < PARALLAX_MIN) parallax_x = PARALLAX_MIN; else if (parallax_x > PARALLAX_MAX) parallax_x = PARALLAX_MAX;
@@ -1037,6 +1031,7 @@ void saveSettings() {
   prefs.putFloat("mlo",  manual_lo);
   prefs.putFloat("mhi",  manual_hi);
   prefs.putUChar("ptab", panel_tab);
+  prefs.putBool ("port", ui_portrait);
   prefs.end();
   save_indicator_until_ms = millis() + 1500;
   Serial.printf("Saved: PX=%+d,%+d Z=%d%% Tint=%d%% Brt=%+d Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
@@ -1156,9 +1151,14 @@ bool gt911_read_touch(uint16_t *tx, uint16_t *ty) {
   Wire.beginTransmission(gt911_addr);
   Wire.write(0x81); Wire.write(0x4E); Wire.write(0x00);
   Wire.endTransmission();
-  // GT911 native = 320x480 portrait; we use rotation 1 (landscape).
-  *tx = ry;
-  *ty = 320 - rx;
+  // GT911 native = 320x480 portrait. Rotation 1 remaps to landscape.
+  if (ui_portrait) {
+    *tx = rx;
+    *ty = ry;
+  } else {
+    *tx = ry;
+    *ty = 319 - rx;
+  }
   return true;
 }
 
@@ -1173,11 +1173,11 @@ struct TouchButton {
 bool adjust_unlocked = false;
 uint32_t adjust_unlock_until_ms = 0;
 static constexpr uint32_t ADJUST_UNLOCK_MS = 12000;
-static constexpr int PANEL_X = IMG_X + IMG_W + 4;
-static constexpr int PANEL_W = 480 - PANEL_X - 4;
-static constexpr int PANEL_SLIDER_X = PANEL_X + 4;
-static constexpr int PANEL_SLIDER_W = PANEL_W - 8;
-static constexpr int PANEL_SLIDER_H = 20;
+static int PANEL_X = 348;
+static int PANEL_W = 128;
+static int PANEL_SLIDER_X = 352;
+static int PANEL_SLIDER_W = 120;
+static int PANEL_SLIDER_H = 20;
 static constexpr int PANEL_NUDGE_W  = 22;
 static constexpr int PANEL_NUDGE_GAP = 3;
 static constexpr uint32_t NUDGE_REPEAT_MS = 130;
@@ -1186,12 +1186,12 @@ static constexpr int ZOOM_NUDGE_PCT = 1;
 static constexpr int TINT_NUDGE_PCT = 1;
 static constexpr float MANUAL_NUDGE_C = 0.1f;
 static constexpr float MANUAL_MIN_SPAN_C = 1.0f;
-static constexpr int TAB_ROW_Y     = 58;       // tabs sit between top buttons and X slider
-static constexpr int TAB_ROW_H     = 22;
-static constexpr int X_SLIDER_Y    = 94;
-static constexpr int Y_SLIDER_Y    = 136;
-static constexpr int Z_SLIDER_Y    = 178;
-static constexpr int TINT_SLIDER_Y = 232;
+static int TAB_ROW_Y     = 58;       // tabs sit between top buttons and X slider
+static int TAB_ROW_H     = 22;
+static int X_SLIDER_Y    = 94;
+static int Y_SLIDER_Y    = 136;
+static int Z_SLIDER_Y    = 178;
+static int TINT_SLIDER_Y = 232;
 // In the RANGE tab the slider lineup becomes LO / HI / (empty). The third
 // slot stays at Z_SLIDER_Y — we just clear it instead of drawing a slider.
 // LO and HI reuse the X / Y slider rows so the visual layout stays consistent.
@@ -1214,36 +1214,226 @@ void btnCycleRange() {
 void btnTabPos()   { panel_tab = PANEL_TAB_POS;   markDirty(); }
 void btnTabRange() { panel_tab = PANEL_TAB_RANGE; markDirty(); }
 
+void drawStaticUI();
+void layoutUi();
+
+void applyScreenOrientation() {
+  lcd.setRotation(ui_portrait ? 0 : 1);
+  layoutUi();
+}
+
+void redrawFullUi() {
+  lcd.fillScreen(TFT_BLACK);
+  drawStaticUI();
+}
+
+void btnToggleOrientation() {
+  ui_portrait = !ui_portrait;
+  markDirty();
+  applyScreenOrientation();
+  redrawFullUi();
+}
+
 // Tab-button widths split the panel into two roughly-equal halves with a
 // 4-px gap between them.
-static constexpr int TAB_W = (PANEL_W - 4) / 2;
+static int TAB_W = 62;
+static int SLIDER_X = 352;
+static int SLIDER_Y = 232;
+static int SLIDER_W = 120;
+static int SLIDER_H = 20;
+static int BRT_BAR_X     = 46;
+static int BRT_BAR_Y     = 290;
+static int BRT_CELL_W    = 50;
+static int BRT_CELL_H    = 24;
+static constexpr int BRT_NUM_CELLS = 5;
+static int BRT_CLEAR_X   = 40;
+static int BRT_CLEAR_R   = 336;
+static int PALETTE_X = 5;
+static int PALETTE_Y_TOP = 24;
+static int PALETTE_Y_BOTTOM = 280;
+static int PALETTE_W = 12;
+static int TMAX_LABEL_X = 2;
+static int TMAX_LABEL_Y = 10;
+static int TMIN_LABEL_X = 2;
+static int TMIN_LABEL_Y = 290;
+static int TOPBAR_CLEAR_X = 40;
+static int TOPBAR_CLEAR_W = 440;
+static int TB_TMAX  =   2;
+static int TB_CTR   =  44;
+static int TB_FPS   = 116;
+static int TB_ZOOM  = 162;
+static int TB_PARA  = 200;
+static int TB_MODE  = 256;
+static int TB_MODE_W = 42;
+static int TB_RNG   = 302;
+static int TB_RNG_W = 36;
+static int TB_STAT  = 342;
+static int TB_STAT_W = 24;
+static int TB_BAT   = 412;
+static int READOUT_X = 378;
+static int READOUT_Y = 158;
+static int READOUT_W = 98;
+static int READOUT_H = 10;
+
 TouchButton buttons[] = {
-  {PANEL_X,      22, 40, 28, "ADJ",  TFT_DARKCYAN,  btnToggleAdjust },
-  {PANEL_X + 44, 22, 40, 28, "MODE", TFT_DARKGREEN, btnCycleMode    },
-  {PANEL_X + 88, 22, 40, 28, "RNG",  TFT_PURPLE,    btnCycleRange   },
+  {0, 0, 0, 0, "ADJ",  TFT_DARKCYAN,  btnToggleAdjust },
+  {0, 0, 0, 0, "MODE", TFT_DARKGREEN, btnCycleMode    },
+  {0, 0, 0, 0, "RNG",  TFT_PURPLE,    btnCycleRange   },
+  {0, 0, 0, 0, "ROT",  TFT_DARKGREY,  btnToggleOrientation },
   // Tab row.
-  {PANEL_X,                TAB_ROW_Y, TAB_W, TAB_ROW_H, "POS",   TFT_DARKGREY, btnTabPos   },
-  {PANEL_X + TAB_W + 4,    TAB_ROW_Y, TAB_W, TAB_ROW_H, "RANGE", TFT_DARKGREY, btnTabRange },
-  // Bottom-right reset.
-  {PANEL_X,     286, PANEL_W, 30, "RST", TFT_MAROON, btnReset        },
+  {0, 0, 0, 0, "POS",   TFT_DARKGREY, btnTabPos   },
+  {0, 0, 0, 0, "RANGE", TFT_DARKGREY, btnTabRange },
+  // Reset.
+  {0, 0, 0, 0, "RST", TFT_MAROON, btnReset        },
 };
 const int NUM_BUTTONS = sizeof(buttons) / sizeof(buttons[0]);
 
-static constexpr int SLIDER_X = PANEL_SLIDER_X;
-static constexpr int SLIDER_Y = TINT_SLIDER_Y;
-static constexpr int SLIDER_W = PANEL_SLIDER_W;
-static constexpr int SLIDER_H = PANEL_SLIDER_H;
+void layoutUi() {
+  if (ui_portrait) {
+    IMG_X = 0;
+    IMG_Y = 24;
+    PANEL_X = 4;
+    PANEL_W = 312;
+    PANEL_SLIDER_X = 8;
+    PANEL_SLIDER_W = 304;
+    PANEL_SLIDER_H = 16;
+    TAB_ROW_Y = 296;
+    TAB_ROW_H = 20;
+    X_SLIDER_Y = 330;
+    Y_SLIDER_Y = 362;
+    Z_SLIDER_Y = 394;
+    TINT_SLIDER_Y = 426;
+    TAB_W = (PANEL_W - 4) / 2;
+    SLIDER_X = PANEL_SLIDER_X;
+    SLIDER_Y = TINT_SLIDER_Y;
+    SLIDER_W = PANEL_SLIDER_W;
+    SLIDER_H = PANEL_SLIDER_H;
+    BRT_BAR_X = 32;
+    BRT_BAR_Y = 456;
+    BRT_CELL_W = 42;
+    BRT_CELL_H = 18;
+    BRT_CLEAR_X = 0;
+    BRT_CLEAR_R = 320;
+    PALETTE_X = 0;
+    PALETTE_Y_TOP = IMG_Y;
+    PALETTE_Y_BOTTOM = IMG_Y + IMG_H - 1;
+    PALETTE_W = 0;
+    TMAX_LABEL_X = 2;
+    TMAX_LABEL_Y = 4;
+    TMIN_LABEL_X = 2;
+    TMIN_LABEL_Y = -1;
+    TOPBAR_CLEAR_X = 40;
+    TOPBAR_CLEAR_W = 280;
+    TB_TMAX = TMAX_LABEL_X;
+    TB_CTR = 40;
+    TB_FPS = 108;
+    TB_ZOOM = 150;
+    TB_PARA = 184;
+    TB_MODE = 236;
+    TB_MODE_W = 34;
+    TB_RNG = 272;
+    TB_RNG_W = 30;
+    TB_STAT = -1;
+    TB_STAT_W = 0;
+    TB_BAT = -1;
+    READOUT_X = 0;
+    READOUT_Y = 0;
+    READOUT_W = 0;
+    READOUT_H = 0;
 
-// Brightness slider — five discrete cells (−2..+2) along the bottom strip
-// below the image (image ends at y=280). Sits in the dead space we had
-// before, no overlap with image or with t_min temperature label.
-static constexpr int BRT_BAR_X     = 46;
-static constexpr int BRT_BAR_Y     = 290;
-static constexpr int BRT_CELL_W    = 50;
-static constexpr int BRT_CELL_H    = 24;
-static constexpr int BRT_NUM_CELLS = 5;          // -2, -1, 0, +1, +2
-static constexpr int BRT_CLEAR_X   = 40;
-static constexpr int BRT_CLEAR_R   = BRT_BAR_X + BRT_NUM_CELLS * BRT_CELL_W + 40;
+    const int gap = 4;
+    int bw = (320 - 2 * PANEL_X - gap * 4) / 5;
+    int by = 268;
+    const int top_ids[] = {0, 1, 2, 3, 6};
+    for (int i = 0; i < 5; i++) {
+      TouchButton &b = buttons[top_ids[i]];
+      b.x = PANEL_X + i * (bw + gap);
+      b.y = by;
+      b.w = bw;
+      b.h = 24;
+    }
+    buttons[4].x = PANEL_X;
+    buttons[4].y = TAB_ROW_Y;
+    buttons[4].w = TAB_W;
+    buttons[4].h = TAB_ROW_H;
+    buttons[5].x = PANEL_X + TAB_W + 4;
+    buttons[5].y = TAB_ROW_Y;
+    buttons[5].w = TAB_W;
+    buttons[5].h = TAB_ROW_H;
+  } else {
+    IMG_X = 24;
+    IMG_Y = 40;
+    PANEL_X = IMG_X + IMG_W + 4;
+    PANEL_W = 480 - PANEL_X - 4;
+    PANEL_SLIDER_X = PANEL_X + 4;
+    PANEL_SLIDER_W = PANEL_W - 8;
+    PANEL_SLIDER_H = 20;
+    TAB_ROW_Y = 58;
+    TAB_ROW_H = 22;
+    X_SLIDER_Y = 94;
+    Y_SLIDER_Y = 136;
+    Z_SLIDER_Y = 178;
+    TINT_SLIDER_Y = 232;
+    TAB_W = (PANEL_W - 4) / 2;
+    SLIDER_X = PANEL_SLIDER_X;
+    SLIDER_Y = TINT_SLIDER_Y;
+    SLIDER_W = PANEL_SLIDER_W;
+    SLIDER_H = PANEL_SLIDER_H;
+    BRT_BAR_X = 46;
+    BRT_BAR_Y = 290;
+    BRT_CELL_W = 50;
+    BRT_CELL_H = 24;
+    BRT_CLEAR_X = 40;
+    BRT_CLEAR_R = BRT_BAR_X + BRT_NUM_CELLS * BRT_CELL_W + 40;
+    PALETTE_X = 5;
+    PALETTE_Y_TOP = 24;
+    PALETTE_Y_BOTTOM = 280;
+    PALETTE_W = 12;
+    TMAX_LABEL_X = 2;
+    TMAX_LABEL_Y = 10;
+    TMIN_LABEL_X = 2;
+    TMIN_LABEL_Y = 290;
+    TOPBAR_CLEAR_X = 40;
+    TOPBAR_CLEAR_W = 440;
+    TB_TMAX = 2;
+    TB_CTR = 44;
+    TB_FPS = 116;
+    TB_ZOOM = 162;
+    TB_PARA = 200;
+    TB_MODE = 256;
+    TB_MODE_W = 42;
+    TB_RNG = 302;
+    TB_RNG_W = 36;
+    TB_STAT = 342;
+    TB_STAT_W = 24;
+    TB_BAT = 412;
+    READOUT_X = 378;
+    READOUT_Y = 158;
+    READOUT_W = 98;
+    READOUT_H = 10;
+
+    const int gap = 3;
+    int bw = (PANEL_W - gap * 3) / 4;
+    for (int i = 0; i < 4; i++) {
+      buttons[i].x = PANEL_X + i * (bw + gap);
+      buttons[i].y = 22;
+      buttons[i].w = bw;
+      buttons[i].h = 28;
+    }
+    buttons[4].x = PANEL_X;
+    buttons[4].y = TAB_ROW_Y;
+    buttons[4].w = TAB_W;
+    buttons[4].h = TAB_ROW_H;
+    buttons[5].x = PANEL_X + TAB_W + 4;
+    buttons[5].y = TAB_ROW_Y;
+    buttons[5].w = TAB_W;
+    buttons[5].h = TAB_ROW_H;
+    buttons[6].x = PANEL_X;
+    buttons[6].y = 286;
+    buttons[6].w = PANEL_W;
+    buttons[6].h = 30;
+  }
+}
 
 void drawButtons() {
   for (int i = 0; i < NUM_BUTTONS; i++) {
@@ -2061,6 +2251,7 @@ float stream_cam_req_fps = 0.0f;
 uint32_t stream_thermal_req_count = 0;
 uint32_t stream_thermal_req_timer_ms = 0;
 float stream_thermal_req_fps = 0.0f;
+uint32_t stream_jpeg_fail_count = 0;
 bool stream_stop_pending = false;
 
 static constexpr uint8_t STREAM_VIEW_OVERLAY = 0;
@@ -2093,6 +2284,7 @@ void resetStreamDiagnostics(uint32_t now) {
   stream_thermal_req_count = 0;
   stream_thermal_req_timer_ms = now;
   stream_thermal_req_fps = 0.0f;
+  stream_jpeg_fail_count = 0;
 }
 
 static const char STREAM_PORTAL_HTML[] PROGMEM = R"STREAMHTML(
@@ -2160,7 +2352,8 @@ function scheduleState(dur=0,fail=false){clearTimeout(stateTimer);if(!running)re
 function kickStreams(){if(+S.view!==2)scheduleCam(999,false);scheduleThermal(999,false)}
 async function getState(){if(stateBusy||!running)return;let t=performance.now();stateBusy=true;try{let r=await fetchTimeout('/api/state',{cache:'no-store'},1500);if(!r.ok)throw new Error(r.status);applyState(await r.json());stateFail=0;setConn('online',false)}catch(e){stateFail++;setConn('state retry',true)}finally{stateBusy=false;scheduleState(performance.now()-t,stateFail>0)}}
 async function getThermal(){if(thermalBusy||!running)return;let t=performance.now();thermalBusy=true;try{let r=await fetchTimeout('/thermal.bin',{cache:'no-store'},1500);if(!r.ok)throw new Error(r.status);let b=await r.arrayBuffer();if(b.byteLength<1536)throw new Error('short thermal');let dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;thermal=a;S.seq=+(r.headers.get('X-Frame-Seq')||S.seq);S.lo=+(r.headers.get('X-Range-Lo')||S.lo);S.hi=+(r.headers.get('X-Range-Hi')||S.hi);dirtyThermal=true;if(marker)markerTemp=tempAt(marker.x,marker.y);thermalFail=0;setConn('online',false);updateLabels()}catch(e){thermalFail++;setConn('thermal retry',true)}finally{thermalBusy=false;scheduleThermal(performance.now()-t,thermalFail>0)}}
-async function getCam(){if(camBusy||!running||+S.view===2)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1500);if(!r.ok)throw new Error(r.status);let blob=await r.blob(),url=URL.createObjectURL(blob),img=new Image();img.onload=()=>{if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img};img.onerror=()=>URL.revokeObjectURL(url);img.src=url;camFail=0;setConn('online',false);tuneOverlay(performance.now()-t)}catch(e){camFail++;setConn('cam retry',true)}finally{camBusy=false;scheduleCam(performance.now()-t,camFail>0)}}
+function loadImageUrl(url){return new Promise((resolve,reject)=>{let img=new Image();img.onload=()=>resolve(img);img.onerror=()=>reject(new Error('decode'));img.src=url})}
+async function getCam(){if(camBusy||!running||+S.view===2)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1500);if(!r.ok)throw new Error('http '+r.status);let blob=await r.blob();if(!blob.size)throw new Error('empty');let url=URL.createObjectURL(blob);try{let img=await loadImageUrl(url);if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img;camFail=0;setConn('online',false);tuneOverlay(performance.now()-t)}catch(e){URL.revokeObjectURL(url);throw e}}catch(e){camFail++;setConn(e&&e.message==='decode'?'cam decode retry':'cam retry',true)}finally{camBusy=false;scheduleCam(performance.now()-t,camFail>0)}}
 let sendTimer=null,pending={};async function postControl(o){let p=new URLSearchParams(o);let r=await fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p},1800);if(!r.ok)throw new Error(r.status);return r}
 function flushSend(){let p=pending;pending={};postControl(p).then(()=>setConn('online',false)).catch(()=>setConn('control retry',true))}
 function send(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(flushSend,90)}
@@ -2441,6 +2634,14 @@ size_t streamJpgChunk(void *arg, size_t index, const void *data, size_t len) {
   return len;
 }
 
+void sendStreamJpegBuffer(const uint8_t *jpg, size_t jpg_len) {
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.setContentLength(jpg_len);
+  share_server.send(200, "image/jpeg", "");
+  WiFiClient client = share_server.client();
+  client.write(jpg, jpg_len);
+}
+
 void handleStreamCameraJpg() {
   if (!stream_mode) {
     share_server.send(404, "text/plain", "Stream portal is not active");
@@ -2458,18 +2659,31 @@ void handleStreamCameraJpg() {
       return;
     }
 
-    share_server.sendHeader("Cache-Control", "no-store");
     if (fb->format == PIXFORMAT_JPEG) {
-      share_server.setContentLength(fb->len);
-      share_server.send(200, "image/jpeg", "");
-      WiFiClient client = share_server.client();
-      client.write(fb->buf, fb->len);
+      sendStreamJpegBuffer(fb->buf, fb->len);
     } else {
+#if STREAM_CAMERA_CHUNKED_JPEG
+      share_server.sendHeader("Cache-Control", "no-store");
       share_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
       share_server.send(200, "image/jpeg", "");
       bool ok = frame2jpg_cb(fb, STREAM_JPEG_QUALITY, streamJpgChunk,
                              &share_server);
-      if (!ok) Serial.println("Stream camera: JPEG callback failed");
+      if (!ok) {
+        stream_jpeg_fail_count++;
+        Serial.println("Stream camera: JPEG callback failed");
+      }
+#else
+      uint8_t *jpg = nullptr;
+      size_t jpg_len = 0;
+      bool ok = frame2jpg(fb, STREAM_JPEG_QUALITY, &jpg, &jpg_len);
+      if (ok && jpg && jpg_len) {
+        sendStreamJpegBuffer(jpg, jpg_len);
+      } else {
+        stream_jpeg_fail_count++;
+        share_server.send(500, "text/plain", "JPEG conversion failed");
+      }
+      if (jpg) free(jpg);
+#endif
     }
     esp_camera_fb_return(fb);
     return;
@@ -2481,13 +2695,31 @@ void handleStreamCameraJpg() {
     return;
   }
 
+#if STREAM_CAMERA_CHUNKED_JPEG
   share_server.sendHeader("Cache-Control", "no-store");
   share_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   share_server.send(200, "image/jpeg", "");
   bool ok = fmt2jpg_cb(cam_snapshot, cam_snapshot_len, IMG_W, IMG_H,
                        PIXFORMAT_RGB565, STREAM_JPEG_QUALITY,
                        streamJpgChunk, &share_server);
-  if (!ok) Serial.println("Stream camera: RGB565 JPEG callback failed");
+  if (!ok) {
+    stream_jpeg_fail_count++;
+    Serial.println("Stream camera: RGB565 JPEG callback failed");
+  }
+#else
+  uint8_t *jpg = nullptr;
+  size_t jpg_len = 0;
+  bool ok = fmt2jpg(cam_snapshot, cam_snapshot_len, IMG_W, IMG_H,
+                    PIXFORMAT_RGB565, STREAM_JPEG_QUALITY, &jpg, &jpg_len);
+  if (!ok || !jpg || !jpg_len) {
+    stream_jpeg_fail_count++;
+    if (jpg) free(jpg);
+    share_server.send(500, "text/plain", "JPEG conversion failed");
+    return;
+  }
+  sendStreamJpegBuffer(jpg, jpg_len);
+  free(jpg);
+#endif
 }
 
 void handleStreamThermalBin() {
@@ -2632,7 +2864,7 @@ void handleStreamState() {
   portEXIT_CRITICAL(&mlx_mux);
 
   String json;
-  json.reserve(1100);
+  json.reserve(1200);
   json += F("{\"stream\":");
   json += stream_mode ? F("true") : F("false");
   json += F(",\"ssid\":\""); json += share_ap_ssid; json += F("\"");
@@ -2664,6 +2896,9 @@ void handleStreamState() {
   json += F(",\"heap\":"); json += ESP.getFreeHeap();
   json += F(",\"psram\":"); json += ESP.getFreePsram();
   json += F(",\"nativeJpeg\":"); json += stream_native_jpeg_active ? 1 : 0;
+  json += F(",\"jpegChunked\":"); json += STREAM_CAMERA_CHUNKED_JPEG ? 1 : 0;
+  json += F(",\"camHaveFrame\":"); json += cam_have_frame ? 1 : 0;
+  json += F(",\"jpegFailCount\":"); json += stream_jpeg_fail_count;
   json += F("}");
   share_server.sendHeader("Cache-Control", "no-store");
   share_server.send(200, "application/json", json);
@@ -2731,18 +2966,19 @@ void handleFreezeShareAP() {
 }
 
 void drawStreamStatusScreen() {
+  int x = 18;
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextSize(2);
   lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-  lcd.setCursor(18, 28); lcd.print("STREAM PORTAL");
+  lcd.setCursor(x, 28); lcd.print("STREAM PORTAL");
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  lcd.setCursor(18, 72); lcd.print("Connect WiFi:");
-  lcd.setCursor(18, 88); lcd.print(share_ap_ssid);
-  lcd.setCursor(18, 112); lcd.print("Open:");
-  lcd.setCursor(18, 128); lcd.print("http://192.168.4.1/");
-  lcd.setCursor(18, 160); lcd.print("Browser composes overlay/camera/thermal.");
-  lcd.setCursor(18, 176); lcd.print("Hold button 3s to exit.");
+  lcd.setCursor(x, 72); lcd.print("Connect WiFi:");
+  lcd.setCursor(x, 88); lcd.print(share_ap_ssid);
+  lcd.setCursor(x, 112); lcd.print("Open:");
+  lcd.setCursor(x, 128); lcd.print("http://192.168.4.1/");
+  lcd.setCursor(x, 160); lcd.print("Browser preview + recording.");
+  lcd.setCursor(x, 176); lcd.print("Hold button 3s to exit.");
   stream_last_status_ms = 0;
 }
 
@@ -2750,16 +2986,18 @@ void drawStreamStatusDynamic() {
   uint32_t now = millis();
   if (now - stream_last_status_ms < 1000) return;
   stream_last_status_ms = now;
-  lcd.fillRect(18, 206, 300, 48, TFT_BLACK);
+  int x = 18;
+  int y = ui_portrait ? 224 : 206;
+  lcd.fillRect(x, y, lcd.width() - 2 * x, 54, TFT_BLACK);
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
-  lcd.setCursor(18, 206);
+  lcd.setCursor(x, y);
   lcd.printf("Cam %.1f/%.1ffps  MLX %.1f/%.1ffps",
              cam_fps, stream_cam_req_fps, mlx_fps, stream_thermal_req_fps);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  lcd.setCursor(18, 224);
+  lcd.setCursor(x, y + 18);
   lcd.printf("Ctr %.1fC  Scene %.1f..%.1fC", t_center, t_min, t_max);
-  lcd.setCursor(18, 242);
+  lcd.setCursor(x, y + 36);
   lcd.printf("Heap %luK PSRAM %luK",
              (unsigned long)(ESP.getFreeHeap() / 1024),
              (unsigned long)(ESP.getFreePsram() / 1024));
@@ -2776,6 +3014,7 @@ void setStreamMode(bool enabled) {
     }
 
     stream_stop_pending = false;
+    stream_view_mode = STREAM_VIEW_OVERLAY;
     if (!enterStreamCameraMode()) {
       Serial.println("Stream portal: camera mode switch failed, continuing");
     }
@@ -2847,29 +3086,23 @@ float current_fps = 0, cam_fps = 0, mlx_fps = 0;
 uint32_t last_ui_ms = 0;
 
 void drawStaticUI() {
-  // Side palette gradient.
-  for (int i = 0; i < 256; i++) {
-    int y = 280 - i;
-    if (y >= 24 && y <= 280) lcd.drawFastHLine(5, y, 12, palette_native[i]);
+  layoutUi();
+  if (PALETTE_W > 0) {
+    int palette_h = PALETTE_Y_BOTTOM - PALETTE_Y_TOP + 1;
+    int denom = palette_h > 1 ? palette_h - 1 : 1;
+    for (int y = 0; y < palette_h; y++) {
+      int palette_i = 255 - (y * 255) / denom;
+      lcd.drawFastHLine(PALETTE_X, PALETTE_Y_TOP + y, PALETTE_W,
+                        palette_native[palette_i]);
+    }
   }
-  lcd.drawFastVLine(PANEL_X - 3, 22, 296, TFT_DARKGREY);
+  if (ui_portrait) {
+    lcd.drawFastHLine(0, IMG_Y + IMG_H, lcd.width(), TFT_DARKGREY);
+  } else {
+    lcd.drawFastVLine(PANEL_X - 3, 22, 296, TFT_DARKGREY);
+  }
   drawButtons(); drawAdjustSliders(); drawSlider(); drawBrightnessSlider();
 }
-
-// Top-bar X coordinates — kept as named constants so it's easy to see at a
-// glance that no element overlaps another, and that nothing extends into
-// the image area (image is x=40..360, y=40..280; top bar is y=0..18, so we
-// only have to worry about X collisions across the bar). Numbers are the
-// LEFT edge of each element.
-static constexpr int TB_TMAX  =   2;   // side-palette max  (4 chars)
-static constexpr int TB_CTR   =  44;   // centre temp, 2x size, 6 chars max
-static constexpr int TB_FPS   = 116;   // FPS, ~6 chars
-static constexpr int TB_ZOOM  = 162;   // Z134%
-static constexpr int TB_PARA  = 200;   // P+12,-08
-static constexpr int TB_MODE  = 256;   // mode block (42 wide)
-static constexpr int TB_RNG   = 302;   // range block (36 wide)
-static constexpr int TB_STAT  = 342;   // FRZ / SAV (24 wide)
-static constexpr int TB_BAT   = 412;   // battery readout (right-justified)
 
 void drawDynamicUI() {
   lcd.setTextColor(TFT_WHITE, TFT_BLACK); lcd.setTextSize(1);
@@ -2877,15 +3110,17 @@ void drawDynamicUI() {
 
   // Side palette labels — t_max sits in the top-bar gap on the left,
   // t_min sits in the bottom strip next to the brightness slider.
-  lcd.fillRect(0, 10, 38, 12, TFT_BLACK);
+  lcd.fillRect(TMAX_LABEL_X, TMAX_LABEL_Y, 38, 12, TFT_BLACK);
   snprintf(buf, sizeof(buf), "%4.1fC", t_max);
-  lcd.setCursor(TB_TMAX, 10); lcd.print(buf);
-  lcd.fillRect(0, 290, 38, 12, TFT_BLACK);
-  snprintf(buf, sizeof(buf), "%4.1fC", t_min);
-  lcd.setCursor(2, 290); lcd.print(buf);
+  lcd.setCursor(TB_TMAX, TMAX_LABEL_Y); lcd.print(buf);
+  if (TMIN_LABEL_Y >= 0) {
+    lcd.fillRect(TMIN_LABEL_X, TMIN_LABEL_Y, 38, 12, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%4.1fC", t_min);
+    lcd.setCursor(TMIN_LABEL_X, TMIN_LABEL_Y); lcd.print(buf);
+  }
 
   // Top bar — full-width clear so battery on the right doesn't leave a gap.
-  lcd.fillRect(40, 0, 440, 18, TFT_BLACK);
+  lcd.fillRect(TOPBAR_CLEAR_X, 0, TOPBAR_CLEAR_W, 18, TFT_BLACK);
 
   // Centre temperature, large.
   lcd.setTextSize(2);
@@ -2904,32 +3139,32 @@ void drawDynamicUI() {
   lcd.setCursor(TB_PARA, 5); lcd.print(buf);
 
   // Mode tag.
-  lcd.fillRect(TB_MODE, 2, 42, 14, MODE_BG[display_mode]);
+  lcd.fillRect(TB_MODE, 2, TB_MODE_W, 14, MODE_BG[display_mode]);
   lcd.setTextColor(TFT_BLACK, MODE_BG[display_mode]);
   lcd.setCursor(TB_MODE + 3, 5); lcd.print(MODE_NAMES[display_mode]);
 
   // Range tag.
-  lcd.fillRect(TB_RNG, 2, 36, 14, TFT_PURPLE);
+  lcd.fillRect(TB_RNG, 2, TB_RNG_W, 14, TFT_PURPLE);
   lcd.setTextColor(TFT_WHITE, TFT_PURPLE);
   lcd.setCursor(TB_RNG + 3, 5); lcd.print(RANGE_NAMES[range_mode]);
 
   // Status badge: AP implies a frozen frame is being shared.
-  if (share_ap_running) {
-    lcd.fillRect(TB_STAT, 2, 24, 14, TFT_RED);
+  if (TB_STAT >= 0 && share_ap_running) {
+    lcd.fillRect(TB_STAT, 2, TB_STAT_W, 14, TFT_RED);
     lcd.setTextColor(TFT_WHITE, TFT_RED);
     lcd.setCursor(TB_STAT + 6, 5); lcd.print("AP");
-  } else if (freeze_mode) {
-    lcd.fillRect(TB_STAT, 2, 24, 14, TFT_RED);
+  } else if (TB_STAT >= 0 && freeze_mode) {
+    lcd.fillRect(TB_STAT, 2, TB_STAT_W, 14, TFT_RED);
     lcd.setTextColor(TFT_WHITE, TFT_RED);
     lcd.setCursor(TB_STAT + 3, 5); lcd.print("FRZ");
-  } else if (millis() < save_indicator_until_ms) {
-    lcd.fillRect(TB_STAT, 2, 24, 14, TFT_DARKGREEN);
+  } else if (TB_STAT >= 0 && millis() < save_indicator_until_ms) {
+    lcd.fillRect(TB_STAT, 2, TB_STAT_W, 14, TFT_DARKGREEN);
     lcd.setTextColor(TFT_WHITE, TFT_DARKGREEN);
     lcd.setCursor(TB_STAT + 3, 5); lcd.print("SAV");
   }
 
   // Battery — right-justified. Hidden if BATTERY_ADC_PIN is -1 (default).
-  if (battery_pct >= 0) {
+  if (TB_BAT >= 0 && battery_pct >= 0) {
     uint16_t col = battery_pct < 20 ? TFT_RED
                  : battery_pct < 50 ? TFT_YELLOW
                                     : TFT_GREEN;
@@ -2939,305 +3174,62 @@ void drawDynamicUI() {
   }
 
   // Right-column readout under the X+/Y+ buttons.
-  lcd.fillRect(378, 158, 98, 10, TFT_BLACK);
-  lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-  if (share_ap_running) {
-    snprintf(buf, sizeof(buf), "%s", share_ap_ssid);
-  } else {
-    snprintf(buf, sizeof(buf), "X%+d Y%+d", parallax_x, parallax_y);
-  }
-  lcd.setCursor(380, 158); lcd.print(buf);
-}
-
-// ---------------------------------------------------------------- SD ----
-//
-// Two-phase strategy, since the SD card and LCD share one SPI bus and a
-// freshly-powered card can drive MISO with garbage until told otherwise:
-//
-//   PHASE 1 — sdGoIdle()  (BEFORE lcd.init):
-//     Bit-bang ≥80 clocks with CS HIGH, then CMD0 GO_IDLE_STATE with CS LOW.
-//     After CMD0 acks, the card is in SPI mode and tristates MISO while CS
-//     is HIGH. This makes the bus electrically clean for LovyanGFX.
-//     v10's 80-clock pulse alone was insufficient — the card needs CMD0 to
-//     actually enter SPI mode. v11 used Arduino's SD.begin() before
-//     lcd.init(), but that calls spi_bus_initialize() with parameters that
-//     conflict with LovyanGFX's later config. So we do CMD0 by hand with
-//     direct GPIO toggling and leave the bus untouched.
-//
-//   PHASE 2 — mountSDLast()  (AFTER lcd.init):
-//     LovyanGFX has now initialised SPI2_HOST. We attach SD as a *second
-//     device* on the existing host via the IDF's esp_vfs_fat_sdspi_mount.
-//     This is exactly the pattern Espressif's "SDSPI bus sharing" docs and
-//     the LovyanGFX maintainer's gist recommend, and it does not re-init
-//     the bus.
-//
-// Files saved here use POSIX fopen() under "/sdcard/...".
-bool sd_ok = false;
-//sdmmc_card_t *sd_card_handle = nullptr;
-/*
-static inline void sdBitbangByte(uint8_t b) {
-  for (int i = 7; i >= 0; i--) {
-    digitalWrite(TFT_MOSI, (b >> i) & 1);
-    digitalWrite(TFT_SCLK, HIGH);
-    delayMicroseconds(2);
-    digitalWrite(TFT_SCLK, LOW);
-    delayMicroseconds(2);
-  }
-}
-static inline uint8_t sdBitbangRead() {
-  uint8_t b = 0;
-  digitalWrite(TFT_MOSI, HIGH);
-  for (int i = 7; i >= 0; i--) {
-    digitalWrite(TFT_SCLK, HIGH);
-    delayMicroseconds(2);
-    b = (b << 1) | (digitalRead(TFT_MISO) & 1);
-    digitalWrite(TFT_SCLK, LOW);
-    delayMicroseconds(2);
-  }
-  return b;
-}
-
-void sdGoIdle() {
-  pinMode(SD_CS,    OUTPUT);
-  pinMode(TFT_SCLK, OUTPUT);
-  pinMode(TFT_MOSI, OUTPUT);
-  pinMode(TFT_MISO, INPUT_PULLUP);
-  digitalWrite(SD_CS,    HIGH);
-  digitalWrite(TFT_MOSI, HIGH);
-  digitalWrite(TFT_SCLK, LOW);
-  delay(2);
-
-  // ≥80 clocks with CS HIGH — required by the SD spec before any command.
-  for (int i = 0; i < 100; i++) {
-    digitalWrite(TFT_SCLK, HIGH);
-    delayMicroseconds(2);
-    digitalWrite(TFT_SCLK, LOW);
-    delayMicroseconds(2);
-  }
-
-  // CMD0 = GO_IDLE_STATE = 0x40 0x00 0x00 0x00 0x00 0x95.
-  digitalWrite(SD_CS, LOW);
-  delayMicroseconds(10);
-  static const uint8_t cmd0[] = {0x40, 0x00, 0x00, 0x00, 0x00, 0x95};
-  for (int i = 0; i < 6; i++) sdBitbangByte(cmd0[i]);
-
-  // R1 response: 0x01 = card now in SPI idle. Up to 16 bytes of 0xFF first.
-  uint8_t r1 = 0xFF;
-  for (int i = 0; i < 16; i++) {
-    r1 = sdBitbangRead();
-    if (r1 != 0xFF) break;
-  }
-  digitalWrite(SD_CS, HIGH);
-
-  // 8 trailing clocks let the card finish releasing MISO.
-  digitalWrite(TFT_MOSI, HIGH);
-  for (int i = 0; i < 8; i++) {
-    digitalWrite(TFT_SCLK, HIGH);
-    delayMicroseconds(2);
-    digitalWrite(TFT_SCLK, LOW);
-    delayMicroseconds(2);
-  }
-
-  // Hand the pins back to high-Z so LovyanGFX's bus driver can claim them.
-  pinMode(TFT_SCLK, INPUT);
-  pinMode(TFT_MOSI, INPUT);
-  pinMode(TFT_MISO, INPUT);
-
-  Serial.printf("SD CMD0 R1=0x%02X (%s)\n", r1,
-                r1 == 0x01 ? "OK in SPI idle"
-              : r1 == 0xFF ? "no card / no response"
-                           : "unexpected — card may still drive MISO");
-}
-
-#define ENABLE_SD_MOUNT 1
-
-void mountSDLast() {
-#if ENABLE_SD_MOUNT
-  // LovyanGFX has already called spi_bus_initialize on SPI2_HOST. We attach
-  // SD as a device on that existing host.
-  sdspi_device_config_t dev = SDSPI_DEVICE_CONFIG_DEFAULT();
-  dev.host_id = SPI2_HOST;
-  dev.gpio_cs = (gpio_num_t)SD_CS;
-
-  sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-  host.slot          = SPI2_HOST;
-  host.max_freq_khz  = 4000;        // 4 MHz: gentle, plenty for our use case
-
-  esp_vfs_fat_sdmmc_mount_config_t mount = {};
-  mount.format_if_mount_failed = false;
-  mount.max_files              = 4;
-  mount.allocation_unit_size   = 16 * 1024;
-
-  esp_err_t res = esp_vfs_fat_sdspi_mount("/sdcard", &host, &dev,
-                                          &mount, &sd_card_handle);
-  if (res == ESP_OK) {
-    sd_ok = true;
-    uint64_t mb = ((uint64_t)sd_card_handle->csd.capacity *
-                   sd_card_handle->csd.sector_size) / (1024ULL * 1024ULL);
-    Serial.printf("SD: mounted at /sdcard, %lluMB\n", mb);
-  } else {
-    sd_ok = false;
-    Serial.printf("SD mount: 0x%x %s (continuing without)\n",
-                  res, esp_err_to_name(res));
-  }
-#else
-  Serial.println("SD: mount disabled (ENABLE_SD_MOUNT=0)");
-#endif
-}
-
-// -- BMP / CSV save ----------------------------------------------------------
-// BMP of the raw camera frame and CSV of the 32×24 thermal grid. Each pair
-// shares a millis() timestamp in the filename so they can be matched.
-bool saveCameraBMP(const char *path) {
-  if (!cam_have_frame) return false;
-  FILE *f = fopen(path, "wb");
-  if (!f) return false;
-
-  const uint32_t row_bytes = IMG_W * 3;
-  const uint32_t img_size  = row_bytes * IMG_H;
-  const uint32_t file_size = 54 + img_size;
-
-  uint8_t hdr[54] = {0};
-  hdr[0] = 'B'; hdr[1] = 'M';
-  hdr[2]  =  file_size        & 0xFF;
-  hdr[3]  = (file_size >>  8) & 0xFF;
-  hdr[4]  = (file_size >> 16) & 0xFF;
-  hdr[5]  = (file_size >> 24) & 0xFF;
-  hdr[10] = 54;             // pixel offset
-  hdr[14] = 40;             // DIB header size
-  hdr[18] =  IMG_W        & 0xFF;
-  hdr[19] = (IMG_W >>  8) & 0xFF;
-  hdr[22] =  IMG_H        & 0xFF;        // positive height = bottom-up
-  hdr[23] = (IMG_H >>  8) & 0xFF;
-  hdr[26] = 1;              // planes
-  hdr[28] = 24;             // bpp
-  hdr[34] =  img_size        & 0xFF;
-  hdr[35] = (img_size >>  8) & 0xFF;
-  hdr[36] = (img_size >> 16) & 0xFF;
-  hdr[37] = (img_size >> 24) & 0xFF;
-  if (fwrite(hdr, 1, 54, f) != 54) { fclose(f); return false; }
-
-  uint8_t line[IMG_W * 3];
-  uint16_t *src = (uint16_t*)cam_snapshot;
-  for (int y = IMG_H - 1; y >= 0; y--) {           // BMP rows go bottom-up
-    uint16_t *row = &src[y * IMG_W];
-    for (int x = 0; x < IMG_W; x++) {
-      uint16_t cbe = row[x];
-      uint16_t v   = (cbe >> 8) | (cbe << 8);      // wire-BE → native
-      uint8_t r = ((v >> 11) & 0x1F) << 3;
-      uint8_t g = ((v >> 5)  & 0x3F) << 2;
-      uint8_t b =  (v        & 0x1F) << 3;
-      line[x*3 + 0] = b;     // BMP is BGR
-      line[x*3 + 1] = g;
-      line[x*3 + 2] = r;
+  if (READOUT_W > 0 && READOUT_H > 0) {
+    lcd.fillRect(READOUT_X, READOUT_Y, READOUT_W, READOUT_H, TFT_BLACK);
+    lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+    if (share_ap_running) {
+      snprintf(buf, sizeof(buf), "%s", share_ap_ssid);
+    } else {
+      snprintf(buf, sizeof(buf), "X%+d Y%+d", parallax_x, parallax_y);
     }
-    if (fwrite(line, 1, sizeof(line), f) != sizeof(line)) {
-      fclose(f); return false;
-    }
+    lcd.setCursor(READOUT_X + 2, READOUT_Y); lcd.print(buf);
   }
-  fclose(f);
-  return true;
 }
 
-bool saveThermalCSV(const char *path) {
-  FILE *f = fopen(path, "w");
-  if (!f) return false;
-  // Save the rendered frame (mlx_temps_full = full chess-pattern), not the
-  // accumulator, so the CSV always corresponds to a coherent moment.
-  for (int row = 0; row < 24; row++) {
-    for (int col = 0; col < 32; col++) {
-      fprintf(f, "%.2f%c",
-              mlx_temps_full[row * 32 + col],
-              col == 31 ? '\n' : ',');
-    }
-  }
-  fclose(f);
-  return true;
-}
-
-// save_indicator_until_ms is the same global the persistence section uses
-// — long-press save also flashes the "SAV" badge to confirm the write.
-void saveFrameToSD() {
-  if (!sd_ok) {
-    Serial.println("Save: no SD mounted");
-    save_indicator_until_ms = millis() + 1500;
-    return;
-  }
-  uint32_t t = millis();
-  char fbmp[64], fcsv[64];
-  snprintf(fbmp, sizeof(fbmp), "/sdcard/img_%010lu.bmp", t);
-  snprintf(fcsv, sizeof(fcsv), "/sdcard/img_%010lu.csv", t);
-
-  // Brief on-screen "WRT" flash so the user sees something during the ~1 s
-  // BMP write at 4 MHz SD clock. Coords match TB_STAT in drawDynamicUI.
-  lcd.fillRect(TB_STAT, 2, 24, 14, TFT_YELLOW);
-  lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
-  lcd.setCursor(TB_STAT + 3, 5); lcd.print("WRT");
-
-  bool ok_bmp = saveCameraBMP(fbmp);
-  bool ok_csv = saveThermalCSV(fcsv);
-
-  Serial.printf("Save t=%lu: bmp=%s csv=%s\n",
-                t, ok_bmp ? "OK" : "FAIL", ok_csv ? "OK" : "FAIL");
-  save_indicator_until_ms = millis() + 1500;
-}
-*/
+// --------------------------------------------------------------- Storage --
+// SD storage is disabled; freeze/WiFi export is the save path.
 // ---------------------------------------------------------------- Setup --
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n=== FLIR v16 ===");
-  Serial.println("Hardware-level SD-card-kills-LCD remediation, in case the");
-  Serial.println("software path below isn't enough on your specific board:");
-  Serial.println("  - One-time flash voltage lock (defeats the GPIO45 strap");
-  Serial.println("    bootloop on brown-out): espefuse.py set_flash_voltage 3.3V");
-  Serial.println("  - 10 uF + 0.1 uF caps across SD VCC/GND (inrush surge)");
-  Serial.println("  - If LCD still latches, ILI9488 has a known MISO tristate");
-  Serial.println("    defect — sever GDI ribbon trace 16 (LCD is write-only).");
-  Serial.println();
-  analogReadResolution(12); 
+  analogReadResolution(12);
   
-  // Set the pin to 11dB attenuation so it can read up to ~3.3V
+  // Set the pin to 11dB attenuation so it can read up to ~3.3V.
+#if BATTERY_ADC_PIN >= 0
   analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+#endif
   
- // pinMode(SD_CS, OUTPUT);
- // digitalWrite(SD_CS, HIGH);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  // Phase 1: bit-bang CMD0 so the SD enters SPI mode and tristates MISO
-  // BEFORE LovyanGFX touches the bus.
-  Serial.println("[0/9] SD CMD0 GO_IDLE (bit-bang, before LCD)");
- // sdGoIdle();
-
-  Serial.println("[1/9] Wire on IO1/IO2");
+  Serial.println("[1/8] Wire on IO1/IO2");
   Wire.begin(SIOD_GPIO_NUM, SIOC_GPIO_NUM);
   Wire.setClock(100000);
 
-  Serial.println("[2/9] AXP camera power");
+  Serial.println("[2/8] AXP camera power");
   uint32_t t0 = millis();
   while (axp.begin() != 0 && millis() - t0 < 500) delay(50);
   axp.enableCameraPower(axp.eOV2640);
   delay(500);
 
-  Serial.println("[3/9] Camera (must precede LCD init)");
+  Serial.println("[3/8] Camera (must precede LCD init)");
   if (!initCamera()) {
     Serial.println("CAMERA: init failed — continuing without camera. "
                    "TINT/CAM modes will fall back to thermal-only.");
   }
 
-  Serial.println("[4/9] GT911 manual reset");
+  Serial.println("[4/8] GT911 manual reset");
   gt911_init_manual();
 
-  Serial.println("[5/9] LCD");
-//  digitalWrite(SD_CS, HIGH);
+  Serial.println("[5/8] LCD");
   lcd.init();
-  lcd.setRotation(1);
+  lcd.setRotation(1); // Temporary boot orientation; settings load later.
   lcd.setBrightness(255);
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_WHITE); lcd.setTextSize(2);
   lcd.drawString("Booting...", 10, 10);
 
-  Serial.println("[6/9] MLX on Wire1");
+  Serial.println("[6/8] MLX on Wire1");
   if (!initMLX()) {
     lcd.fillScreen(TFT_RED);
     lcd.drawString("MLX FAIL", 10, 150);
@@ -3264,9 +3256,10 @@ void setup() {
   }
   last_mlx_ms = millis();
 
-  Serial.println("[7/9] Palette + UI + Battery");
+  Serial.println("[7/8] Palette + UI + Battery");
   buildPalette();
   loadSettings();
+  applyScreenOrientation();
   if (brightness_apply_pending) { applyCameraBrightness(); brightness_apply_pending = false; }
   readBattery();
   lcd.fillScreen(TFT_BLACK);
@@ -3280,19 +3273,12 @@ void setup() {
     Serial.println("MLX task: running on core 0");
   }
 
-  // Phase 2: now that LovyanGFX has SPI2 set up, attach SD as a second
-  // device on the same host via the IDF's SDSPI driver.
-  Serial.println("[8/9] SD mount via IDF (after LCD)");
- /* mountSDLast();
-
-  Serial.println("[9/9] Ready");
+  Serial.println("[8/8] Ready");
   fps_timer = millis();
   last_ui_ms = millis();
-  Serial.printf("Status: Cam=%s Touch=%s SD=%s\n",
+  Serial.printf("Status: Cam=%s Touch=%s Storage=WiFi\n",
                 cam_ok   ? "OK" : "MISSING",
-                gt911_ok ? "OK" : "FAIL",
-                sd_ok    ? "OK" : "off");
-                */
+                gt911_ok ? "OK" : "FAIL");
 }
 
 // ---------------------------------------------------------------- Loop ---
