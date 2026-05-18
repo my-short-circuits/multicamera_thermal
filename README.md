@@ -168,9 +168,9 @@ The firmware does not use local SD storage. On this hardware the LCD/SD shared S
 
 Install these Arduino dependencies before compiling:
 
-- ESP32 board package 2.x with `DFRobot FireBeetle 2 ESP32-S3` support.
-- LovyanGFX, tested with 1.2.x.
-- DFRobot_AXP313A, tested with 1.0.x.
+- ESP32 board package `2.0.11` with `DFRobot FireBeetle 2 ESP32-S3` support.
+- LovyanGFX `1.2.20`.
+- DFRobot_AXP313A `1.0.0`.
 
 The Melexis MLX90640 API sources needed by the sketch are included in this repository:
 
@@ -188,6 +188,14 @@ The Melexis MLX90640 API sources needed by the sketch are included in this repos
 | Flash Size | 16 MB |
 | Partition Scheme | 16M Flash (3MB APP / 9.9MB FATFS) |
 | PSRAM | OPI PSRAM |
+
+### Camera diagnostics
+
+If camera-only mode cannot show a frame, the LCD now reports the specific
+camera failure stage instead of only `NO CAMERA`. The browser portal also
+includes camera and PSRAM diagnostics in `/api/state`, including `camOk`,
+`camHaveFrame`, `camFailStage`, `camErrCode`, `camErrName`, `psramFound`,
+`psramSize`, and frame-length counters.
 
 
 

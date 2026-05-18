@@ -63,6 +63,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include "esp_camera.h"
+#include "esp_err.h"
 #include "img_converters.h"
 #include "DFRobot_AXP313A.h"
 #include "MLX90640_API.h"
@@ -692,11 +693,83 @@ bool     cam_ok = false;           // false => camera disconnected or init faile
 bool     camera_driver_active = false;
 bool     stream_native_jpeg_active = false;
 
+enum CameraFailStage : uint8_t {
+  CAM_STAGE_NOT_STARTED = 0,
+  CAM_STAGE_OK,
+  CAM_STAGE_NO_PSRAM,
+  CAM_STAGE_SNAPSHOT_ALLOC_FAIL,
+  CAM_STAGE_INIT_FAIL,
+  CAM_STAGE_NO_SENSOR,
+  CAM_STAGE_NO_FRAME,
+  CAM_STAGE_FRAME_LEN_MISMATCH
+};
+
+CameraFailStage cam_fail_stage = CAM_STAGE_NOT_STARTED;
+esp_err_t cam_last_err = ESP_OK;
+int cam_sensor_pid = -1;
+uint32_t cam_init_attempts = 0;
+uint32_t cam_frame_fail_count = 0;
+uint32_t cam_frame_len_mismatch_count = 0;
+uint32_t cam_last_frame_log_ms = 0;
+size_t cam_last_frame_len = 0;
+bool cam_psram_found = false;
+uint32_t cam_psram_size = 0;
+uint32_t cam_psram_free = 0;
+
+const char *cameraStageName(uint8_t stage) {
+  switch (stage) {
+    case CAM_STAGE_OK: return "OK";
+    case CAM_STAGE_NO_PSRAM: return "NO_PSRAM";
+    case CAM_STAGE_SNAPSHOT_ALLOC_FAIL: return "SNAPSHOT_ALLOC_FAIL";
+    case CAM_STAGE_INIT_FAIL: return "ESP_CAMERA_INIT_FAIL";
+    case CAM_STAGE_NO_SENSOR: return "NO_SENSOR";
+    case CAM_STAGE_NO_FRAME: return "NO_FRAME";
+    case CAM_STAGE_FRAME_LEN_MISMATCH: return "FRAME_LEN_MISMATCH";
+    default: return "NOT_STARTED";
+  }
+}
+
+const char *cameraDisplayMessage() {
+  switch (cam_fail_stage) {
+    case CAM_STAGE_NO_PSRAM: return "NO PSRAM";
+    case CAM_STAGE_SNAPSHOT_ALLOC_FAIL: return "PSRAM ALLOC FAIL";
+    case CAM_STAGE_INIT_FAIL: return "CAM INIT FAIL";
+    case CAM_STAGE_NO_SENSOR: return "NO SENSOR";
+    case CAM_STAGE_FRAME_LEN_MISMATCH: return "FRAME BAD LEN";
+    case CAM_STAGE_NO_FRAME: return "NO FRAME";
+    default: return "NO CAMERA";
+  }
+}
+
+const char *cameraErrName() {
+  return cam_last_err == ESP_OK ? "OK" : esp_err_to_name(cam_last_err);
+}
+
+void updateCameraMemoryDiagnostics() {
+  cam_psram_found = psramFound();
+  cam_psram_size = ESP.getPsramSize();
+  cam_psram_free = ESP.getFreePsram();
+}
+
 bool ensureCameraSnapshotBuffer() {
   cam_snapshot_len = IMG_W * IMG_H * 2;
+  updateCameraMemoryDiagnostics();
+  if (!cam_psram_found) {
+    cam_fail_stage = CAM_STAGE_NO_PSRAM;
+    Serial.printf("Camera: PSRAM not found; expected %u-byte snapshot buffer\n",
+                  (unsigned)cam_snapshot_len);
+    return false;
+  }
   if (!cam_snapshot) {
     cam_snapshot = (uint8_t*)heap_caps_malloc(cam_snapshot_len, MALLOC_CAP_SPIRAM);
-    if (!cam_snapshot) return false;
+    if (!cam_snapshot) {
+      updateCameraMemoryDiagnostics();
+      cam_fail_stage = CAM_STAGE_SNAPSHOT_ALLOC_FAIL;
+      Serial.printf("Camera: PSRAM snapshot allocation failed (%u bytes), free PSRAM=%lu\n",
+                    (unsigned)cam_snapshot_len,
+                    (unsigned long)cam_psram_free);
+      return false;
+    }
     memset(cam_snapshot, 0, cam_snapshot_len);
   }
   return true;
@@ -718,6 +791,21 @@ void applyCameraSensorDefaults() {
 
 bool initCameraFormat(pixformat_t format, framesize_t frame_size,
                       uint8_t fb_count, camera_grab_mode_t grab_mode) {
+  cam_init_attempts++;
+  cam_ok = false;
+  cam_have_frame = false;
+  cam_last_err = ESP_OK;
+  cam_sensor_pid = -1;
+  cam_last_frame_len = 0;
+  updateCameraMemoryDiagnostics();
+  Serial.printf("Camera init attempt %lu: PSRAM found=%d size=%lu free=%lu format=%d frame=%d fb=%u\n",
+                (unsigned long)cam_init_attempts,
+                cam_psram_found ? 1 : 0,
+                (unsigned long)cam_psram_size,
+                (unsigned long)cam_psram_free,
+                (int)format,
+                (int)frame_size,
+                (unsigned)fb_count);
   if (!ensureCameraSnapshotBuffer()) return false;
   // Always allocate the snapshot buffer first — render paths use it to draw
   // fallback content (e.g. "NO CAMERA") when the sensor isn't available.
@@ -743,8 +831,24 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
   cfg.fb_count     = fb_count;
   cfg.fb_location  = CAMERA_FB_IN_PSRAM;
   cfg.grab_mode    = grab_mode;
-  if (esp_camera_init(&cfg) != ESP_OK) return false;
+  cam_last_err = esp_camera_init(&cfg);
+  if (cam_last_err != ESP_OK) {
+    cam_fail_stage = CAM_STAGE_INIT_FAIL;
+    Serial.printf("Camera init failed: 0x%X %s\n",
+                  (unsigned)cam_last_err, cameraErrName());
+    return false;
+  }
   camera_driver_active = true;
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    cam_fail_stage = CAM_STAGE_NO_SENSOR;
+    Serial.println("Camera init failed: sensor pointer is null after esp_camera_init");
+    esp_camera_deinit();
+    camera_driver_active = false;
+    return false;
+  }
+  cam_sensor_pid = s->id.PID;
 
   // Stay close to sensor defaults — every extra filter we turn on (dcw,
   // lenc, bpc, wpc, aec2) softens the image. The "raw feed" look the user
@@ -756,6 +860,12 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
   applyCameraSensorDefaults();
 
   cam_ok = true;
+  cam_fail_stage = CAM_STAGE_OK;
+  updateCameraMemoryDiagnostics();
+  Serial.printf("Camera init OK: PID=0x%04X PSRAM free=%lu snapshot=%u\n",
+                cam_sensor_pid,
+                (unsigned long)cam_psram_free,
+                (unsigned)cam_snapshot_len);
   return true;
 }
 
@@ -809,10 +919,33 @@ void exitStreamCameraMode() {
 bool grabCamera() {
   if (!cam_ok || stream_native_jpeg_active) return false;
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) return false;
+  if (!fb) {
+    cam_frame_fail_count++;
+    cam_fail_stage = CAM_STAGE_NO_FRAME;
+    uint32_t now = millis();
+    if (now - cam_last_frame_log_ms > 2000) {
+      cam_last_frame_log_ms = now;
+      Serial.printf("Camera frame unavailable: failures=%lu\n",
+                    (unsigned long)cam_frame_fail_count);
+    }
+    return false;
+  }
+  cam_last_frame_len = fb->len;
   if (fb->len == cam_snapshot_len) {
     memcpy(cam_snapshot, fb->buf, cam_snapshot_len);
     cam_have_frame = true;
+    cam_fail_stage = CAM_STAGE_OK;
+  } else {
+    cam_frame_len_mismatch_count++;
+    cam_fail_stage = CAM_STAGE_FRAME_LEN_MISMATCH;
+    uint32_t now = millis();
+    if (now - cam_last_frame_log_ms > 2000) {
+      cam_last_frame_log_ms = now;
+      Serial.printf("Camera frame length mismatch: got=%u expected=%u count=%lu\n",
+                    (unsigned)fb->len,
+                    (unsigned)cam_snapshot_len,
+                    (unsigned long)cam_frame_len_mismatch_count);
+    }
   }
   esp_camera_fb_return(fb);
   return cam_have_frame;
@@ -2164,11 +2297,26 @@ void renderCameraOnly() {
     // No camera — paint a placeholder so the screen doesn't look frozen.
     lcd.fillRect(IMG_X, IMG_Y, IMG_W, IMG_H, TFT_BLACK);
     lcd.setTextColor(TFT_RED, TFT_BLACK);
-    lcd.setTextSize(3);
-    const char *msg = cam_ok ? "WAITING FOR CAMERA..." : "NO CAMERA";
-    int tw = (int)strlen(msg) * 18;
+    lcd.setTextSize(2);
+    const char *msg = cam_ok ? "WAITING FOR CAMERA" : cameraDisplayMessage();
+    int tw = (int)strlen(msg) * 12;
     lcd.setCursor(IMG_X + (IMG_W - tw) / 2, IMG_Y + IMG_H / 2 - 12);
     lcd.print(msg);
+    lcd.setTextSize(1);
+    lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    char detail[64];
+    if (cam_last_err != ESP_OK) {
+      snprintf(detail, sizeof(detail), "%s 0x%X",
+               cameraStageName(cam_fail_stage), (unsigned)cam_last_err);
+    } else if (cam_last_frame_len && cam_last_frame_len != cam_snapshot_len) {
+      snprintf(detail, sizeof(detail), "len %u expected %u",
+               (unsigned)cam_last_frame_len, (unsigned)cam_snapshot_len);
+    } else {
+      snprintf(detail, sizeof(detail), "%s", cameraStageName(cam_fail_stage));
+    }
+    tw = (int)strlen(detail) * 6;
+    lcd.setCursor(IMG_X + (IMG_W - tw) / 2, IMG_Y + IMG_H / 2 + 14);
+    lcd.print(detail);
     lcd.setTextSize(1);
     return;
   }
@@ -2864,7 +3012,8 @@ void handleStreamState() {
   portEXIT_CRITICAL(&mlx_mux);
 
   String json;
-  json.reserve(1200);
+  updateCameraMemoryDiagnostics();
+  json.reserve(1800);
   json += F("{\"stream\":");
   json += stream_mode ? F("true") : F("false");
   json += F(",\"ssid\":\""); json += share_ap_ssid; json += F("\"");
@@ -2897,7 +3046,20 @@ void handleStreamState() {
   json += F(",\"psram\":"); json += ESP.getFreePsram();
   json += F(",\"nativeJpeg\":"); json += stream_native_jpeg_active ? 1 : 0;
   json += F(",\"jpegChunked\":"); json += STREAM_CAMERA_CHUNKED_JPEG ? 1 : 0;
+  json += F(",\"camOk\":"); json += cam_ok ? 1 : 0;
   json += F(",\"camHaveFrame\":"); json += cam_have_frame ? 1 : 0;
+  json += F(",\"camFailStage\":\""); json += cameraStageName(cam_fail_stage); json += F("\"");
+  json += F(",\"camErrCode\":"); json += (int)cam_last_err;
+  json += F(",\"camErrName\":\""); json += cameraErrName(); json += F("\"");
+  json += F(",\"camSensorPid\":"); json += cam_sensor_pid;
+  json += F(",\"camInitAttempts\":"); json += cam_init_attempts;
+  json += F(",\"camLastFrameLen\":"); json += (unsigned)cam_last_frame_len;
+  json += F(",\"camExpectedFrameLen\":"); json += (unsigned)cam_snapshot_len;
+  json += F(",\"camFrameFailCount\":"); json += cam_frame_fail_count;
+  json += F(",\"camFrameLenMismatchCount\":"); json += cam_frame_len_mismatch_count;
+  json += F(",\"psramFound\":"); json += cam_psram_found ? 1 : 0;
+  json += F(",\"psramSize\":"); json += cam_psram_size;
+  json += F(",\"psramFree\":"); json += cam_psram_free;
   json += F(",\"jpegFailCount\":"); json += stream_jpeg_fail_count;
   json += F("}");
   share_server.sendHeader("Cache-Control", "no-store");
@@ -3279,6 +3441,16 @@ void setup() {
   Serial.printf("Status: Cam=%s Touch=%s Storage=WiFi\n",
                 cam_ok   ? "OK" : "MISSING",
                 gt911_ok ? "OK" : "FAIL");
+  Serial.printf("Camera diag: stage=%s err=0x%X/%s psram=%d size=%lu free=%lu sensor=0x%04X frameLen=%u expected=%u\n",
+                cameraStageName(cam_fail_stage),
+                (unsigned)cam_last_err,
+                cameraErrName(),
+                cam_psram_found ? 1 : 0,
+                (unsigned long)cam_psram_size,
+                (unsigned long)cam_psram_free,
+                cam_sensor_pid,
+                (unsigned)cam_last_frame_len,
+                (unsigned)cam_snapshot_len);
 }
 
 // ---------------------------------------------------------------- Loop ---
