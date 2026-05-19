@@ -1011,8 +1011,8 @@ static constexpr int ZOOM_MAX = 250;
 static constexpr int ALIGN_DEFAULT_ZX = 100;
 static constexpr int ALIGN_DEFAULT_ZY = 124;
 static constexpr int ALIGN_DEFAULT_CM = 100;
-static constexpr int ALIGN_MIN_CM = 15;
-static constexpr int ALIGN_MAX_CM = 300;
+static constexpr int ALIGN_MIN_CM = 5;
+static constexpr int ALIGN_MAX_CM = 500;
 static constexpr int ALIGN_NUDGE_CM = 5;
 // px100 = coefficient / distance_cm. Coefficient is derived from:
 // 100 * 320 px * 1.218 cm / (2 * tan(55 deg / 2)).
@@ -1025,11 +1025,13 @@ struct AlignPreset {
 };
 
 static constexpr AlignPreset ALIGN_PRESETS[] = {
+  {  5, 7488, "5cm"   },
   { 15, 2496, "15cm"  },
   { 30, 1248, "30cm"  },
   { 60,  624, "60cm"  },
   {100,  374, "100cm" },
   {300,  125, "300cm" },
+  {500,   75, "500cm" },
 };
 static constexpr int ALIGN_PRESET_COUNT = sizeof(ALIGN_PRESETS) / sizeof(ALIGN_PRESETS[0]);
 
@@ -1046,6 +1048,11 @@ volatile bool stream_mode = false;
 volatile uint8_t stream_view_mode = 0;  // 0=overlay, 1=camera, 2=thermal
 volatile bool stream_hud_enabled = true;
 volatile bool stream_crosshair_enabled = true;
+bool screen_marker_active = false;
+int screen_marker_x = IMG_W / 2;
+int screen_marker_y = IMG_H / 2;
+float screen_marker_temp = NAN;
+uint32_t screen_marker_seq = 0;
 
 // MANUAL-mode lo/hi setpoints. Used only when range_mode == RANGE_MANUAL.
 // On entering MANUAL we seed these from whatever range was active so the
@@ -1652,7 +1659,8 @@ void drawNudgeButton(int x, int y, int w, int h,
 
 void drawHSlider(int x, int y, int w, int h, int pct,
                  const char *label, const char *value,
-                 uint16_t fill, bool enabled) {
+                 uint16_t fill, bool enabled,
+                 const char *left_nudge, const char *right_nudge) {
   if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
   uint16_t bg = enabled ? TFT_DARKGREY : 0x4208;
   uint16_t fg = enabled ? TFT_WHITE : TFT_LIGHTGREY;
@@ -1664,8 +1672,8 @@ void drawHSlider(int x, int y, int w, int h, int pct,
   lcd.setCursor(x, y - 11); lcd.print(label);
   int tw = (int)strlen(value) * 6;
   lcd.setCursor(x + w - tw, y - 11); lcd.print(value);
-  drawNudgeButton(x, y, PANEL_NUDGE_W, h, "-", enabled);
-  drawNudgeButton(x + w - PANEL_NUDGE_W, y, PANEL_NUDGE_W, h, "+", enabled);
+  drawNudgeButton(x, y, PANEL_NUDGE_W, h, left_nudge, enabled);
+  drawNudgeButton(x + w - PANEL_NUDGE_W, y, PANEL_NUDGE_W, h, right_nudge, enabled);
   lcd.fillRect(track_x, y, track_w, h, bg);
   lcd.drawRect(track_x, y, track_w, h, TFT_WHITE);
   int fill_w = (pct * (track_w - 4)) / 100;
@@ -1679,7 +1687,7 @@ void drawSlider() {
   char buf[12];
   snprintf(buf, sizeof(buf), "%d%%", tint_pct);
   drawHSlider(SLIDER_X, SLIDER_Y, SLIDER_W, SLIDER_H,
-              tint_pct, "TINT", buf, TFT_CYAN, true);
+              tint_pct, "TINT", buf, TFT_CYAN, true, "-", "+");
 }
 
 // Convert a manual_lo/hi temperature in [MANUAL_T_MIN..MANUAL_T_MAX] into the
@@ -1716,7 +1724,7 @@ void drawPresetPanel() {
   snprintf(buf, sizeof(buf), "%dcm", align_distance_cm);
   int pct = (align_distance_cm - ALIGN_MIN_CM) * 100 / (ALIGN_MAX_CM - ALIGN_MIN_CM);
   drawHSlider(PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-              pct, "DIST", buf, TFT_GREEN, enabled);
+              pct, "DIST", buf, TFT_GREEN, enabled, "-5", "+5");
 
   lcd.fillRect(PANEL_SLIDER_X, Y_SLIDER_Y - 12,
                PANEL_SLIDER_W, Z_SLIDER_Y - Y_SLIDER_Y + PANEL_SLIDER_H + 18,
@@ -1744,11 +1752,11 @@ void drawAdjustSliders() {
     bool enabled = (range_mode == RANGE_MANUAL);
     snprintf(buf, sizeof(buf), "%.1fC", manual_lo);
     drawHSlider(PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-                manualTempToPct(manual_lo), "LO", buf, TFT_BLUE, enabled);
+                manualTempToPct(manual_lo), "LO", buf, TFT_BLUE, enabled, "-", "+");
 
     snprintf(buf, sizeof(buf), "%.1fC", manual_hi);
     drawHSlider(PANEL_SLIDER_X, Y_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-                manualTempToPct(manual_hi), "HI", buf, TFT_RED, enabled);
+                manualTempToPct(manual_hi), "HI", buf, TFT_RED, enabled, "-", "+");
 
     // Clear the inactive third slider slot.
     lcd.fillRect(PANEL_SLIDER_X, Z_SLIDER_Y - 13,
@@ -1796,6 +1804,10 @@ void drawBrightnessSlider() {
 
 uint32_t last_touch_ms = 0;
 uint32_t last_nudge_ms = 0;
+
+bool sampleThermalAtImagePoint(int x, int y, float *out);
+void setScreenMarkerFromTouch(uint16_t tx, uint16_t ty);
+void updateScreenMarkerTemp();
 
 bool nudgeReady(uint32_t now) {
   if (last_nudge_ms && now - last_nudge_ms < NUDGE_REPEAT_MS) return false;
@@ -1851,7 +1863,7 @@ void handleTouch() {
 
   if (panel_tab == PANEL_TAB_PRESET && handlePresetTouch(tx, ty)) return;
 
-  // Side-panel sliders: POS controls alignment, RANGE controls manual LO/HI.
+  // Side-panel sliders: DIST controls alignment, RANGE controls manual LO/HI.
   if (tx >= PANEL_SLIDER_X && tx < PANEL_SLIDER_X + PANEL_SLIDER_W) {
     int dir = sliderNudgeDir(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
     bool track_hit = sliderTrackHit(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
@@ -1882,6 +1894,15 @@ void handleTouch() {
         return;
       }
     }
+  }
+
+  if (tx >= IMG_X && tx < IMG_X + IMG_W &&
+      ty >= IMG_Y && ty < IMG_Y + IMG_H) {
+    if (now - last_touch_ms >= 120) {
+      setScreenMarkerFromTouch(tx, ty);
+      last_touch_ms = now;
+    }
+    return;
   }
 
   // Brightness cells are rate-limited so one tap does not fire repeatedly.
@@ -2092,6 +2113,70 @@ static inline void thermal_steps(int32_t &step_x_q, int32_t &step_y_q) {
   step_y_q = TH_STEP_Y_Q;
 }
 
+static inline int clampPixelCoord(int v, int hi) {
+  if (v < 0) return 0;
+  if (v > hi) return hi;
+  return v;
+}
+
+bool sampleThermalAtImagePoint(int x, int y, float *out) {
+  if (!out) return false;
+  x = clampPixelCoord(x, IMG_W - 1);
+  y = clampPixelCoord(y, IMG_H - 1);
+
+  int32_t step_x_q, step_y_q;
+  thermal_steps(step_x_q, step_y_q);
+  int tx0, tx1, ty0, ty1;
+  uint16_t fx, fy;
+  bool x_inside, y_inside;
+  thermal_indices_fov(x - IMG_W / 2, step_x_q, 16, 31, tx0, tx1, fx, x_inside);
+  thermal_indices_fov(y - IMG_H / 2, step_y_q, 12, 23, ty0, ty1, fy, y_inside);
+  if (!x_inside || !y_inside) return false;
+
+  float a, b, c, d;
+  bool ready;
+  portENTER_CRITICAL(&mlx_mux);
+  ready = mlx_full_ready;
+  a = mlx_temps_full[ty0 * 32 + (31 - tx0)];
+  b = mlx_temps_full[ty0 * 32 + (31 - tx1)];
+  c = mlx_temps_full[ty1 * 32 + (31 - tx0)];
+  d = mlx_temps_full[ty1 * 32 + (31 - tx1)];
+  portEXIT_CRITICAL(&mlx_mux);
+  if (!ready) return false;
+
+  float ifx = 256.0f - fx;
+  float ify = 256.0f - fy;
+  float top = (a * ifx + b * fx) / 256.0f;
+  float bottom = (c * ifx + d * fx) / 256.0f;
+  *out = (top * ify + bottom * fy) / 256.0f;
+  return true;
+}
+
+void setScreenMarkerFromTouch(uint16_t tx, uint16_t ty) {
+  screen_marker_x = clampPixelCoord((int)tx - IMG_X, IMG_W - 1);
+  screen_marker_y = clampPixelCoord((int)ty - IMG_Y, IMG_H - 1);
+  float temp;
+  if (sampleThermalAtImagePoint(screen_marker_x, screen_marker_y, &temp)) {
+    screen_marker_temp = temp;
+    screen_marker_seq = thermal_frame_seq;
+  } else {
+    screen_marker_temp = NAN;
+    screen_marker_seq = 0;
+  }
+  screen_marker_active = true;
+}
+
+void updateScreenMarkerTemp() {
+  if (!screen_marker_active) return;
+  uint32_t seq = thermal_frame_seq;
+  if (seq == screen_marker_seq) return;
+  float temp;
+  if (sampleThermalAtImagePoint(screen_marker_x, screen_marker_y, &temp)) {
+    screen_marker_temp = temp;
+    screen_marker_seq = seq;
+  }
+}
+
 // Camera crop parameters for zoom and parallax. Output parameters avoid
 // Arduino's generated-prototype edge cases with local struct types.
 static inline void cameraCropParamsFor(int zx, int zy, int px100, int py100,
@@ -2121,12 +2206,6 @@ static inline void cameraCropParams(int32_t &src_x0_q, int32_t &src_y0_q,
                       src_x0_q, src_y0_q, step_x_q, step_y_q);
 }
 
-static inline int clampPixelCoord(int v, int hi) {
-  if (v < 0) return 0;
-  if (v > hi) return hi;
-  return v;
-}
-
 static inline uint16_t cameraPixelWireAt(const uint16_t *cam, bool valid,
                                          int x, int y,
                                          int32_t sample_x0_q,
@@ -2154,6 +2233,27 @@ static inline void drawCrosshairRow(uint16_t *row, int y) {
     row[cx] = TFT_WHITE;
     row[cx + CROSS_R] = TFT_WHITE;
   }
+}
+
+static inline void drawMarkerRow(uint16_t *row, int y) {
+  if (!screen_marker_active) return;
+  static constexpr int MARKER_R = 7;
+  int dy = y - screen_marker_y;
+  if (dy < -MARKER_R || dy > MARKER_R) return;
+  for (int dx = -MARKER_R; dx <= MARKER_R; dx++) {
+    int x = screen_marker_x + dx;
+    if (x < 0 || x >= IMG_W) continue;
+    int d2 = dx * dx + dy * dy;
+    bool ring = d2 >= 34 && d2 <= 58;
+    bool cross = (dy == 0 && abs(dx) <= MARKER_R + 2) ||
+                 (dx == 0 && abs(dy) <= MARKER_R + 2);
+    if (ring || cross) row[x] = TFT_GREEN;
+  }
+}
+
+static inline void drawOverlayRow(uint16_t *row, int y) {
+  drawCrosshairRow(row, y);
+  drawMarkerRow(row, y);
 }
 
 void drawCrossbar();
@@ -2218,7 +2318,7 @@ void renderTinted() {
         }
         row[x] = out;
       }
-      drawCrosshairRow(row, y);
+      drawOverlayRow(row, y);
     }
     lcd.pushImage(IMG_X, IMG_Y + y0, IMG_W, chunk_h, chunk_buf);
   }
@@ -2260,7 +2360,7 @@ void renderThermalOnly() {
         }
         row[x] = out;
       }
-      drawCrosshairRow(row, y);
+      drawOverlayRow(row, y);
     }
     lcd.pushImage(IMG_X, IMG_Y + y0, IMG_W, chunk_h, chunk_buf);
   }
@@ -2304,7 +2404,7 @@ void renderCameraOnly() {
         int y = y0 + dy;
         uint16_t *row = &chunk_buf[dy * IMG_W];
         memcpy(row, &cam[y * IMG_W], IMG_W * sizeof(uint16_t));
-        drawCrosshairRow(row, y);
+        drawOverlayRow(row, y);
       }
       lcd.pushImage(IMG_X, IMG_Y + y0, IMG_W, chunk_h, chunk_buf);
     }
@@ -2327,7 +2427,7 @@ void renderCameraOnly() {
         int src_x = (int)((crop_x0_q + (int64_t)x * crop_step_x_q) >> 16);
         row[x] = cam_row[clampPixelCoord(src_x, IMG_W - 1)];
       }
-      drawCrosshairRow(row, y);
+      drawOverlayRow(row, y);
     }
     lcd.pushImage(IMG_X, IMG_Y + y0, IMG_W, chunk_h, chunk_buf);
   }
@@ -2459,12 +2559,13 @@ static const char PORTAL_INDEX_HTML[] PROGMEM = R"PORTALINDEX(
 <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Thermal Portal</title><link rel="stylesheet" href="/portal.css"></head><body><main>
 <header><div><h1><span id="tCenter">--</span>C</h1><p>Scene <b id="tSpan">--</b>C - Range <b id="tRange">--</b>C - Marker <b id="markerTemp">--</b>C</p></div><b id="connState">loading</b></header>
-<section class="grid"><div class="video"><canvas id="view" width="320" height="240"></canvas><canvas id="recCanvas" width="320" height="240" hidden></canvas><div class="actions"><button id="recBtn">Record</button><button id="stopPortal">Stop portal</button></div><p id="saveMsg">Recording is stored in browser memory until stopped.</p></div>
+<section class="topStats"><div>Cam <b id="statCam">--</b>fps</div><div>MLX <b id="statMlx">--</b>fps</div><div>Loop <b id="statLoop">--</b>fps</div></section>
+<section class="grid"><div class="video"><canvas id="view" width="320" height="240"></canvas><canvas id="recCanvas" width="320" height="240" hidden></canvas><div class="actions recActions"><button id="recBtn">Record</button><label class="check"><input type="checkbox" id="recHud" checked> Record temp overlay</label><button id="stopPortal">Stop portal</button></div><p id="saveMsg">Recording is stored in browser memory until stopped.</p></div>
 <div class="panel">
 <label>View<select id="viewMode"><option value="0">Overlay</option><option value="1">Camera only</option><option value="2">Thermal only</option></select></label>
 <label>Thermal<select id="thermalMode"><option value="smooth">Smooth</option><option value="cells">Cells</option><option value="enhanced">Enhanced</option></select></label>
 <label>Range<select id="rangeMode"><option value="0">AUTO</option><option value="1">AUT2</option><option value="2">AUT3</option><option value="3">HMN</option><option value="4">PCB</option><option value="5">PRNT</option><option value="6">WALL</option><option value="7">DRFT</option><option value="8">MAN</option></select></label>
-<label>Distance <span id="distv"></span><input id="dist" type="range" min="15" max="300" step="1"></label>
+<div class="field"><div>Distance <span id="distv"></span></div><div class="distCtl"><button id="distMinus">-5</button><input id="dist" type="range" min="5" max="500" step="1"><button id="distPlus">+5</button></div></div>
 <p id="alignInfo">Alignment --</p>
 <label>Tint <span id="tintv"></span><input id="tint" type="range" min="0" max="100" step="1"></label>
 <label>Manual LO <span id="mlov"></span><input id="mlo" type="range" min="5" max="60" step="0.1"></label>
@@ -2478,20 +2579,20 @@ static const char PORTAL_INDEX_HTML[] PROGMEM = R"PORTALINDEX(
 <div class="actions"><button id="resetAlign">Reset 100 cm</button><button id="rotBtn">Rotate</button><button id="snap">Snapshot</button><button id="testFrame">Test frame</button></div>
 <label class="check"><input type="checkbox" id="crosshair" checked> Crosshair</label>
 </div></section>
-<section id="diag" class="diag"></section>
+<details id="diagBox"><summary>Diagnostics</summary><section id="diag" class="diag"></section></details>
 </main><script src="/portal.js"></script></body></html>
 )PORTALINDEX";
 
 static const char PORTAL_CSS[] PROGMEM = R"PORTALCSS(
-body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:10px}header{display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap}h1{font-size:32px;margin:0}p{color:#9aa8b3;margin:.25rem 0}.grid{display:grid;grid-template-columns:minmax(280px,640px) minmax(280px,1fr);gap:10px}.video,.panel{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:9px}canvas{width:100%;height:auto;background:#000;image-rendering:auto}label{display:grid;grid-template-columns:92px 1fr;gap:8px;align-items:center;margin:7px 0}label span{justify-self:end;color:#9fe870;font-variant-numeric:tabular-nums}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:7px}button{cursor:pointer}.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-top:8px}.check{display:block}.diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px;margin-top:10px}.diag div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}#connState{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px}.bad{background:#3a1b20!important;border-color:#8a2630!important;color:#ffd1d1!important}@media(max-width:760px){.grid{grid-template-columns:1fr}label{grid-template-columns:80px 1fr}}
+body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:10px}header{display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap}h1{font-size:34px;margin:0}p{color:#9aa8b3;margin:.25rem 0}.topStats{display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:8px;margin:8px 0}.topStats div{background:#10161b;border:1px solid #26343e;border-radius:8px;padding:8px;color:#cbd6dd}.topStats b{color:#9fe870;font-variant-numeric:tabular-nums}.grid{display:grid;grid-template-columns:minmax(280px,640px) minmax(290px,1fr);gap:10px}.video,.panel,details{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:9px}canvas{width:100%;height:auto;background:#000;image-rendering:auto;border-radius:6px}label,.field{display:grid;grid-template-columns:96px 1fr;gap:8px;align-items:center;margin:7px 0}label span,.field span{justify-self:end;color:#9fe870;font-variant-numeric:tabular-nums}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:7px}button{cursor:pointer}.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:8px;margin-top:8px}.recActions{align-items:center}.check{display:block;color:#d9e4eb}.distCtl{display:grid;grid-template-columns:48px 1fr 48px;gap:7px;align-items:center}.diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px;margin-top:10px}.diag div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}summary{cursor:pointer;color:#dbe6ed;font-weight:700}#connState{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px}.bad{background:#3a1b20!important;border-color:#8a2630!important;color:#ffd1d1!important}@media(max-width:760px){.grid{grid-template-columns:1fr}label,.field{grid-template-columns:86px 1fr}.topStats{grid-template-columns:1fr 1fr 1fr}}
 )PORTALCSS";
 
 static const char PORTAL_JS[] PROGMEM = R"PORTALJS(
 const W=320,H=240,$=id=>document.getElementById(id),canvas=$('view'),ctx=canvas.getContext('2d'),recCanvas=$('recCanvas'),recCtx=recCanvas.getContext('2d');
 const scene=document.createElement('canvas');scene.width=W;scene.height=H;const sctx=scene.getContext('2d');const th=document.createElement('canvas');th.width=W;th.height=H;const thx=th.getContext('2d');
-let S={view:0,range:0,px:0,py:0,px100:374,py100:0,zx:100,zy:124,alignDistanceCm:100,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--'},thermal=null,thermalSmooth=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle';
+let S={view:0,range:0,px:0,py:0,px100:374,py100:0,zx:100,zy:124,alignDistanceCm:100,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--'},thermal=null,thermalSmooth=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
 const PAL=Array.from({length:256},(_,i)=>{let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]});
-function clamp(v,a,b){return Math.max(a,Math.min(b,v))}function fmt(v,d=1){return Number.isFinite(+v)?(+v).toFixed(d):'--'}function mmss(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60);return m+':'+String(s%60).padStart(2,'0')}function kb(v){return v?Math.round(v/1024)+'K':'--'}function bytes(v){return v?Math.round(v/102.4)/10+'K':'--'}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}function fmt(v,d=1){return Number.isFinite(+v)?(+v).toFixed(d):'--'}function mmss(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60);return m+':'+String(s%60).padStart(2,'0')}function kb(v){return v?Math.round(v/1024)+'K':'--'}function bytes(v){return v?Math.round(v/102.4)/10+'K':'--'}function txt(id,v){let e=$(id);if(e)e.textContent=v}
 function fetchTimeout(url,opt={},ms=1500){let c=new AbortController(),t=setTimeout(()=>c.abort(),ms);return fetch(url,Object.assign({},opt,{signal:c.signal})).finally(()=>clearTimeout(t))}function conn(t,b){let e=$('connState');e.textContent=t;e.classList.toggle('bad',!!b)}
 function setCanvasRotation(){rot=((rot%4)+4)%4;let rw=rot%2?H:W,rh=rot%2?W:H;canvas.width=rw;canvas.height=rh;recCanvas.width=rw;recCanvas.height=rh;$('rotBtn').textContent='Rotate '+rot*90;localStorage.thermalRotate=rot}
 function drawRot(out,src){out.setTransform(1,0,0,1,0,0);out.clearRect(0,0,out.canvas.width,out.canvas.height);out.save();if(rot===1){out.translate(H,0);out.rotate(Math.PI/2)}else if(rot===2){out.translate(W,H);out.rotate(Math.PI)}else if(rot===3){out.translate(0,W);out.rotate(-Math.PI/2)}out.drawImage(src,0,0);out.restore()}
@@ -2502,9 +2603,11 @@ function rebuildThermal(){if(!thermal)return;let mode=$('thermalMode').value,src
 function drawCamera(c){let img=camImg,iw=img&&(img.naturalWidth||img.width),ih=img&&(img.naturalHeight||img.height);if(!img||!iw||!ih)return;let zx=clamp(+S.zx||100,100,250),zy=clamp(+S.zy||124,100,250),cw=W*100/zx,ch=H*100/zy,px=(+S.px100||0)/100,py=(+S.py100||0)/100,sx=(W-cw)/2-px*cw/W,sy=(H-ch)/2-py*ch/H;sx=clamp(sx,0,W-cw);sy=clamp(sy,0,H-ch);c.drawImage(img,sx*iw/W,sy*ih/H,cw*iw/W,ch*ih/H,0,0,W,H)}
 function drawCross(c){if(!S.crosshair)return;c.save();c.strokeStyle='#fff';c.lineWidth=1;c.beginPath();c.moveTo(W/2-10,H/2);c.lineTo(W/2+10,H/2);c.moveTo(W/2,H/2-10);c.lineTo(W/2,H/2+10);c.rect(W/2-10,H/2-10,20,20);c.stroke();c.restore()}
 function drawScene(){sctx.clearRect(0,0,W,H);sctx.fillStyle='#000';sctx.fillRect(0,0,W,H);if(+S.view!==2)drawCamera(sctx);if(+S.view!==1&&thermal){if(dirtyThermal)rebuildThermal();sctx.save();if(+S.view===0){sctx.globalCompositeOperation='lighter';sctx.globalAlpha=(+S.tint||0)/100}sctx.drawImage(th,0,0);sctx.restore()}if(marker){sctx.strokeStyle='#9fe870';sctx.beginPath();sctx.arc(marker.x,marker.y,6,0,Math.PI*2);sctx.stroke()}drawCross(sctx)}
-function render(){drawScene();drawRot(ctx,scene);if(rec)drawRot(recCtx,scene);requestAnimationFrame(render)}
-function labels(){let px=(S.px100/100).toFixed(2);$('tCenter').textContent=fmt(S.tCenter);$('tSpan').textContent=`${fmt(S.tMin)}-${fmt(S.tMax)}`;$('tRange').textContent=`${fmt(S.lo)}-${fmt(S.hi)}`;$('markerTemp').textContent=markerTemp==null?'--':fmt(markerTemp);$('distv').textContent=(S.alignDistanceCm||100)+'cm';$('alignInfo').textContent=`RGB shift ${px}px right - crop ${S.zx}/${S.zy}%`;$('tintv').textContent=S.tint+'%';$('mlov').textContent=fmt(S.mlo)+'C';$('mhiv').textContent=fmt(S.mhi)+'C';$('brtv').textContent=S.brt;$('conv').textContent=S.con;$('satv').textContent=S.sat;$('shpv').textContent=S.shp;$('denv').textContent=S.den;let items=[['Cam',S.camFps,'fps'],['Cam Req',S.camReqFps,'fps'],['Transport',S.camTransport,''],['JPEG Q',S.jpegQuality,''],['Cam Enc',S.camEncodeMs,'ms'],['Cam Send',S.camSendMs,'ms'],['Cam Total',S.camTotalMs,'ms'],['Cam Size',bytes(S.camJpegBytes||camBytes),''],['Fetch',fmt(camFetchMs),'ms'],['Decode',fmt(camDecodeMs),'ms'],['Grab',fmt(S.grabMs),'ms'],['Render',fmt(S.renderMs),'ms'],['UI',fmt(S.uiMs),'ms'],['MLX',S.mlxFps,'fps'],['Therm Req',S.thermalReqFps,'fps'],['API',S.apiFps,'fps'],['Loop',S.loopFps,'fps'],['Heap',kb(S.heap),''],['PSRAM',kb(S.psram),''],['Seq',S.seq||'--',''],['Uptime',mmss(S.portalMs),''],['Cam',camStatus,'']];$('diag').innerHTML=items.map(i=>`<div>${i[0]} <b>${i[1]??'--'}</b>${i[2]}</div>`).join('')}
-function sync(){for(let id of ['rangeMode','viewMode','tint','mlo','mhi','brt','con','sat','shp','den','jpgq'])if($(id))$(id).value=S[id==='rangeMode'?'range':id==='viewMode'?'view':id==='jpgq'?'jpegQuality':id];$('dist').value=S.alignDistanceCm||100;$('crosshair').checked=!!S.crosshair;labels()}
+function hudPanel(c,x,y,lines,anchor='left'){c.save();c.font='12px system-ui,-apple-system,Segoe UI,sans-serif';let pad=7,lh=15,w=0;for(let l of lines)w=Math.max(w,c.measureText(l).width);w+=pad*2;let h=lines.length*lh+pad*2;if(anchor.includes('right'))x-=w;if(anchor.includes('bottom'))y-=h;c.fillStyle='rgba(7,10,13,.72)';c.strokeStyle='rgba(159,232,112,.75)';c.lineWidth=1;c.fillRect(x,y,w,h);c.strokeRect(x+.5,y+.5,w-1,h-1);c.fillStyle='#eef6fb';for(let i=0;i<lines.length;i++)c.fillText(lines[i],x+pad,y+pad+11+i*lh);c.restore()}
+function drawRecHud(c){if(!recHud)return;let w=c.canvas.width,h=c.canvas.height,mt=markerTemp==null?'--':fmt(markerTemp);hudPanel(c,8,8,[`Center ${fmt(S.tCenter)}C`,`Range ${S.rangeName||S.range||'--'}`]);hudPanel(c,w-8,8,[`REC ${mmss(Date.now()-recStarted)}`,`Cam ${fmt(S.camFps)}fps  MLX ${fmt(S.mlxFps)}fps`],'right');if(marker)hudPanel(c,8,h-8,[`Marker ${mt}C`],'bottom');hudPanel(c,w-8,h-8,[`Scene ${fmt(S.tMin)}-${fmt(S.tMax)}C`,`Palette ${fmt(S.lo)}-${fmt(S.hi)}C`],'right bottom')}
+function render(){drawScene();drawRot(ctx,scene);if(rec){drawRot(recCtx,scene);drawRecHud(recCtx)}requestAnimationFrame(render)}
+function labels(){let px=(S.px100/100).toFixed(2);txt('tCenter',fmt(S.tCenter));txt('tSpan',`${fmt(S.tMin)}-${fmt(S.tMax)}`);txt('tRange',`${fmt(S.lo)}-${fmt(S.hi)}`);txt('markerTemp',markerTemp==null?'--':fmt(markerTemp));txt('statCam',fmt(S.camFps));txt('statMlx',fmt(S.mlxFps));txt('statLoop',fmt(S.loopFps));txt('distv',(S.alignDistanceCm||100)+'cm');txt('alignInfo',`RGB shift ${px}px right - crop ${S.zx}/${S.zy}%`);txt('tintv',S.tint+'%');txt('mlov',fmt(S.mlo)+'C');txt('mhiv',fmt(S.mhi)+'C');txt('brtv',S.brt);txt('conv',S.con);txt('satv',S.sat);txt('shpv',S.shp);txt('denv',S.den);if(!$('diagBox').open)return;let items=[['Cam',S.camFps,'fps'],['Cam Req',S.camReqFps,'fps'],['Transport',S.camTransport,''],['JPEG Q',S.jpegQuality,''],['Cam Enc',S.camEncodeMs,'ms'],['Cam Send',S.camSendMs,'ms'],['Cam Total',S.camTotalMs,'ms'],['Cam Size',bytes(S.camJpegBytes||camBytes),''],['Fetch',fmt(camFetchMs),'ms'],['Decode',fmt(camDecodeMs),'ms'],['Grab',fmt(S.grabMs),'ms'],['Render',fmt(S.renderMs),'ms'],['UI',fmt(S.uiMs),'ms'],['MLX',S.mlxFps,'fps'],['Therm Req',S.thermalReqFps,'fps'],['API',S.apiFps,'fps'],['Loop',S.loopFps,'fps'],['Heap',kb(S.heap),''],['PSRAM',kb(S.psram),''],['Seq',S.seq||'--',''],['Uptime',mmss(S.portalMs),''],['Index',bytes(S.indexBytes),''],['CSS',bytes(S.cssBytes),''],['JS',bytes(S.jsBytes),''],['Cam',camStatus,'']];$('diag').innerHTML=items.map(i=>`<div>${i[0]} <b>${i[1]??'--'}</b>${i[2]}</div>`).join('')}
+function sync(){for(let id of ['rangeMode','viewMode','tint','mlo','mhi','brt','con','sat','shp','den','jpgq'])if($(id))$(id).value=S[id==='rangeMode'?'range':id==='viewMode'?'view':id==='jpgq'?'jpegQuality':id];$('dist').value=S.alignDistanceCm||100;$('crosshair').checked=!!S.crosshair;$('recHud').checked=!!recHud;labels()}
 function applyState(s){Object.assign(S,s);S.lo=s.rangeLo;S.hi=s.rangeHi;sync();dirtyThermal=true;conn('online',false)}
 async function getState(){if(stateBusy||!running)return;stateBusy=true;try{let r=await fetchTimeout('/api/state',{cache:'no-store'},1500);if(!r.ok)throw 0;applyState(await r.json())}catch(e){conn('state retry',true)}finally{stateBusy=false;setTimeout(getState,1000)}}
 async function getThermal(){if(thermBusy||!running)return;thermBusy=true;try{let r=await fetchTimeout('/thermal.bin',{cache:'no-store'},1500);if(!r.ok)throw 0;let b=await r.arrayBuffer(),dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;if(!thermalSmooth)thermalSmooth=new Float32Array(a);else for(let i=0;i<768;i++)thermalSmooth[i]+= (a[i]-thermalSmooth[i])*0.35;thermal=a;let h=r.headers;S.seq=+(h.get('X-Frame-Seq')||S.seq);S.lo=+(h.get('X-Range-Lo')||S.lo);S.hi=+(h.get('X-Range-Hi')||S.hi);S.tCenter=+(h.get('X-Temp-Center')||S.tCenter);S.tMin=+(h.get('X-Temp-Min')||S.tMin);S.tMax=+(h.get('X-Temp-Max')||S.tMax);if(marker)markerTemp=rawTempAt(marker.x,marker.y);dirtyThermal=true;labels()}catch(e){conn('thermal retry',true)}finally{thermBusy=false;setTimeout(getThermal,+S.view===1?750:(+S.view===2?125:250))}}
@@ -2512,8 +2615,10 @@ function loadImg(url){return new Promise((res,rej)=>{let i=new Image();i.onload=
 async function setCam(blob){let t=performance.now(),url=URL.createObjectURL(blob);try{let img=await loadImg(url);if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img;camDecodeMs=performance.now()-t;camStatus='ok'}catch(e){URL.revokeObjectURL(url);camStatus='decode failed';throw e}}
 async function getCam(){if(camBusy||!running||+S.view===2)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1800);if(!r.ok)throw 0;let h=r.headers;S.camEncodeMs=+(h.get('X-Cam-Encode-Ms')||S.camEncodeMs);S.camSendMs=+(h.get('X-Cam-Send-Ms')||S.camSendMs);S.camTotalMs=+(h.get('X-Cam-Total-Ms')||S.camTotalMs);S.camJpegBytes=+(h.get('X-Cam-Bytes')||S.camJpegBytes);S.jpegQuality=+(h.get('X-JPEG-Quality')||S.jpegQuality);S.camTransport=h.get('X-Cam-Transport')||S.camTransport;let blob=await r.blob();camFetchMs=performance.now()-t;camBytes=blob.size;await setCam(blob);labels()}catch(e){camStatus='retry';conn('cam retry',true)}finally{camBusy=false;setTimeout(getCam,+S.view===1?70:110)}}
 function post(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(()=>{let p=new URLSearchParams(pending);pending={};fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p},1800).catch(()=>conn('control retry',true))},90)}
-for(let id of ['dist','tint','mlo','mhi','brt','con','sat','shp','den'])$(id).oninput=e=>{let v=+e.target.value;if(id==='dist'){S.alignDistanceCm=v;S.px100=Math.round(37440/v);S.py100=0;S.zx=100;S.zy=124;post({dist:v})}else{S[id]=v;post({[id]:v})}dirtyThermal=true;labels()};
-$('viewMode').onchange=e=>{S.view=+e.target.value;post({view:S.view});getCam();getThermal()};$('rangeMode').onchange=e=>{S.range=+e.target.value;post({range:S.range})};$('jpgq').onchange=e=>{S.jpegQuality=+e.target.value;post({jpgq:S.jpegQuality})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;post({crosshair:S.crosshair})};$('thermalMode').onchange=()=>{dirtyThermal=true};$('resetAlign').onclick=()=>post({reset_alignment:1});$('rotBtn').onclick=()=>{rot=(rot+1)%4;setCanvasRotation()};$('testFrame').onclick=()=>open('/cam.jpg?ts='+Date.now(),'_blank');$('snap').onclick=()=>{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()};canvas.onclick=e=>{let r=canvas.getBoundingClientRect(),p=viewToScene((e.clientX-r.left)*canvas.width/r.width,(e.clientY-r.top)*canvas.height/r.height);marker=p;markerTemp=rawTempAt(p.x,p.y);labels()};
+function setDistance(v){v=clamp(Math.round(v),5,500);S.alignDistanceCm=v;S.px100=Math.round(37440/v);S.py100=0;S.zx=100;S.zy=124;$('dist').value=v;post({dist:v});labels()}
+for(let id of ['dist','tint','mlo','mhi','brt','con','sat','shp','den'])$(id).oninput=e=>{let v=+e.target.value;if(id==='dist'){setDistance(v)}else{S[id]=v;post({[id]:v});labels()}dirtyThermal=true};
+$('distMinus').onclick=()=>setDistance((+S.alignDistanceCm||100)-5);$('distPlus').onclick=()=>setDistance((+S.alignDistanceCm||100)+5);
+$('viewMode').onchange=e=>{S.view=+e.target.value;post({view:S.view});getCam();getThermal()};$('rangeMode').onchange=e=>{S.range=+e.target.value;post({range:S.range})};$('jpgq').onchange=e=>{S.jpegQuality=+e.target.value;post({jpgq:S.jpegQuality})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;post({crosshair:S.crosshair})};$('recHud').onchange=e=>{recHud=e.target.checked?1:0;localStorage.recHud=recHud};$('diagBox').ontoggle=labels;$('thermalMode').onchange=()=>{dirtyThermal=true};$('resetAlign').onclick=()=>setDistance(100);$('rotBtn').onclick=()=>{rot=(rot+1)%4;setCanvasRotation()};$('testFrame').onclick=()=>open('/cam.jpg?ts='+Date.now(),'_blank');$('snap').onclick=()=>{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()};canvas.onclick=e=>{let r=canvas.getBoundingClientRect(),p=viewToScene((e.clientX-r.left)*canvas.width/r.width,(e.clientY-r.top)*canvas.height/r.height);marker=p;markerTemp=rawTempAt(p.x,p.y);labels()};
 function recType(){return['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||''}function stopRec(){if(rec)rec.stop()}$('recBtn').onclick=()=>{if(rec){stopRec();return}if(!recCanvas.captureStream||!window.MediaRecorder){$('saveMsg').textContent='Recording unavailable; use screen recording.';return}chunks=[];let type=recType();rec=new MediaRecorder(recCanvas.captureStream(15),type?{mimeType:type}:undefined);rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};rec.onstop=()=>{clearInterval(recTimer);let blob=new Blob(chunks,{type:type||'video/webm'});if(recUrl)URL.revokeObjectURL(recUrl);recUrl=URL.createObjectURL(blob);$('saveMsg').innerHTML=`<a href="${recUrl}" download="thermal-stream.${type.includes('mp4')?'mp4':'webm'}">Download recording</a>`;$('recBtn').textContent='Record';rec=null};rec.start(1000);recStarted=Date.now();recTimer=setInterval(()=>{$('saveMsg').textContent='Recording '+mmss(Date.now()-recStarted)},500);$('recBtn').textContent='Stop'};
 $('stopPortal').onclick=async()=>{running=false;try{await fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({stop_stream:1})},1200)}catch(e){}$('saveMsg').textContent='Stop requested. Hold button 3s if needed.'};
 setCanvasRotation();getState();getThermal();getCam();render();
@@ -3459,6 +3564,8 @@ void drawDynamicUI() {
   lcd.setTextColor(TFT_CYAN, TFT_BLACK);
   if (share_ap_running) {
     snprintf(buf, sizeof(buf), "%s", share_ap_ssid);
+  } else if (screen_marker_active && !isnan(screen_marker_temp)) {
+    snprintf(buf, sizeof(buf), "M %.1fC", screen_marker_temp);
   } else {
     snprintf(buf, sizeof(buf), "%dcm", align_distance_cm);
   }
@@ -3617,6 +3724,8 @@ void loop() {
     if (grabCamera()) cam_count++;
     noteLoopTiming(diag_grab_ms, micros() - grab_t0);
   }
+
+  if (!stream_mode) updateScreenMarkerTemp();
 
   uint32_t render_t0 = micros();
   if (stream_mode) {
