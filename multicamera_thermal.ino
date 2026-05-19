@@ -40,7 +40,7 @@
  *     drawFastHLine(palette)  -> palette_native[] / normal colour APIs
  *
  * Camera tearing mitigation:
- *   fb_count = 3, grab_mode = LATEST, XCLK = 16 MHz, snapshot to our own
+ *   fb_count = 2, grab_mode = LATEST, XCLK = 16 MHz, snapshot to our own
  *   PSRAM buffer immediately and esp_camera_fb_return() before rendering, so
  *   the camera DMA never has to wait on the LCD push.
  *
@@ -61,12 +61,25 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include "esp_camera.h"
+#include "esp_arduino_version.h"
 #include "esp_err.h"
 #include "img_converters.h"
 #include "DFRobot_AXP313A.h"
 #include "MLX90640_API.h"
 #include "MLX90640_I2C_Driver.h"
 #include <algorithm>     // std::nth_element for parity medians
+
+#ifndef ESP_ARDUINO_VERSION
+#define ESP_ARDUINO_VERSION 0
+#endif
+#ifndef ESP_ARDUINO_VERSION_VAL
+#define ESP_ARDUINO_VERSION_VAL(major, minor, patch) ((major << 16) | (minor << 8) | (patch))
+#endif
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 3, 0)
+#define CAMERA_HAS_SAFE_RECONFIGURE 1
+#else
+#define CAMERA_HAS_SAFE_RECONFIGURE 0
+#endif
 
 // Smooth display interpolation. The upstream frame is kept edge-aware; this
 // just avoids turning every MLX cell into an obvious display block.
@@ -660,12 +673,21 @@ bool     cam_ok = false;           // false => camera disconnected or init faile
 bool     camera_driver_active = false;
 bool     stream_native_jpeg_active = false;
 extern volatile uint8_t stream_jpeg_quality;
+extern uint32_t stream_jpeg_fail_count;
 extern volatile int8_t cam_contrast;
 extern volatile int8_t cam_saturation;
 extern volatile int8_t cam_sharpness;
 extern volatile int8_t cam_denoise;
 extern volatile bool cam_lenc;
 extern volatile bool cam_raw_gma;
+
+static constexpr uint8_t CAMERA_RGB565_FB_COUNT = 2;
+static constexpr camera_grab_mode_t CAMERA_RGB565_GRAB_MODE = CAMERA_GRAB_LATEST;
+#if CAMERA_HAS_SAFE_RECONFIGURE
+static constexpr bool STREAM_NATIVE_JPEG_PREFERRED = true;
+#else
+static constexpr bool STREAM_NATIVE_JPEG_PREFERRED = false;
+#endif
 
 enum CameraFailStage : uint8_t {
   CAM_STAGE_NOT_STARTED = 0,
@@ -765,28 +787,19 @@ void applyCameraSensorDefaults() {
   s->set_denoise(s, (int)cam_denoise);
   s->set_lenc(s, cam_lenc ? 1 : 0);
   s->set_raw_gma(s, cam_raw_gma ? 1 : 0);
+  if (s->set_quality) s->set_quality(s, (int)stream_jpeg_quality);
 }
 
-bool initCameraFormat(pixformat_t format, framesize_t frame_size,
-                      uint8_t jpeg_quality, uint8_t fb_count,
-                      camera_grab_mode_t grab_mode,
-                      bool require_snapshot) {
-  cam_init_attempts++;
-  cam_ok = false;
-  cam_have_frame = false;
-  cam_last_err = ESP_OK;
-  cam_sensor_pid = -1;
-  cam_last_frame_len = 0;
-  updateCameraMemoryDiagnostics();
-  Serial.printf("Camera init attempt %lu: PSRAM found=%d size=%lu free=%lu fmt=%d fb=%u\n",
-                (unsigned long)cam_init_attempts,
-                cam_psram_found ? 1 : 0,
-                (unsigned long)cam_psram_size,
-                (unsigned long)cam_psram_free,
-                (int)format, (unsigned)fb_count);
-  if (require_snapshot && !ensureCameraSnapshotBuffer()) return false;
+bool applyCameraJpegQuality() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s || !s->set_quality) return false;
+  return s->set_quality(s, (int)stream_jpeg_quality) == 0;
+}
 
-  camera_config_t cfg = {};
+void buildCameraConfig(camera_config_t &cfg, pixformat_t format,
+                       framesize_t frame_size, uint8_t jpeg_quality,
+                       uint8_t fb_count, camera_grab_mode_t grab_mode) {
+  cfg = {};
   cfg.ledc_channel = LEDC_CHANNEL_0;
   cfg.ledc_timer   = LEDC_TIMER_0;
   cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM;
@@ -809,16 +822,21 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
   cfg.fb_count     = fb_count;
   cfg.fb_location  = CAMERA_FB_IN_PSRAM;
   cfg.grab_mode    = grab_mode;
+}
 
-  cam_last_err = esp_camera_init(&cfg);
-  if (cam_last_err != ESP_OK) {
-    cam_fail_stage = CAM_STAGE_INIT_FAIL;
-    Serial.printf("Camera init failed: 0x%X %s\n",
-                  (unsigned)cam_last_err, cameraErrName());
-    return false;
+void enableCameraPsramDmaIfAvailable() {
+#if CAMERA_HAS_SAFE_RECONFIGURE
+  if (psramFound()) {
+    esp_err_t err = esp_camera_set_psram_mode(true);
+    if (err != ESP_OK) {
+      Serial.printf("Camera: PSRAM DMA enable skipped: 0x%X %s\n",
+                    (unsigned)err, esp_err_to_name(err));
+    }
   }
-  camera_driver_active = true;
+#endif
+}
 
+bool finishCameraDriverStart() {
   sensor_t *s = esp_camera_sensor_get();
   if (!s) {
     cam_fail_stage = CAM_STAGE_NO_SENSOR;
@@ -828,6 +846,7 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
     return false;
   }
   cam_sensor_pid = s->id.PID;
+  enableCameraPsramDmaIfAvailable();
   applyCameraSensorDefaults();
 
   cam_ok = true;
@@ -840,10 +859,77 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
   return true;
 }
 
+bool prepareCameraStart(pixformat_t format, uint8_t fb_count,
+                        bool require_snapshot) {
+  cam_init_attempts++;
+  cam_ok = false;
+  cam_have_frame = false;
+  cam_last_err = ESP_OK;
+  cam_sensor_pid = -1;
+  cam_last_frame_len = 0;
+  updateCameraMemoryDiagnostics();
+  Serial.printf("Camera init attempt %lu: PSRAM found=%d size=%lu free=%lu fmt=%d fb=%u\n",
+                (unsigned long)cam_init_attempts,
+                cam_psram_found ? 1 : 0,
+                (unsigned long)cam_psram_size,
+                (unsigned long)cam_psram_free,
+                (int)format, (unsigned)fb_count);
+  return !require_snapshot || ensureCameraSnapshotBuffer();
+}
+
+bool initCameraFormat(pixformat_t format, framesize_t frame_size,
+                      uint8_t jpeg_quality, uint8_t fb_count,
+                      camera_grab_mode_t grab_mode,
+                      bool require_snapshot) {
+  if (!prepareCameraStart(format, fb_count, require_snapshot)) return false;
+
+  camera_config_t cfg;
+  buildCameraConfig(cfg, format, frame_size, jpeg_quality, fb_count, grab_mode);
+  cam_last_err = esp_camera_init(&cfg);
+  if (cam_last_err != ESP_OK) {
+    cam_fail_stage = CAM_STAGE_INIT_FAIL;
+    Serial.printf("Camera init failed: 0x%X %s\n",
+                  (unsigned)cam_last_err, cameraErrName());
+    return false;
+  }
+  camera_driver_active = true;
+  return finishCameraDriverStart();
+}
+
+bool reconfigureCameraFormat(pixformat_t format, framesize_t frame_size,
+                             uint8_t jpeg_quality, uint8_t fb_count,
+                             camera_grab_mode_t grab_mode,
+                             bool require_snapshot) {
+#if CAMERA_HAS_SAFE_RECONFIGURE
+  if (!camera_driver_active) {
+    return initCameraFormat(format, frame_size, jpeg_quality, fb_count,
+                            grab_mode, require_snapshot);
+  }
+  if (!prepareCameraStart(format, fb_count, require_snapshot)) return false;
+
+  camera_config_t cfg;
+  buildCameraConfig(cfg, format, frame_size, jpeg_quality, fb_count, grab_mode);
+  cam_last_err = esp_camera_reconfigure(&cfg);
+  if (cam_last_err != ESP_OK) {
+    cam_fail_stage = CAM_STAGE_INIT_FAIL;
+    Serial.printf("Camera reconfigure failed: 0x%X %s\n",
+                  (unsigned)cam_last_err, cameraErrName());
+    return false;
+  }
+  camera_driver_active = true;
+  return finishCameraDriverStart();
+#else
+  (void)format; (void)frame_size; (void)jpeg_quality; (void)fb_count;
+  (void)grab_mode; (void)require_snapshot;
+  return false;
+#endif
+}
+
 bool initCamera() {
   stream_native_jpeg_active = false;
-  return initCameraFormat(PIXFORMAT_RGB565, FRAMESIZE_QVGA, 12, 3,
-                          CAMERA_GRAB_LATEST, true);
+  return initCameraFormat(PIXFORMAT_RGB565, FRAMESIZE_QVGA, 12,
+                          CAMERA_RGB565_FB_COUNT, CAMERA_RGB565_GRAB_MODE,
+                          true);
 }
 
 bool initCameraNativeJpeg() {
@@ -860,30 +946,84 @@ void deinitCameraDriver() {
   cam_have_frame = false;
 }
 
-bool enterStreamCameraMode() {
-  stream_native_jpeg_active = false;
-  if (!camera_driver_active && !cam_ok) return true;
+bool grabCamera();
 
+bool warmCameraSnapshot(uint8_t attempts) {
+  for (uint8_t i = 0; i < attempts; i++) {
+    if (grabCamera()) return true;
+    delay(25);
+  }
+  return cam_have_frame;
+}
+
+bool restoreRgb565CameraMode() {
+#if CAMERA_HAS_SAFE_RECONFIGURE
+  if (camera_driver_active) {
+    stream_native_jpeg_active = false;
+    if (reconfigureCameraFormat(PIXFORMAT_RGB565, FRAMESIZE_QVGA, 12,
+                                CAMERA_RGB565_FB_COUNT,
+                                CAMERA_RGB565_GRAB_MODE, true)) {
+      warmCameraSnapshot(3);
+      return true;
+    }
+  }
+#endif
+  stream_native_jpeg_active = false;
   deinitCameraDriver();
   delay(50);
-  if (initCameraNativeJpeg()) {
-    stream_native_jpeg_active = true;
+  bool ok = initCamera();
+  if (ok) warmCameraSnapshot(3);
+  return ok;
+}
+
+bool validateNativeJpegCamera() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return false;
+  bool ok = (fb->format == PIXFORMAT_JPEG && fb->len > 0);
+  esp_camera_fb_return(fb);
+  return ok;
+}
+
+bool switchToNativeJpegCameraMode() {
+  if (!STREAM_NATIVE_JPEG_PREFERRED || !camera_driver_active || !cam_ok) {
+    return false;
+  }
+
+  bool ok = reconfigureCameraFormat(PIXFORMAT_JPEG, FRAMESIZE_QVGA,
+                                    stream_jpeg_quality, 2,
+                                    CAMERA_GRAB_LATEST, false);
+  if (!ok) {
+    restoreRgb565CameraMode();
+    return false;
+  }
+  applyCameraJpegQuality();
+  if (!validateNativeJpegCamera()) {
+    stream_jpeg_fail_count++;
+    Serial.println("Stream camera: native JPEG self-test failed");
+    restoreRgb565CameraMode();
+    return false;
+  }
+  stream_native_jpeg_active = true;
+  return true;
+}
+
+bool enterStreamCameraMode() {
+  stream_native_jpeg_active = false;
+  if (!camera_driver_active || !cam_ok) return false;
+
+  if (switchToNativeJpegCameraMode()) {
     Serial.println("Stream camera: native JPEG");
     return true;
   }
 
-  Serial.println("Stream camera: native JPEG failed, restoring RGB565");
-  deinitCameraDriver();
-  delay(50);
-  initCamera();
+  warmCameraSnapshot(2);
+  Serial.println("Stream camera: RGB565 JPEG fallback");
   return false;
 }
 
 void exitStreamCameraMode() {
   if (!stream_native_jpeg_active) return;
-  deinitCameraDriver();
-  delay(50);
-  if (!initCamera()) {
+  if (!restoreRgb565CameraMode()) {
     Serial.println("Stream camera: RGB565 restore failed");
   }
 }
@@ -2571,11 +2711,13 @@ static const char PORTAL_INDEX_HTML[] PROGMEM = R"PORTALINDEX(
 <label>Manual LO <span id="mlov"></span><input id="mlo" type="range" min="5" max="60" step="0.1"></label>
 <label>Manual HI <span id="mhiv"></span><input id="mhi" type="range" min="5" max="60" step="0.1"></label>
 <label>Brightness <span id="brtv"></span><input id="brt" type="range" min="-2" max="2" step="1"></label>
+<details id="advBox"><summary>Advanced camera</summary>
 <label>Contrast <span id="conv"></span><input id="con" type="range" min="-2" max="2" step="1"></label>
 <label>Saturation <span id="satv"></span><input id="sat" type="range" min="-2" max="2" step="1"></label>
 <label>Sharpness <span id="shpv"></span><input id="shp" type="range" min="-2" max="2" step="1"></label>
 <label>Denoise <span id="denv"></span><input id="den" type="range" min="0" max="1" step="1"></label>
 <label>JPEG Q<select id="jpgq"><option value="35">35 fastest</option><option value="45">45 fast</option><option value="55">55 balanced</option><option value="65">65 detail</option><option value="75">75 high</option></select></label>
+</details>
 <div class="actions"><button id="resetAlign">Reset 100 cm</button><button id="rotBtn">Rotate</button><button id="snap">Snapshot</button><button id="testFrame">Test frame</button></div>
 <label class="check"><input type="checkbox" id="crosshair" checked> Crosshair</label>
 </div></section>
@@ -2584,17 +2726,17 @@ static const char PORTAL_INDEX_HTML[] PROGMEM = R"PORTALINDEX(
 )PORTALINDEX";
 
 static const char PORTAL_CSS[] PROGMEM = R"PORTALCSS(
-body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:10px}header{display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap}h1{font-size:34px;margin:0}p{color:#9aa8b3;margin:.25rem 0}.topStats{display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:8px;margin:8px 0}.topStats div{background:#10161b;border:1px solid #26343e;border-radius:8px;padding:8px;color:#cbd6dd}.topStats b{color:#9fe870;font-variant-numeric:tabular-nums}.grid{display:grid;grid-template-columns:minmax(280px,640px) minmax(290px,1fr);gap:10px}.video,.panel,details{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:9px}canvas{width:100%;height:auto;background:#000;image-rendering:auto;border-radius:6px}label,.field{display:grid;grid-template-columns:96px 1fr;gap:8px;align-items:center;margin:7px 0}label span,.field span{justify-self:end;color:#9fe870;font-variant-numeric:tabular-nums}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:7px}button{cursor:pointer}.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:8px;margin-top:8px}.recActions{align-items:center}.check{display:block;color:#d9e4eb}.distCtl{display:grid;grid-template-columns:48px 1fr 48px;gap:7px;align-items:center}.diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px;margin-top:10px}.diag div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}summary{cursor:pointer;color:#dbe6ed;font-weight:700}#connState{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px}.bad{background:#3a1b20!important;border-color:#8a2630!important;color:#ffd1d1!important}@media(max-width:760px){.grid{grid-template-columns:1fr}label,.field{grid-template-columns:86px 1fr}.topStats{grid-template-columns:1fr 1fr 1fr}}
+body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:10px}header{display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap}h1{font-size:34px;margin:0}p{color:#9aa8b3;margin:.25rem 0}.topStats{display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:8px;margin:8px 0}.topStats div{background:#10161b;border:1px solid #26343e;border-radius:8px;padding:8px;color:#cbd6dd}.topStats b{color:#9fe870;font-variant-numeric:tabular-nums}.grid{display:grid;grid-template-columns:minmax(280px,640px) minmax(290px,1fr);gap:10px}.video,.panel,details{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:9px}.panel details{background:transparent;border:0;padding:0;margin:8px 0}canvas{width:100%;height:auto;background:#000;image-rendering:auto;border-radius:6px}label,.field{display:grid;grid-template-columns:96px 1fr;gap:8px;align-items:center;margin:7px 0}label span,.field span{justify-self:end;color:#9fe870;font-variant-numeric:tabular-nums}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:7px}button{cursor:pointer}.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:8px;margin-top:8px}.recActions{align-items:center}.check{display:block;color:#d9e4eb}.distCtl{display:grid;grid-template-columns:48px 1fr 48px;gap:7px;align-items:center}.diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px;margin-top:10px}.diag div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}summary{cursor:pointer;color:#dbe6ed;font-weight:700}#connState{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px}.bad{background:#3a1b20!important;border-color:#8a2630!important;color:#ffd1d1!important}@media(max-width:760px){.grid{grid-template-columns:1fr}label,.field{grid-template-columns:86px 1fr}.topStats{grid-template-columns:1fr 1fr 1fr}}
 )PORTALCSS";
 
 static const char PORTAL_JS[] PROGMEM = R"PORTALJS(
 const W=320,H=240,$=id=>document.getElementById(id),canvas=$('view'),ctx=canvas.getContext('2d'),recCanvas=$('recCanvas'),recCtx=recCanvas.getContext('2d');
 const scene=document.createElement('canvas');scene.width=W;scene.height=H;const sctx=scene.getContext('2d');const th=document.createElement('canvas');th.width=W;th.height=H;const thx=th.getContext('2d');
-let S={view:0,range:0,px:0,py:0,px100:374,py100:0,zx:100,zy:124,alignDistanceCm:100,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--'},thermal=null,thermalSmooth=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
+let S={view:0,range:0,px:0,py:0,px100:374,py100:0,zx:100,zy:124,alignDistanceCm:100,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--'},thermal=null,thermalSmooth=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,sceneDirty=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,diagBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
 const PAL=Array.from({length:256},(_,i)=>{let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]});
 function clamp(v,a,b){return Math.max(a,Math.min(b,v))}function fmt(v,d=1){return Number.isFinite(+v)?(+v).toFixed(d):'--'}function mmss(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60);return m+':'+String(s%60).padStart(2,'0')}function kb(v){return v?Math.round(v/1024)+'K':'--'}function bytes(v){return v?Math.round(v/102.4)/10+'K':'--'}function txt(id,v){let e=$(id);if(e)e.textContent=v}
 function fetchTimeout(url,opt={},ms=1500){let c=new AbortController(),t=setTimeout(()=>c.abort(),ms);return fetch(url,Object.assign({},opt,{signal:c.signal})).finally(()=>clearTimeout(t))}function conn(t,b){let e=$('connState');e.textContent=t;e.classList.toggle('bad',!!b)}
-function setCanvasRotation(){rot=((rot%4)+4)%4;let rw=rot%2?H:W,rh=rot%2?W:H;canvas.width=rw;canvas.height=rh;recCanvas.width=rw;recCanvas.height=rh;$('rotBtn').textContent='Rotate '+rot*90;localStorage.thermalRotate=rot}
+function setCanvasRotation(){rot=((rot%4)+4)%4;let rw=rot%2?H:W,rh=rot%2?W:H;canvas.width=rw;canvas.height=rh;recCanvas.width=rw;recCanvas.height=rh;$('rotBtn').textContent='Rotate '+rot*90;localStorage.thermalRotate=rot;sceneDirty=true}
 function drawRot(out,src){out.setTransform(1,0,0,1,0,0);out.clearRect(0,0,out.canvas.width,out.canvas.height);out.save();if(rot===1){out.translate(H,0);out.rotate(Math.PI/2)}else if(rot===2){out.translate(W,H);out.rotate(Math.PI)}else if(rot===3){out.translate(0,W);out.rotate(-Math.PI/2)}out.drawImage(src,0,0);out.restore()}
 function viewToScene(x,y){let p=rot===1?{x:y,y:H-x}:rot===2?{x:W-x,y:H-y}:rot===3?{x:W-y,y:x}:{x,y};p.x=clamp(p.x,0,W-1);p.y=clamp(p.y,0,H-1);return p}
 function rawTempAt(x,y,src=thermal){if(!src)return null;let tx=x*32/W,ty=y*24/H,x0=clamp(Math.floor(tx),0,31),y0=clamp(Math.floor(ty),0,23),x1=clamp(x0+1,0,31),y1=clamp(y0+1,0,23),fx=tx-x0,fy=ty-y0;let t=(r,c)=>src[r*32+(31-c)],a=t(y0,x0),b=t(y0,x1),c=t(y1,x0),d=t(y1,x1);return(a*(1-fx)+b*fx)*(1-fy)+(c*(1-fx)+d*fx)*fy}
@@ -2605,22 +2747,23 @@ function drawCross(c){if(!S.crosshair)return;c.save();c.strokeStyle='#fff';c.lin
 function drawScene(){sctx.clearRect(0,0,W,H);sctx.fillStyle='#000';sctx.fillRect(0,0,W,H);if(+S.view!==2)drawCamera(sctx);if(+S.view!==1&&thermal){if(dirtyThermal)rebuildThermal();sctx.save();if(+S.view===0){sctx.globalCompositeOperation='lighter';sctx.globalAlpha=(+S.tint||0)/100}sctx.drawImage(th,0,0);sctx.restore()}if(marker){sctx.strokeStyle='#9fe870';sctx.beginPath();sctx.arc(marker.x,marker.y,6,0,Math.PI*2);sctx.stroke()}drawCross(sctx)}
 function hudPanel(c,x,y,lines,anchor='left'){c.save();c.font='12px system-ui,-apple-system,Segoe UI,sans-serif';let pad=7,lh=15,w=0;for(let l of lines)w=Math.max(w,c.measureText(l).width);w+=pad*2;let h=lines.length*lh+pad*2;if(anchor.includes('right'))x-=w;if(anchor.includes('bottom'))y-=h;c.fillStyle='rgba(7,10,13,.72)';c.strokeStyle='rgba(159,232,112,.75)';c.lineWidth=1;c.fillRect(x,y,w,h);c.strokeRect(x+.5,y+.5,w-1,h-1);c.fillStyle='#eef6fb';for(let i=0;i<lines.length;i++)c.fillText(lines[i],x+pad,y+pad+11+i*lh);c.restore()}
 function drawRecHud(c){if(!recHud)return;let w=c.canvas.width,h=c.canvas.height,mt=markerTemp==null?'--':fmt(markerTemp);hudPanel(c,8,8,[`Center ${fmt(S.tCenter)}C`,`Range ${S.rangeName||S.range||'--'}`]);hudPanel(c,w-8,8,[`REC ${mmss(Date.now()-recStarted)}`,`Cam ${fmt(S.camFps)}fps  MLX ${fmt(S.mlxFps)}fps`],'right');if(marker)hudPanel(c,8,h-8,[`Marker ${mt}C`],'bottom');hudPanel(c,w-8,h-8,[`Scene ${fmt(S.tMin)}-${fmt(S.tMax)}C`,`Palette ${fmt(S.lo)}-${fmt(S.hi)}C`],'right bottom')}
-function render(){drawScene();drawRot(ctx,scene);if(rec){drawRot(recCtx,scene);drawRecHud(recCtx)}requestAnimationFrame(render)}
-function labels(){let px=(S.px100/100).toFixed(2);txt('tCenter',fmt(S.tCenter));txt('tSpan',`${fmt(S.tMin)}-${fmt(S.tMax)}`);txt('tRange',`${fmt(S.lo)}-${fmt(S.hi)}`);txt('markerTemp',markerTemp==null?'--':fmt(markerTemp));txt('statCam',fmt(S.camFps));txt('statMlx',fmt(S.mlxFps));txt('statLoop',fmt(S.loopFps));txt('distv',(S.alignDistanceCm||100)+'cm');txt('alignInfo',`RGB shift ${px}px right - crop ${S.zx}/${S.zy}%`);txt('tintv',S.tint+'%');txt('mlov',fmt(S.mlo)+'C');txt('mhiv',fmt(S.mhi)+'C');txt('brtv',S.brt);txt('conv',S.con);txt('satv',S.sat);txt('shpv',S.shp);txt('denv',S.den);if(!$('diagBox').open)return;let items=[['Cam',S.camFps,'fps'],['Cam Req',S.camReqFps,'fps'],['Transport',S.camTransport,''],['JPEG Q',S.jpegQuality,''],['Cam Enc',S.camEncodeMs,'ms'],['Cam Send',S.camSendMs,'ms'],['Cam Total',S.camTotalMs,'ms'],['Cam Size',bytes(S.camJpegBytes||camBytes),''],['Fetch',fmt(camFetchMs),'ms'],['Decode',fmt(camDecodeMs),'ms'],['Grab',fmt(S.grabMs),'ms'],['Render',fmt(S.renderMs),'ms'],['UI',fmt(S.uiMs),'ms'],['MLX',S.mlxFps,'fps'],['Therm Req',S.thermalReqFps,'fps'],['API',S.apiFps,'fps'],['Loop',S.loopFps,'fps'],['Heap',kb(S.heap),''],['PSRAM',kb(S.psram),''],['Seq',S.seq||'--',''],['Uptime',mmss(S.portalMs),''],['Index',bytes(S.indexBytes),''],['CSS',bytes(S.cssBytes),''],['JS',bytes(S.jsBytes),''],['Cam',camStatus,'']];$('diag').innerHTML=items.map(i=>`<div>${i[0]} <b>${i[1]??'--'}</b>${i[2]}</div>`).join('')}
+function render(){if(sceneDirty||rec){drawScene();drawRot(ctx,scene);sceneDirty=false;if(rec){drawRot(recCtx,scene);drawRecHud(recCtx)}}requestAnimationFrame(render)}
+function labels(){let px=(S.px100/100).toFixed(2);txt('tCenter',fmt(S.tCenter));txt('tSpan',`${fmt(S.tMin)}-${fmt(S.tMax)}`);txt('tRange',`${fmt(S.lo)}-${fmt(S.hi)}`);txt('markerTemp',markerTemp==null?'--':fmt(markerTemp));txt('statCam',fmt(S.camFps));txt('statMlx',fmt(S.mlxFps));txt('statLoop',fmt(S.loopFps));txt('distv',(S.alignDistanceCm||100)+'cm');txt('alignInfo',`RGB shift ${px}px right - crop ${S.zx}/${S.zy}%`);txt('tintv',S.tint+'%');txt('mlov',fmt(S.mlo)+'C');txt('mhiv',fmt(S.mhi)+'C');txt('brtv',S.brt);txt('conv',S.con);txt('satv',S.sat);txt('shpv',S.shp);txt('denv',S.den);if(!$('diagBox').open)return;let items=[['Cam',S.camFps,'fps'],['Cam Req',S.camReqFps,'fps'],['Transport',S.camTransport,''],['RGB FB',S.camRgbFbCount,''],['Reconfig',S.safeReconfigure?'yes':'no',''],['JPEG Q',S.jpegQuality,''],['Cam Enc',S.camEncodeMs,'ms'],['Cam Send',S.camSendMs,'ms'],['Cam Total',S.camTotalMs,'ms'],['Cam Size',bytes(S.camJpegBytes||camBytes),''],['Fetch',fmt(camFetchMs),'ms'],['Decode',fmt(camDecodeMs),'ms'],['Grab',fmt(S.grabMs),'ms'],['Render',fmt(S.renderMs),'ms'],['UI',fmt(S.uiMs),'ms'],['MLX',S.mlxFps,'fps'],['Therm Req',S.thermalReqFps,'fps'],['API',S.apiFps,'fps'],['Loop',S.loopFps,'fps'],['Heap',kb(S.heap),''],['PSRAM',kb(S.psram),''],['Seq',S.seq||'--',''],['Uptime',mmss(S.portalMs),''],['Index',bytes(S.indexBytes),''],['CSS',bytes(S.cssBytes),''],['JS',bytes(S.jsBytes),''],['Cam',camStatus,'']];$('diag').innerHTML=items.map(i=>`<div>${i[0]} <b>${i[1]??'--'}</b>${i[2]}</div>`).join('')}
 function sync(){for(let id of ['rangeMode','viewMode','tint','mlo','mhi','brt','con','sat','shp','den','jpgq'])if($(id))$(id).value=S[id==='rangeMode'?'range':id==='viewMode'?'view':id==='jpgq'?'jpegQuality':id];$('dist').value=S.alignDistanceCm||100;$('crosshair').checked=!!S.crosshair;$('recHud').checked=!!recHud;labels()}
-function applyState(s){Object.assign(S,s);S.lo=s.rangeLo;S.hi=s.rangeHi;sync();dirtyThermal=true;conn('online',false)}
+function applyState(s){Object.assign(S,s);S.lo=s.rangeLo;S.hi=s.rangeHi;sync();dirtyThermal=true;sceneDirty=true;conn('online',false)}
 async function getState(){if(stateBusy||!running)return;stateBusy=true;try{let r=await fetchTimeout('/api/state',{cache:'no-store'},1500);if(!r.ok)throw 0;applyState(await r.json())}catch(e){conn('state retry',true)}finally{stateBusy=false;setTimeout(getState,1000)}}
-async function getThermal(){if(thermBusy||!running)return;thermBusy=true;try{let r=await fetchTimeout('/thermal.bin',{cache:'no-store'},1500);if(!r.ok)throw 0;let b=await r.arrayBuffer(),dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;if(!thermalSmooth)thermalSmooth=new Float32Array(a);else for(let i=0;i<768;i++)thermalSmooth[i]+= (a[i]-thermalSmooth[i])*0.35;thermal=a;let h=r.headers;S.seq=+(h.get('X-Frame-Seq')||S.seq);S.lo=+(h.get('X-Range-Lo')||S.lo);S.hi=+(h.get('X-Range-Hi')||S.hi);S.tCenter=+(h.get('X-Temp-Center')||S.tCenter);S.tMin=+(h.get('X-Temp-Min')||S.tMin);S.tMax=+(h.get('X-Temp-Max')||S.tMax);if(marker)markerTemp=rawTempAt(marker.x,marker.y);dirtyThermal=true;labels()}catch(e){conn('thermal retry',true)}finally{thermBusy=false;setTimeout(getThermal,+S.view===1?750:(+S.view===2?125:250))}}
+async function getDiag(){if(diagBusy||!running||!$('diagBox').open)return;diagBusy=true;try{let r=await fetchTimeout('/api/diag',{cache:'no-store'},1500);if(!r.ok)throw 0;Object.assign(S,await r.json());labels()}catch(e){}finally{diagBusy=false;if(running&&$('diagBox').open)setTimeout(getDiag,1000)}}
+async function getThermal(){if(thermBusy||!running)return;thermBusy=true;try{let r=await fetchTimeout('/thermal.bin',{cache:'no-store'},1500);if(!r.ok)throw 0;let b=await r.arrayBuffer(),dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;if(!thermalSmooth)thermalSmooth=new Float32Array(a);else for(let i=0;i<768;i++)thermalSmooth[i]+= (a[i]-thermalSmooth[i])*0.35;thermal=a;let h=r.headers;S.seq=+(h.get('X-Frame-Seq')||S.seq);S.lo=+(h.get('X-Range-Lo')||S.lo);S.hi=+(h.get('X-Range-Hi')||S.hi);S.tCenter=+(h.get('X-Temp-Center')||S.tCenter);S.tMin=+(h.get('X-Temp-Min')||S.tMin);S.tMax=+(h.get('X-Temp-Max')||S.tMax);if(marker)markerTemp=rawTempAt(marker.x,marker.y);dirtyThermal=true;sceneDirty=true;labels()}catch(e){conn('thermal retry',true)}finally{thermBusy=false;setTimeout(getThermal,+S.view===1?750:(+S.view===2?125:250))}}
 function loadImg(url){return new Promise((res,rej)=>{let i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=url})}
-async function setCam(blob){let t=performance.now(),url=URL.createObjectURL(blob);try{let img=await loadImg(url);if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img;camDecodeMs=performance.now()-t;camStatus='ok'}catch(e){URL.revokeObjectURL(url);camStatus='decode failed';throw e}}
+async function setCam(blob){let t=performance.now(),url=URL.createObjectURL(blob);try{let img=await loadImg(url);if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img;camDecodeMs=performance.now()-t;camStatus='ok';sceneDirty=true}catch(e){URL.revokeObjectURL(url);camStatus='decode failed';throw e}}
 async function getCam(){if(camBusy||!running||+S.view===2)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1800);if(!r.ok)throw 0;let h=r.headers;S.camEncodeMs=+(h.get('X-Cam-Encode-Ms')||S.camEncodeMs);S.camSendMs=+(h.get('X-Cam-Send-Ms')||S.camSendMs);S.camTotalMs=+(h.get('X-Cam-Total-Ms')||S.camTotalMs);S.camJpegBytes=+(h.get('X-Cam-Bytes')||S.camJpegBytes);S.jpegQuality=+(h.get('X-JPEG-Quality')||S.jpegQuality);S.camTransport=h.get('X-Cam-Transport')||S.camTransport;let blob=await r.blob();camFetchMs=performance.now()-t;camBytes=blob.size;await setCam(blob);labels()}catch(e){camStatus='retry';conn('cam retry',true)}finally{camBusy=false;setTimeout(getCam,+S.view===1?70:110)}}
-function post(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(()=>{let p=new URLSearchParams(pending);pending={};fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p},1800).catch(()=>conn('control retry',true))},90)}
-function setDistance(v){v=clamp(Math.round(v),5,500);S.alignDistanceCm=v;S.px100=Math.round(37440/v);S.py100=0;S.zx=100;S.zy=124;$('dist').value=v;post({dist:v});labels()}
-for(let id of ['dist','tint','mlo','mhi','brt','con','sat','shp','den'])$(id).oninput=e=>{let v=+e.target.value;if(id==='dist'){setDistance(v)}else{S[id]=v;post({[id]:v});labels()}dirtyThermal=true};
+function post(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(()=>{let p=new URLSearchParams(pending);pending={};fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p},1800).catch(()=>conn('control retry',true))},160)}
+function setDistance(v){v=clamp(Math.round(v),5,500);S.alignDistanceCm=v;S.px100=Math.round(37440/v);S.py100=0;S.zx=100;S.zy=124;$('dist').value=v;post({dist:v});sceneDirty=true;labels()}
+for(let id of ['dist','tint','mlo','mhi','brt','con','sat','shp','den'])$(id).oninput=e=>{let v=+e.target.value;if(id==='dist'){setDistance(v)}else{S[id]=v;post({[id]:v});labels()}dirtyThermal=true;sceneDirty=true};
 $('distMinus').onclick=()=>setDistance((+S.alignDistanceCm||100)-5);$('distPlus').onclick=()=>setDistance((+S.alignDistanceCm||100)+5);
-$('viewMode').onchange=e=>{S.view=+e.target.value;post({view:S.view});getCam();getThermal()};$('rangeMode').onchange=e=>{S.range=+e.target.value;post({range:S.range})};$('jpgq').onchange=e=>{S.jpegQuality=+e.target.value;post({jpgq:S.jpegQuality})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;post({crosshair:S.crosshair})};$('recHud').onchange=e=>{recHud=e.target.checked?1:0;localStorage.recHud=recHud};$('diagBox').ontoggle=labels;$('thermalMode').onchange=()=>{dirtyThermal=true};$('resetAlign').onclick=()=>setDistance(100);$('rotBtn').onclick=()=>{rot=(rot+1)%4;setCanvasRotation()};$('testFrame').onclick=()=>open('/cam.jpg?ts='+Date.now(),'_blank');$('snap').onclick=()=>{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()};canvas.onclick=e=>{let r=canvas.getBoundingClientRect(),p=viewToScene((e.clientX-r.left)*canvas.width/r.width,(e.clientY-r.top)*canvas.height/r.height);marker=p;markerTemp=rawTempAt(p.x,p.y);labels()};
+$('viewMode').onchange=e=>{S.view=+e.target.value;sceneDirty=true;post({view:S.view});getCam();getThermal()};$('rangeMode').onchange=e=>{S.range=+e.target.value;dirtyThermal=true;sceneDirty=true;post({range:S.range})};$('jpgq').onchange=e=>{S.jpegQuality=+e.target.value;post({jpgq:S.jpegQuality})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;sceneDirty=true;post({crosshair:S.crosshair})};$('recHud').onchange=e=>{recHud=e.target.checked?1:0;localStorage.recHud=recHud};$('diagBox').ontoggle=()=>{labels();if($('diagBox').open)getDiag()};$('thermalMode').onchange=()=>{dirtyThermal=true;sceneDirty=true};$('resetAlign').onclick=()=>setDistance(100);$('rotBtn').onclick=()=>{rot=(rot+1)%4;setCanvasRotation()};$('testFrame').onclick=()=>open('/cam.jpg?ts='+Date.now(),'_blank');$('snap').onclick=()=>{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()};canvas.onclick=e=>{let r=canvas.getBoundingClientRect(),p=viewToScene((e.clientX-r.left)*canvas.width/r.width,(e.clientY-r.top)*canvas.height/r.height);marker=p;markerTemp=rawTempAt(p.x,p.y);sceneDirty=true;labels()};
 function recType(){return['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||''}function stopRec(){if(rec)rec.stop()}$('recBtn').onclick=()=>{if(rec){stopRec();return}if(!recCanvas.captureStream||!window.MediaRecorder){$('saveMsg').textContent='Recording unavailable; use screen recording.';return}chunks=[];let type=recType();rec=new MediaRecorder(recCanvas.captureStream(15),type?{mimeType:type}:undefined);rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};rec.onstop=()=>{clearInterval(recTimer);let blob=new Blob(chunks,{type:type||'video/webm'});if(recUrl)URL.revokeObjectURL(recUrl);recUrl=URL.createObjectURL(blob);$('saveMsg').innerHTML=`<a href="${recUrl}" download="thermal-stream.${type.includes('mp4')?'mp4':'webm'}">Download recording</a>`;$('recBtn').textContent='Record';rec=null};rec.start(1000);recStarted=Date.now();recTimer=setInterval(()=>{$('saveMsg').textContent='Recording '+mmss(Date.now()-recStarted)},500);$('recBtn').textContent='Stop'};
-$('stopPortal').onclick=async()=>{running=false;try{await fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({stop_stream:1})},1200)}catch(e){}$('saveMsg').textContent='Stop requested. Hold button 3s if needed.'};
+$('stopPortal').onclick=async()=>{$('saveMsg').textContent='Stopping portal...';try{let r=await fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({stop_stream:1})},1200);running=false;$('saveMsg').textContent=r.ok?'Stop requested.':'Stop request failed; hold button 3s.'}catch(e){$('saveMsg').textContent='Stop failed; hold button 3s.'}};
 setCanvasRotation();getState();getThermal();getCam();render();
 )PORTALJS";
 
@@ -2955,10 +3098,7 @@ void handleStreamCameraJpg() {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
       stream_jpeg_fail_count++;
-      stream_native_jpeg_active = false;
-      deinitCameraDriver();
-      delay(30);
-      initCamera();
+      restoreRgb565CameraMode();
     } else if (fb->format == PIXFORMAT_JPEG && fb->len) {
       uint32_t send_start_us = micros();
       addStreamJpegTimingHeaders(fb->len, 0);
@@ -2975,13 +3115,13 @@ void handleStreamCameraJpg() {
     } else {
       stream_jpeg_fail_count++;
       esp_camera_fb_return(fb);
-      stream_native_jpeg_active = false;
-      deinitCameraDriver();
-      delay(30);
-      initCamera();
+      restoreRgb565CameraMode();
     }
   }
 
+  if (!cam_have_frame || !cam_snapshot) {
+    warmCameraSnapshot(1);
+  }
   if (!cam_have_frame || !cam_snapshot) {
     share_server.send(404, "text/plain", "No camera frame available");
     return;
@@ -3093,17 +3233,24 @@ void handleStreamControl() {
     int cm = share_server.arg("preset_cm").toInt();
     if (applyAlignmentPresetCm(cm, false)) dirty = true;
   }
-  if (share_server.hasArg("dist") || share_server.hasArg("distance_cm")) {
+  bool has_distance_arg = share_server.hasArg("dist") || share_server.hasArg("distance_cm");
+  if (has_distance_arg) {
     int cm = share_server.hasArg("dist") ? share_server.arg("dist").toInt()
                                          : share_server.arg("distance_cm").toInt();
     applyAlignmentDistanceCm(cm, false);
     dirty = true;
   }
-  int px100 = argPx100Clamped("px100", "px", parallax_x100);
-  int py100 = argPx100Clamped("py100", "py", parallax_y100);
-  int zx = argIntClamped("zx", zoom_x_pct, ZOOM_MIN, ZOOM_MAX);
-  int zy = argIntClamped("zy", zoom_y_pct, ZOOM_MIN, ZOOM_MAX);
-  if (share_server.hasArg("zoom")) zy = argIntClamped("zoom", zy, ZOOM_MIN, ZOOM_MAX);
+  int px100 = parallax_x100;
+  int py100 = parallax_y100;
+  int zx = zoom_x_pct;
+  int zy = zoom_y_pct;
+  if (!has_distance_arg) {
+    px100 = argPx100Clamped("px100", "px", parallax_x100);
+    py100 = argPx100Clamped("py100", "py", parallax_y100);
+    zx = argIntClamped("zx", zoom_x_pct, ZOOM_MIN, ZOOM_MAX);
+    zy = argIntClamped("zy", zoom_y_pct, ZOOM_MIN, ZOOM_MAX);
+    if (share_server.hasArg("zoom")) zy = argIntClamped("zoom", zy, ZOOM_MIN, ZOOM_MAX);
+  }
   int ti = argIntClamped("tint", tint_pct, 0, 100);
   int br = argIntClamped("brt", cam_brightness, -2, 2);
   int con = argIntClamped("con", cam_contrast, -2, 2);
@@ -3119,6 +3266,7 @@ void handleStreamControl() {
   if (ti != tint_pct)   { tint_pct = (uint8_t)ti; dirty = true; }
   if (jq != stream_jpeg_quality) {
     stream_jpeg_quality = (uint8_t)jq;
+    if (stream_native_jpeg_active) applyCameraJpegQuality();
     dirty = true;
   }
   if (br != cam_brightness) {
@@ -3195,8 +3343,7 @@ void handleStreamState() {
   portEXIT_CRITICAL(&mlx_mux);
 
   String json;
-  updateCameraMemoryDiagnostics();
-  json.reserve(3200);
+  json.reserve(1500);
   json += F("{\"stream\":");
   json += stream_mode ? F("true") : F("false");
   json += F(",\"ssid\":\""); json += share_ap_ssid; json += F("\"");
@@ -3232,14 +3379,32 @@ void handleStreamState() {
   json += F(",\"tMax\":"); json += String(mx, 2);
   json += F(",\"seq\":"); json += seq;
   json += F(",\"camFps\":"); json += String(cam_fps, 1);
-  json += F(",\"camReqFps\":"); json += String(stream_cam_req_fps, 1);
   json += F(",\"mlxFps\":"); json += String(mlx_fps, 1);
-  json += F(",\"thermalReqFps\":"); json += String(stream_thermal_req_fps, 1);
   json += F(",\"loopFps\":"); json += String(current_fps, 1);
+  json += F(",\"portalMs\":"); json += stream_started_ms ? (now - stream_started_ms) : 0;
+  json += F(",\"camTransport\":\"");
+  json += stream_native_jpeg_active ? F("native-jpeg\"") : F("rgb565-jpeg\"");
+  json += F(",\"jpegQuality\":"); json += (int)stream_jpeg_quality;
+  json += F(",\"camOk\":"); json += cam_ok ? 1 : 0;
+  json += F(",\"camHaveFrame\":"); json += cam_have_frame ? 1 : 0;
+  json += F("}");
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.send(200, "application/json", json);
+}
+
+void handleStreamDiagnostics() {
+  uint32_t now = millis();
+  noteStreamRequest(stream_api_count, stream_api_timer_ms, stream_api_fps);
+  updateCameraMemoryDiagnostics();
+
+  String json;
+  json.reserve(1800);
+  json += F("{\"camReqFps\":"); json += String(stream_cam_req_fps, 1);
+  json += F(",\"thermalReqFps\":"); json += String(stream_thermal_req_fps, 1);
+  json += F(",\"apiFps\":"); json += String(stream_api_fps, 1);
   json += F(",\"grabMs\":"); json += String(diag_grab_ms, 1);
   json += F(",\"renderMs\":"); json += String(diag_render_ms, 1);
   json += F(",\"uiMs\":"); json += String(diag_ui_ms, 1);
-  json += F(",\"apiFps\":"); json += String(stream_api_fps, 1);
   json += F(",\"portalMs\":"); json += stream_started_ms ? (now - stream_started_ms) : 0;
   json += F(",\"heap\":"); json += ESP.getFreeHeap();
   json += F(",\"psram\":"); json += ESP.getFreePsram();
@@ -3268,6 +3433,8 @@ void handleStreamState() {
   json += F(",\"camExpectedFrameLen\":"); json += (unsigned)cam_snapshot_len;
   json += F(",\"camFrameFailCount\":"); json += cam_frame_fail_count;
   json += F(",\"camFrameLenMismatchCount\":"); json += cam_frame_len_mismatch_count;
+  json += F(",\"camRgbFbCount\":"); json += CAMERA_RGB565_FB_COUNT;
+  json += F(",\"safeReconfigure\":"); json += CAMERA_HAS_SAFE_RECONFIGURE ? 1 : 0;
   json += F(",\"psramFound\":"); json += cam_psram_found ? 1 : 0;
   json += F(",\"psramSize\":"); json += cam_psram_size;
   json += F(",\"psramFree\":"); json += cam_psram_free;
@@ -3290,6 +3457,7 @@ void configureShareRoutes() {
   share_server.on("/cam.jpg", HTTP_GET, handleStreamCameraJpg);
   share_server.on("/thermal.bin", HTTP_GET, handleStreamThermalBin);
   share_server.on("/api/state", HTTP_GET, handleStreamState);
+  share_server.on("/api/diag", HTTP_GET, handleStreamDiagnostics);
   share_server.on("/api/control", HTTP_POST, handleStreamControl);
   share_server.on("/generate_204", [](){
     share_server.sendHeader("Location", "/", true);
