@@ -1,35 +1,35 @@
 /*
  * ============================================================================
- * DIY FLIR-STYLE THERMAL CAMERA — v16
+ * DIY FLIR-style thermal camera
  * ============================================================================
  * MCU      : DFRobot FireBeetle 2 ESP32-S3-U (DFR0975-U), N16R8
  * Display  : DFRobot Fermion 3.5" 480x320 ILI9488 + GT911 touch (DFR0669)
  * Camera   : OV3660 over DVP (replaced OV2640), QVGA RGB565 (with digital crop-zoom)
  * Thermal  : Melexis MLX90640 32x24, on dedicated Wire1 @ 1 MHz
  *
- * Init order (every step is load-bearing — don't reorder casually):
- *   1. Wire.begin(1, 2) @ 100 kHz — shared bus for AXP / GT911 / SCCB.
+ * Init order:
+ *   1. Wire.begin(1, 2) @ 100 kHz - shared bus for AXP / GT911 / SCCB.
  *   2. AXP313A enable camera power, then 500 ms.
  *   3. esp_camera_init BEFORE lcd.init (LCD touches Wire internals).
  *      Camera shares Wire's I2C driver via pin_sccb_*=-1, sccb_i2c_port=0.
- *   4. GT911 manual reset pulse: INT low 11 ms → input → 50 ms (selects 0x5D).
- *   5. lcd.init, then apply the saved landscape/portrait orientation.
+ *   4. GT911 manual reset pulse: INT low 11 ms, input, 50 ms (selects 0x5D).
+ *   5. lcd.init in landscape orientation.
  *   6. Wire1.begin(11, 14) @ 1 MHz, MLX init.
  *
- * Pinout — verified, do not change without re-verifying GDI ribbon:
+ * Pinout - verified, do not change without re-verifying GDI ribbon:
  *   GDI    : SCLK=17 MOSI=15 MISO=16 DC=3 RST=38 CS=18 BL=21
- *            TOUCH SDA=1 SCL=2 INT=13   (TCS=GPIO12 is on the ribbon — avoid!)
+ *            TOUCH SDA=1 SCL=2 INT=13   (TCS=GPIO12 is on the ribbon; avoid)
  *   CAMERA : XCLK=45 SIOD=1 SIOC=2 D0..D7=39,40,41,4,7,8,46,48
  *            VSYNC=6 HREF=42 PCLK=5
- *   MLX    : SDA=11 SCL=14   (Wire1; NOT 12 — that's GDI's TCS line)
+ *   MLX    : SDA=11 SCL=14   (Wire1; not 12, which is GDI TCS)
  *   BUTTON : GPIO10, INPUT_PULLUP, NO to GND
  *
- * MLX90640_I2C_Driver.cpp must be patched: every "Wire." → "Wire1.".
+ * MLX90640_I2C_Driver.cpp must be patched: every "Wire." to "Wire1.".
  *
- * Byte-order rules (this was THE bug in v8 — semantics flipped):
+ * Byte-order rules:
  *   LovyanGFX setSwapBytes:
- *     true  → buffer is treated as rgb565_t  (native uint16_t, R in high bits)
- *     false → buffer is treated as swap565_t (byte-swapped / wire format)
+ *     true  -> buffer is treated as rgb565_t  (native uint16_t, R in high bits)
+ *     false -> buffer is treated as swap565_t (byte-swapped / wire format)
  *   OV2640 RGB565 frame buffer is wire format (byte0 = R+G_hi).
  *   palette_native[] is native uint16_t for UI drawing. Render chunk_buf is
  *   written in wire-format (swap565) so pushImage() can use the DMA fast path
@@ -38,15 +38,13 @@
  *     pushImage(camera_buf)   -> setSwapBytes(false)
  *     pushImage(chunk_buf)    -> setSwapBytes(false)
  *     drawFastHLine(palette)  -> palette_native[] / normal colour APIs
- *   v8 had ALL THREE inverted, which is why everything was green/cyan/purple.
  *
  * Camera tearing mitigation:
  *   fb_count = 3, grab_mode = LATEST, XCLK = 16 MHz, snapshot to our own
  *   PSRAM buffer immediately and esp_camera_fb_return() before rendering, so
  *   the camera DMA never has to wait on the LCD push.
  *
- * Known unsolved: SD card on shared SPI kills the LCD. SD storage is disabled;
- * use the freeze export or browser portal instead.
+ * SD storage is disabled; use freeze export or browser portal instead.
  *
  * Build: ESP32 Arduino core 2.x, "DFRobot FireBeetle 2 ESP32-S3", USB CDC On
  *        Boot, 16MB Flash, partition 16M (3MB APP / 9.9MB FATFS), OPI PSRAM.
@@ -68,20 +66,11 @@
 #include "DFRobot_AXP313A.h"
 #include "MLX90640_API.h"
 #include "MLX90640_I2C_Driver.h"
-#include <algorithm>     // std::nth_element for AUTO-range percentile clipping
+#include <algorithm>     // std::nth_element for parity medians
 
 // Smooth display interpolation. The upstream frame is kept edge-aware; this
 // just avoids turning every MLX cell into an obvious display block.
 #define USE_BILINEAR_THERMAL 1
-
-// Experimental: reinitialize the camera as native JPEG while the browser
-// portal is active. Kept off by default until verified on the actual unit.
-#ifndef STREAM_CAMERA_NATIVE_JPEG
-#define STREAM_CAMERA_NATIVE_JPEG 0
-#endif
-#ifndef STREAM_CAMERA_CHUNKED_JPEG
-#define STREAM_CAMERA_CHUNKED_JPEG 0
-#endif
 
 // ---------------------------------------------------------------- Pins ----
 #define TFT_SCLK 17
@@ -98,15 +87,8 @@
 #define MLX_SDA  11
 #define MLX_SCL  14
 
-// LCD SPI write clock. 60 MHz is an overclock for many ILI9488 boards, but
-// this is a contained performance test knob: set back to 40000000UL if the
-// display shows speckles, wrong colours, or intermittent blanking.
-// ILI9488 published spec is 20 MHz max SPI write; in practice 40 MHz is the
-// known-safe sweet spot, 60 MHz produced random-colored full-width lines
-// (bit-flips on the wire). 50 MHz is a midpoint we're testing — if you see
-// any random-color lines reappear, drop back to 40 MHz; if it's clean, you
-// can push higher (55, then back toward 60) to find this panel's actual
-// ceiling.
+// LCD SPI write clock. 40 MHz is the known-safe baseline; 60 MHz produced
+// random full-width line artifacts, so 50 MHz is the current cap.
 static constexpr uint32_t TFT_WRITE_FREQ_HZ = 50000000UL;
 
 #define XCLK_GPIO_NUM 45
@@ -162,18 +144,7 @@ static int IMG_X = 24;
 static int IMG_Y = 40;
 static constexpr int IMG_W = 320;
 static constexpr int IMG_H = 240;
-static constexpr int CROSS_CX = IMG_W / 2;
-static constexpr int CROSS_CY = IMG_H / 2;
 static constexpr int CROSS_R  = 10;
-
-static inline bool isCrosshairPixel(int x, int y) {
-  bool in_x = (x >= CROSS_CX - CROSS_R && x <= CROSS_CX + CROSS_R);
-  bool in_y = (y >= CROSS_CY - CROSS_R && y <= CROSS_CY + CROSS_R);
-  return (y == CROSS_CY && in_x) ||
-         (x == CROSS_CX && in_y) ||
-         ((y == CROSS_CY - CROSS_R || y == CROSS_CY + CROSS_R) && in_x) ||
-         ((x == CROSS_CX - CROSS_R || x == CROSS_CX + CROSS_R) && in_y);
-}
 
 // ---------------------------------------------------------------- MLX ----
 const byte MLX_ADDR = 0x33;
@@ -186,57 +157,40 @@ paramsMLX90640 mlx_params;
 static constexpr uint8_t  MLX_REFRESH_RATE_CODE = 0x05;
 static constexpr uint8_t  MLX_ADC_RESOLUTION_CODE = 0x03; // 19-bit, lowest sensor noise
 static constexpr uint32_t MLX_POLL_MS = 3;               // cheap data-ready check cadence
-// Filtering knobs. Conservative tuning for "see fingers vs palm clearly":
-//
-// Temporal IIR — was alpha=0.16 / fast=0.82 / delta=1.0 °C. That made
-// sub-1 °C changes (which is the ENTIRE useful skin signal) take ~6 frames
-// to register. Now alpha=0.45 / delta=0.4: skin variations cross the "fast"
-// threshold quickly and small changes still update meaningfully each frame.
+// Filtering keeps sub-degree hand detail responsive while catching real motion.
 static constexpr float MLX_TEMP_ALPHA_STILL = 0.45f;     // small changes still respond fast
 static constexpr float MLX_TEMP_ALPHA_FAST  = 0.85f;     // real motion: catch up almost instantly
 static constexpr float MLX_TEMP_FAST_DELTA_C = 0.40f;    // engage fast mode at half-a-degree
 
-// Spatial — was 0.70 °C, which is wider than the typical temperature
-// difference *within* a hand. So fingers (33 °C) and palm (32.5 °C) were
-// being averaged together → fingers vanished. 0.0 disables the spatial pass
-// entirely (neighbours only count if exactly equal, which essentially never).
-// Try 0.20 if cell-level noise is too pronounced — that smooths within-noise
-// neighbours but preserves real edges between fingers and palm.
-static constexpr float MLX_SPATIAL_EDGE_C = 0.0f;        // 0 = disabled
+// Off by default: the temporal filter is cheaper and preserves fine detail.
+#define ENABLE_MLX_SPATIAL_DENOISE 0
+#if ENABLE_MLX_SPATIAL_DENOISE
+static constexpr float MLX_SPATIAL_EDGE_C = 0.20f;
+#endif
 
 // Chess subpages can have a small relative bias from CP/TGC noise and timing.
 // Correct only the global checkerboard offset; do not blur local edges.
 static constexpr bool  MLX_BALANCE_CHESS_SUBPAGES = true;
 static constexpr float MLX_CHESS_BALANCE_MAX_C = 1.50f;  // ignore implausible scene-driven medians
 
-// Auto-range — was using raw min/max which means one outlier cell stretches
-// the whole palette. Switch to percentile clipping (see updateAutoDisplayRange).
+// Auto-range uses percentile clipping so outliers do not stretch the palette.
 static constexpr float MLX_AUTO_MIN_SPAN_C = 2.50f;      // prevent auto-range from magnifying noise
 static constexpr float MLX_RANGE_ALPHA_EXPAND = 0.70f;   // new hot/cold enters range fast
 static constexpr float MLX_RANGE_ALPHA_SHRINK = 0.30f;   // contraction speed (was 0.18, too slow)
-// Trim the hottest/coldest pixels when computing AUTO range — kills outliers
-// (one hot bulb in the frame) so most of the palette is spent on the bulk
-// of the scene where you actually want to see contrast.
 static constexpr int   MLX_AUTO_TRIM_LO_PCT = 5;         // ignore coldest 5% of pixels
 static constexpr int   MLX_AUTO_TRIM_HI_PCT = 5;         // ignore hottest 5% of pixels
 
-// mlx_temps is the chess-mode accumulator: each MLX90640_CalculateTo() call
-// only writes the half of the array matching the current subpage (the other
-// half retains the previous-subpage values from the prior MLX subpage). Rendering
-// straight from this buffer makes 1-2-cell-wide features (fingers!) flicker
-// in and out, because they often land entirely on cells of one subpage.
-//
-// mlx_temps_full is the rendering buffer: we only promote mlx_temps into it
-// *after* both subpages have been collected this cycle. Render code reads
-// from here so it always sees a complete frame. This is exactly what the
-// old TFT_eSPI sketch did with `for (byte x=0; x<2; x++)` reading both
-// subpages back-to-back before rendering. v15 lost that and v16 brings it
-// back.
+// Render only after both chess subpages are collected, so narrow features do
+// not flicker between mixed half-frames.
 float mlx_temps[768];          // chess-pattern accumulator
-float mlx_temps_full[768];     // last complete frame — what render code reads
+float mlx_temps_full[768];     // last complete frame read by render code
 float mlx_publish[768];        // repaired/ranged frame staged before publishing
 float mlx_filtered[768];       // adaptive temporal denoise state
+#if ENABLE_MLX_SPATIAL_DENOISE
 float mlx_spatial[768];        // edge-aware spatial denoise scratch
+#endif
+static constexpr int MLX_RANGE_HIST_BINS = 128;
+uint16_t mlx_range_hist[MLX_RANGE_HIST_BINS];
 bool  mlx_filter_valid = false;
 float mlx_range_lo = 20.0f, mlx_range_hi = 30.0f;
 bool  mlx_range_valid = false;
@@ -271,12 +225,13 @@ volatile float mlx_diag_chess_bias_last = 0.0f;
 // needs to consult. Full definitions live further down (~line 670). Kept
 // here because Arduino doesn't auto-generate forward decls for variables
 // or enums, only for free functions.
-enum RangeMode { RANGE_AUTO=0, RANGE_AUTO2, RANGE_SKIN, RANGE_BODY,
-                 RANGE_WARM, RANGE_HOT, RANGE_VHOT, RANGE_MANUAL, RANGE_COUNT };
+enum RangeMode { RANGE_AUTO=0, RANGE_AUTO2, RANGE_AUTO3, RANGE_HMN,
+                 RANGE_PCB, RANGE_PRNT, RANGE_WALL, RANGE_DRFT,
+                 RANGE_MANUAL, RANGE_COUNT };
 extern volatile RangeMode range_mode;
-static constexpr float AUTO2_AMBIENT_DELTA = 1.5f;
-static constexpr int   AUTO2_MIN_SUBJECT_PIXELS = 8;
-static constexpr float AUTO2_PAD_C = 0.3f;
+static constexpr int   AUTO2_NARROW_TRIM_PCT = 15;
+static constexpr float AUTO3_ROOM_FLOOR_DELTA_C = 0.5f;
+bool shouldThrottleMLXForScreenCameraOnly();
 
 bool initMLX() {
   Wire1.begin(MLX_SDA, MLX_SCL);
@@ -294,9 +249,9 @@ bool initMLX() {
 }
 
 // Reads ONE chess subpage. Returns:
-//   MLX_READ_FAIL — sensor I2C failure
-//   MLX_READ_HALF — no complete frame yet (no ready subpage, or one stale half)
-//   MLX_READ_FULL — both subpages have been collected this cycle; analyzeMLX()
+//   MLX_READ_FAIL: sensor I2C failure
+//   MLX_READ_HALF: no complete frame yet
+//   MLX_READ_FULL: both subpages are ready; analyzeMLX()
 //                   can now repair/range and publish a new render frame.
 //
 // The stock Melexis MLX90640_GetFrameData() loop is conservative: if another
@@ -345,8 +300,7 @@ int readMLXFrameDataFast(uint16_t *frameData) {
     mlx_diag_read_us_last = read_us;
     if (read_us > mlx_diag_read_us_max) mlx_diag_read_us_max = read_us;
 
-    // A new subpage completed during the RAM burst. Discard this read rather
-    // than calculating temperatures from a possibly mixed old/new RAM image.
+    // Discard reads that overlap a subpage rollover.
     if (statusAfter & 0x0008) {
       mlx_diag_stale++;
       continue;
@@ -379,7 +333,7 @@ int readMLXSubpage() {
     mlx_subpage_mask = 0;
     return MLX_READ_FAIL;
   }
-  int sp = raw[833] & 0x01;          // which subpage this frame is — Melexis stores it at index 833
+  int sp = raw[833] & 0x01;          // Melexis stores the subpage bit at index 833.
   float Ta = MLX90640_GetTa(raw, &mlx_params);
   float tr = Ta - TA_SHIFT;
   MLX90640_CalculateTo(raw, &mlx_params, 0.95f, tr, mlx_temps);
@@ -515,8 +469,8 @@ void denoiseMLXFrame(float *t) {
     }
   }
 
-  // Light edge-aware spatial pass. Similar neighbours average out cell noise;
-  // strong thermal edges are left alone so fingers/tools don't smear badly.
+#if ENABLE_MLX_SPATIAL_DENOISE
+  // Edge-aware spatial pass: average only similar neighbours.
   for (int row = 0; row < 24; row++) {
     for (int col = 0; col < 32; col++) {
       int idx = row * 32 + col;
@@ -544,6 +498,7 @@ void denoiseMLXFrame(float *t) {
     }
   }
   memcpy(t, mlx_spatial, sizeof(mlx_spatial));
+#endif
 }
 
 void updateAutoDisplayRange(float mn, float mx, float &lo, float &hi) {
@@ -570,12 +525,45 @@ void updateAutoDisplayRange(float mn, float mx, float &lo, float &hi) {
   lo = mlx_range_lo;
   hi = mlx_range_hi;
 }
+int buildMLXRangeHistogram(const float *t, float mn, float mx) {
+  memset(mlx_range_hist, 0, sizeof(mlx_range_hist));
+  if (!(mx > mn)) {
+    mlx_range_hist[0] = 768;
+    return 768;
+  }
 
-// Repair bad pixels, range-find, recompute centre temperature, then publish.
-// Operates on a staged copy of the complete chess accumulator. Borrowed from
-// the old TFT_eSPI sketch: any cell whose temperature is impossible (<-40 °C
-// or >300 °C) is replaced with its left neighbour, which kills isolated dead
-// pixels far better than just clipping them.
+  float scale = (float)(MLX_RANGE_HIST_BINS - 1) / (mx - mn);
+  int valid = 0;
+  for (int i = 0; i < 768; i++) {
+    float v = t[i];
+    if (!(v >= -40.0f && v <= 300.0f)) continue;
+    int b = (int)((v - mn) * scale);
+    if (b < 0) b = 0;
+    else if (b >= MLX_RANGE_HIST_BINS) b = MLX_RANGE_HIST_BINS - 1;
+    mlx_range_hist[b]++;
+    valid++;
+  }
+  return valid;
+}
+
+float mlxRangePercentile(float mn, float mx, int valid, int pct) {
+  if (valid <= 0 || !(mx > mn)) return mn;
+  if (pct < 0) pct = 0;
+  else if (pct > 100) pct = 100;
+
+  int target = ((valid - 1) * pct) / 100;
+  int accum = 0;
+  for (int b = 0; b < MLX_RANGE_HIST_BINS; b++) {
+    accum += mlx_range_hist[b];
+    if (accum > target) {
+      return mn + (mx - mn) * (float)b / (float)(MLX_RANGE_HIST_BINS - 1);
+    }
+  }
+  return mx;
+}
+
+// Repair bad pixels, range-find, recompute center temperature, then publish.
+// Impossible cells are replaced with a neighbor before display/export.
 void analyzeMLX() {
   memcpy(mlx_publish, mlx_temps, sizeof(mlx_publish));
   float *t = mlx_publish;
@@ -587,15 +575,7 @@ void analyzeMLX() {
   t[1*32 + 21] = 0.5f * (t[1*32 + 20] + t[1*32 + 22]);
   t[4*32 + 30] = 0.5f * (t[4*32 + 29] + t[4*32 + 31]);
 
-  // Generic dead-pixel substitution from neighbour. Sweeps L→R so a run of
-  // bad pixels still gets reasonable values from the last good cell.
-  // CRITICAL: also catches NaN. The Melexis math can produce NaN when a
-  // pixel is saturated or a calibration term divides by zero, and NaN
-  // compares FALSE against everything, so a plain `t[i] < -40 || t[i] > 300`
-  // would silently let it through. A poisoned NaN cell then crashed
-  // buildThermalPaletteFrame because (int)(NaN*255+0.5f) saturates to
-  // INT_MAX and the palette lookup ran off the end of the array. Use
-  // `!(t[i] >= -40 && t[i] <= 300)` because that condition is TRUE for NaN.
+  // Replace invalid values, including NaN, before palette indexing.
   if (!(t[0] >= -40 && t[0] <= 300)) t[0] = t[1];
   for (int i = 1; i < 768; i++) {
     if (!(t[i] >= -40 && t[i] <= 300)) t[i] = t[i-1];
@@ -603,65 +583,48 @@ void analyzeMLX() {
 
   denoiseMLXFrame(t);
 
-  // Compute true min/max for the side-palette labels — those should reflect
-  // actual scene extremes — AND the trimmed min/max that AUTO range uses.
-  // The trimmed pair excludes the coldest MLX_AUTO_TRIM_LO_PCT% and hottest
-  // MLX_AUTO_TRIM_HI_PCT% of pixels so a single bright outlier (lamp, hot
-  // mug) doesn't stretch the palette and crush the rest of the scene.
-  static float scratch[768];
-  memcpy(scratch, t, sizeof(scratch));
-  const int trim_lo_idx = (768 * MLX_AUTO_TRIM_LO_PCT) / 100;
-  const int trim_hi_idx = 768 - 1 - (768 * MLX_AUTO_TRIM_HI_PCT) / 100;
-  // nth_element partial-sorts in O(n) — far cheaper than a full sort.
-  std::nth_element(scratch, scratch + trim_lo_idx, scratch + 768);
-  float mn_trimmed = scratch[trim_lo_idx];
-  std::nth_element(scratch + trim_lo_idx + 1,
-                   scratch + trim_hi_idx,
-                   scratch + 768);
-  float mx_trimmed = scratch[trim_hi_idx];
+  // Compute true min/max for labels and histogram-percentile range targets.
+  // A fixed histogram avoids repeated nth_element passes in the MLX task; at
+  // 128 bins it is more than precise enough for display range selection and
+  // keeps the task inside the 8 Hz sensor cadence.
+  float mn = t[0], mx = t[0];
+  for (int i = 1; i < 768; i++) {
+    if (t[i] < mn) mn = t[i];
+    if (t[i] > mx) mx = t[i];
+  }
+  int hist_valid = buildMLXRangeHistogram(t, mn, mx);
+  float mn_trimmed = mlxRangePercentile(mn, mx, hist_valid, MLX_AUTO_TRIM_LO_PCT);
+  float mx_trimmed = mlxRangePercentile(mn, mx, hist_valid, 100 - MLX_AUTO_TRIM_HI_PCT);
 
-  // True min/max for the labels (still useful to know if scene has hot/cold
-  // outliers). Doing this from the partially-sorted scratch is free since
-  // we know the smallest and largest live in the unsorted ends.
-  float mn = scratch[0], mx = scratch[767];
-  for (int i = 1; i < trim_lo_idx; i++) if (scratch[i] < mn) mn = scratch[i];
-  for (int i = trim_hi_idx + 1; i < 767; i++) if (scratch[i] > mx) mx = scratch[i];
-
-  // Pick the AUTO target. AUTO2 is "subject-focused": find the median
-  // (an estimate of ambient/room), throw away pixels close to ambient,
-  // and use only the leftover "interesting" pixels' min/max as the target.
-  // If too few pixels qualify (uniform scene), fall back to plain AUTO.
+  // Pick the AUTO target. AUTO2 uses tighter percentile clipping for higher
+  // contrast. AUTO3 estimates room temperature from the median and forces the
+  // palette floor above it so ambient walls/backgrounds stay dark.
   float auto_target_lo = mn_trimmed;
   float auto_target_hi = mx_trimmed;
+  float auto3_floor = -1000.0f;
   if (range_mode == RANGE_AUTO2) {
-    // Median lives at the partition we already established with the trimmed
-    // partial sorts — but to be precise, do one more nth_element at index 384.
-    std::nth_element(scratch, scratch + 384, scratch + 768);
-    float median = scratch[384];
-    float sig_lo = 1000.0f, sig_hi = -1000.0f;
-    int sig_count = 0;
-    for (int i = 0; i < 768; i++) {
-      float dt = t[i] - median;
-      if (dt < 0) dt = -dt;
-      if (dt >= AUTO2_AMBIENT_DELTA) {
-        if (t[i] < sig_lo) sig_lo = t[i];
-        if (t[i] > sig_hi) sig_hi = t[i];
-        sig_count++;
-      }
+    auto_target_lo = mlxRangePercentile(mn, mx, hist_valid, AUTO2_NARROW_TRIM_PCT);
+    auto_target_hi = mlxRangePercentile(mn, mx, hist_valid, 100 - AUTO2_NARROW_TRIM_PCT);
+  } else if (range_mode == RANGE_AUTO3) {
+    auto3_floor = mlxRangePercentile(mn, mx, hist_valid, 50) + AUTO3_ROOM_FLOOR_DELTA_C;
+    if (auto_target_lo < auto3_floor) auto_target_lo = auto3_floor;
+    if (auto_target_hi < auto_target_lo + MLX_AUTO_MIN_SPAN_C) {
+      auto_target_hi = auto_target_lo + MLX_AUTO_MIN_SPAN_C;
     }
-    if (sig_count >= AUTO2_MIN_SUBJECT_PIXELS) {
-      // Pad the range slightly so the most extreme subject pixel doesn't
-      // sit exactly at the palette edge — gives a smoother visual.
-      auto_target_lo = sig_lo - AUTO2_PAD_C;
-      auto_target_hi = sig_hi + AUTO2_PAD_C;
-    }
-    // else: fall back to mn_trimmed/mx_trimmed already in auto_target_*.
   }
 
   float center = (t[11*32 + 15] + t[11*32 + 16] +
                   t[12*32 + 15] + t[12*32 + 16]) * 0.25f;
   float range_lo, range_hi;
   updateAutoDisplayRange(auto_target_lo, auto_target_hi, range_lo, range_hi);
+  if (range_mode == RANGE_AUTO3 && range_lo < auto3_floor) {
+    range_lo = auto3_floor;
+    if (range_hi < range_lo + MLX_AUTO_MIN_SPAN_C) {
+      range_hi = range_lo + MLX_AUTO_MIN_SPAN_C;
+    }
+    mlx_range_lo = range_lo;
+    mlx_range_hi = range_hi;
+  }
 
   portENTER_CRITICAL(&mlx_mux);
   memcpy(mlx_temps_full, mlx_publish, sizeof(mlx_temps_full));
@@ -676,6 +639,10 @@ void mlxTask(void *arg) {
   (void)arg;
   for (;;) {
     if (!freeze_mode) {
+      if (shouldThrottleMLXForScreenCameraOnly()) {
+        vTaskDelay(pdMS_TO_TICKS(125));
+        continue;
+      }
       if (readMLXSubpage() == MLX_READ_FULL) analyzeMLX();
       vTaskDelay(pdMS_TO_TICKS(MLX_POLL_MS));
     } else {
@@ -692,6 +659,13 @@ bool     cam_have_frame = false;
 bool     cam_ok = false;           // false => camera disconnected or init failed
 bool     camera_driver_active = false;
 bool     stream_native_jpeg_active = false;
+extern volatile uint8_t stream_jpeg_quality;
+extern volatile int8_t cam_contrast;
+extern volatile int8_t cam_saturation;
+extern volatile int8_t cam_sharpness;
+extern volatile int8_t cam_denoise;
+extern volatile bool cam_lenc;
+extern volatile bool cam_raw_gma;
 
 enum CameraFailStage : uint8_t {
   CAM_STAGE_NOT_STARTED = 0,
@@ -728,7 +702,6 @@ const char *cameraStageName(uint8_t stage) {
     default: return "NOT_STARTED";
   }
 }
-
 const char *cameraDisplayMessage() {
   switch (cam_fail_stage) {
     case CAM_STAGE_NO_PSRAM: return "NO PSRAM";
@@ -740,7 +713,6 @@ const char *cameraDisplayMessage() {
     default: return "NO CAMERA";
   }
 }
-
 const char *cameraErrName() {
   return cam_last_err == ESP_OK ? "OK" : esp_err_to_name(cam_last_err);
 }
@@ -787,10 +759,18 @@ void applyCameraSensorDefaults() {
   }
   s->set_colorbar(s, 0);
   s->set_brightness(s, (int)cam_brightness);
+  s->set_contrast(s, (int)cam_contrast);
+  s->set_saturation(s, (int)cam_saturation);
+  s->set_sharpness(s, (int)cam_sharpness);
+  s->set_denoise(s, (int)cam_denoise);
+  s->set_lenc(s, cam_lenc ? 1 : 0);
+  s->set_raw_gma(s, cam_raw_gma ? 1 : 0);
 }
 
 bool initCameraFormat(pixformat_t format, framesize_t frame_size,
-                      uint8_t fb_count, camera_grab_mode_t grab_mode) {
+                      uint8_t jpeg_quality, uint8_t fb_count,
+                      camera_grab_mode_t grab_mode,
+                      bool require_snapshot) {
   cam_init_attempts++;
   cam_ok = false;
   cam_have_frame = false;
@@ -798,17 +778,14 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
   cam_sensor_pid = -1;
   cam_last_frame_len = 0;
   updateCameraMemoryDiagnostics();
-  Serial.printf("Camera init attempt %lu: PSRAM found=%d size=%lu free=%lu format=%d frame=%d fb=%u\n",
+  Serial.printf("Camera init attempt %lu: PSRAM found=%d size=%lu free=%lu fmt=%d fb=%u\n",
                 (unsigned long)cam_init_attempts,
                 cam_psram_found ? 1 : 0,
                 (unsigned long)cam_psram_size,
                 (unsigned long)cam_psram_free,
-                (int)format,
-                (int)frame_size,
-                (unsigned)fb_count);
-  if (!ensureCameraSnapshotBuffer()) return false;
-  // Always allocate the snapshot buffer first — render paths use it to draw
-  // fallback content (e.g. "NO CAMERA") when the sensor isn't available.
+                (int)format, (unsigned)fb_count);
+  if (require_snapshot && !ensureCameraSnapshotBuffer()) return false;
+
   camera_config_t cfg = {};
   cfg.ledc_channel = LEDC_CHANNEL_0;
   cfg.ledc_timer   = LEDC_TIMER_0;
@@ -820,7 +797,7 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
   cfg.pin_pclk = PCLK_GPIO_NUM;
   cfg.pin_vsync= VSYNC_GPIO_NUM;
   cfg.pin_href = HREF_GPIO_NUM;
-  cfg.pin_sccb_sda = -1;            // share Wire (esp-camera issue #741)
+  cfg.pin_sccb_sda = -1;
   cfg.pin_sccb_scl = -1;
   cfg.sccb_i2c_port = 0;
   cfg.pin_pwdn = -1;
@@ -828,9 +805,11 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
   cfg.xclk_freq_hz = 16000000;
   cfg.pixel_format = format;
   cfg.frame_size   = frame_size;
+  cfg.jpeg_quality = jpeg_quality;
   cfg.fb_count     = fb_count;
   cfg.fb_location  = CAMERA_FB_IN_PSRAM;
   cfg.grab_mode    = grab_mode;
+
   cam_last_err = esp_camera_init(&cfg);
   if (cam_last_err != ESP_OK) {
     cam_fail_stage = CAM_STAGE_INIT_FAIL;
@@ -849,14 +828,6 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
     return false;
   }
   cam_sensor_pid = s->id.PID;
-
-  // Stay close to sensor defaults — every extra filter we turn on (dcw,
-  // lenc, bpc, wpc, aec2) softens the image. The "raw feed" look the user
-  // prefers comes from the sensor's tuned defaults; we only override
-  // orientation and the test pattern toggle.
-  // OV3660 note: this sensor is physically mounted upside-down relative to
-  // where the OV2640 sat, so vflip must be inverted. We detect the sensor
-  // type at runtime via PID so the sketch works with either module.
   applyCameraSensorDefaults();
 
   cam_ok = true;
@@ -870,8 +841,15 @@ bool initCameraFormat(pixformat_t format, framesize_t frame_size,
 }
 
 bool initCamera() {
-  return initCameraFormat(PIXFORMAT_RGB565, FRAMESIZE_QVGA, 3,
-                          CAMERA_GRAB_LATEST);
+  stream_native_jpeg_active = false;
+  return initCameraFormat(PIXFORMAT_RGB565, FRAMESIZE_QVGA, 12, 3,
+                          CAMERA_GRAB_LATEST, true);
+}
+
+bool initCameraNativeJpeg() {
+  return initCameraFormat(PIXFORMAT_JPEG, FRAMESIZE_QVGA,
+                          stream_jpeg_quality, 2,
+                          CAMERA_GRAB_LATEST, false);
 }
 
 void deinitCameraDriver() {
@@ -884,34 +862,30 @@ void deinitCameraDriver() {
 
 bool enterStreamCameraMode() {
   stream_native_jpeg_active = false;
-#if STREAM_CAMERA_NATIVE_JPEG
-  if (!cam_ok && !camera_driver_active) return true;
+  if (!camera_driver_active && !cam_ok) return true;
+
   deinitCameraDriver();
   delay(50);
-  if (initCameraFormat(PIXFORMAT_JPEG, FRAMESIZE_QVGA, 3,
-                       CAMERA_GRAB_LATEST)) {
+  if (initCameraNativeJpeg()) {
     stream_native_jpeg_active = true;
-    Serial.println("Stream camera: native JPEG mode");
+    Serial.println("Stream camera: native JPEG");
     return true;
   }
-  Serial.println("Stream camera: native JPEG init failed, restoring RGB565");
+
+  Serial.println("Stream camera: native JPEG failed, restoring RGB565");
   deinitCameraDriver();
   delay(50);
-  if (!initCamera()) return false;
-#endif
-  return true;
+  initCamera();
+  return false;
 }
 
 void exitStreamCameraMode() {
-#if STREAM_CAMERA_NATIVE_JPEG
   if (!stream_native_jpeg_active) return;
   deinitCameraDriver();
   delay(50);
   if (!initCamera()) {
     Serial.println("Stream camera: RGB565 restore failed");
   }
-#endif
-  stream_native_jpeg_active = false;
 }
 
 // Pull latest frame, copy to our PSRAM buffer, return camera fb immediately.
@@ -952,15 +926,9 @@ bool grabCamera() {
 }
 
 // ---------------------------------------------------------------- Palette
-// Ironbow (the v8 palette — restored verbatim, since the green/cyan tiles
-// in v8 came from setSwapBytes being inverted, not from the colour ramp).
-//   0%  → black           (cold)
-//   ~17% → blue/violet
-//   ~33% → magenta/red
-//   ~50% → red
-//   ~67% → orange
-//   ~83% → yellow
-//  100% → white            (hot)
+// Ironbow palette.
+//   0% black, 17% blue/violet, 33% magenta/red, 50% red,
+//   67% orange, 83% yellow, 100% white.
 // No green component appears in isolation; greens only show up combined
 // with red as orange/yellow.
 uint16_t palette_native[256];
@@ -974,17 +942,17 @@ void buildPalette() {
   for (int i = 0; i < 256; i++) {
     int j = (i * 180) / 255;            // remap into 0..180 segments
     int R, G, B;
-    if (j < 30) {                       // black → blue
+    if (j < 30) {                       // black to blue
       R = 0;                       G = 0;                              B = 20  + (120 * j) / 30;
-    } else if (j < 60) {                // blue → red
+    } else if (j < 60) {                // blue to red
       R = (120 * (j - 30)) / 30;   G = 0;                              B = 140 - (60  * (j - 30)) / 30;
-    } else if (j < 90) {                // red → red
+    } else if (j < 90) {                // red
       R = 120 + (135 * (j - 60)) / 30;  G = 0;                         B = 80  - (70  * (j - 60)) / 30;
-    } else if (j < 120) {               // red → red-orange
+    } else if (j < 120) {               // red to red-orange
       R = 255;                     G = (60 * (j - 90)) / 30;           B = 10  - (10  * (j - 90)) / 30;
-    } else if (j < 150) {               // orange → yellow
+    } else if (j < 150) {               // orange to yellow
       R = 255;                     G = 60 + (175 * (j - 120)) / 30;    B = 0;
-    } else {                            // yellow → white-ish
+    } else {                            // yellow to white
       R = 255;                     G = 235 + (20 * (j - 150)) / 30;    B = (255 * (j - 150)) / 30;
     }
     palR[i] = clamp8(R); palG[i] = clamp8(G); palB[i] = clamp8(B);
@@ -1011,51 +979,70 @@ const uint16_t MODE_BG[MODE_COUNT] = {TFT_GREEN, TFT_ORANGE, TFT_BLUE};
 
 // Range presets.
 //
-// AUTO  : trimmed min/max of all 768 pixels — full scene mapped to palette.
-//         Good when you don't know what's in frame. Background dominates the
-//         palette when the subject is small.
-// AUTO2 : "subject-focused auto" — finds the median (ambient/room) and
-//         throws everything within ±AUTO2_AMBIENT_DELTA °C of it AWAY,
-//         then maps the palette only to the remaining "interesting"
-//         pixels. So a hand against a wall: room-temp wall ignored,
-//         palette stretched across the temperature range *of the hand*.
-//         Falls back to AUTO if nothing in frame is significantly
-//         hotter or colder than ambient.
-// SKIN  : 30.5 - 35.5 °C — exposed skin only. Tightest palette.
-// BODY  : 28 - 37 °C — clothed body separation, palms + forearms.
-// WARM  : 30 - 50 °C — mugs, electronics, sun-warm surfaces.
-// HOT   : 40 - 90 °C — stovetops, irons.
-// VHOT  : 60 - 140 °C — flame, exhaust manifolds.
-// MANUAL: user drags LO/HI sliders directly (RANGE tab on the side panel).
-//         Persisted across reboots.
-// RangeMode enum + AUTO2 constants are forward-declared near the top of the
+// AUTO : trimmed min/max of all 768 pixels.
+// AUT2 : automatic with tighter percentile clipping.
+// AUT3 : automatic, but the low end is held above estimated room temperature.
+// HMN  : 26 - 40 C.
+// PCB  : 30 - 90 C.
+// PRNT : 40 - 270 C.
+// WALL : 20 - 60 C.
+// DRFT : -10 - 25 C.
+// MAN  : user drags LO/HI sliders directly (RANGE tab on the side panel).
+//        Persisted across reboots.
+// RangeMode enum + AUTO2/AUTO3 constants are forward-declared near the top of the
 // file (right under the MLX block) because analyzeMLX needs them before this
 // point. Only the *arrays* live here.
-const char *RANGE_NAMES[RANGE_COUNT] = {"AUTO", "AUT2", "SKIN", "BODY",
-                                        "WARM", "HOT", "VHOT", "MAN"};
-static constexpr float RANGE_LO[RANGE_COUNT] = {0.0f,  0.0f, 30.5f, 28.0f,
-                                                30.0f, 40.0f, 60.0f, 0.0f};
-static constexpr float RANGE_HI[RANGE_COUNT] = {0.0f,  0.0f, 35.5f, 37.0f,
-                                                50.0f, 90.0f, 140.0f, 0.0f};
+const char *RANGE_NAMES[RANGE_COUNT] = {"AUTO", "AUT2", "AUT3", "HMN",
+                                        "PCB", "PRNT", "WALL", "DRFT", "MAN"};
+static constexpr float RANGE_LO[RANGE_COUNT] = {0.0f,  0.0f,  0.0f, 26.0f,
+                                                30.0f, 40.0f, 20.0f, -10.0f,
+                                                0.0f};
+static constexpr float RANGE_HI[RANGE_COUNT] = {0.0f,  0.0f,  0.0f, 40.0f,
+                                                90.0f, 270.0f, 60.0f, 25.0f,
+                                                0.0f};
 
 static constexpr int PARALLAX_MIN = -90;
 static constexpr int PARALLAX_MAX =  90;
+static constexpr int PARALLAX_SCALE = 100;
+static constexpr int PARALLAX_MIN100 = PARALLAX_MIN * PARALLAX_SCALE;
+static constexpr int PARALLAX_MAX100 = PARALLAX_MAX * PARALLAX_SCALE;
+static constexpr int ZOOM_MIN = 100;
+static constexpr int ZOOM_MAX = 250;
+static constexpr int ALIGN_DEFAULT_ZX = 100;
+static constexpr int ALIGN_DEFAULT_ZY = 124;
+static constexpr int ALIGN_DEFAULT_CM = 100;
+static constexpr int ALIGN_MIN_CM = 15;
+static constexpr int ALIGN_MAX_CM = 300;
+static constexpr int ALIGN_NUDGE_CM = 5;
+// px100 = coefficient / distance_cm. Coefficient is derived from:
+// 100 * 320 px * 1.218 cm / (2 * tan(55 deg / 2)).
+static constexpr int ALIGN_PARALLAX_COEFF_100_CM = 37440;
 
-volatile int parallax_x = 0;
-volatile int parallax_y = 0;
-// zoom_pct is a digital crop factor applied ONLY to the camera image now.
-// The thermal grid is fixed full-screen and never moves or scales. 100% =
-// full sensor frame, no crop. 200% = read a centred 160×120 region and
-// stretch it. Default is 124%, which crops the camera FOV (~68°) down to
-// roughly the MLX FOV (~55°) so the two views naturally align without
-// fiddling. Adjust ± from there to fine-tune. Range 100..250.
-volatile int zoom_pct   = 124;
+struct AlignPreset {
+  int16_t cm;
+  int16_t px100;
+  const char *label;
+};
+
+static constexpr AlignPreset ALIGN_PRESETS[] = {
+  { 15, 2496, "15cm"  },
+  { 30, 1248, "30cm"  },
+  { 60,  624, "60cm"  },
+  {100,  374, "100cm" },
+  {300,  125, "300cm" },
+};
+static constexpr int ALIGN_PRESET_COUNT = sizeof(ALIGN_PRESETS) / sizeof(ALIGN_PRESETS[0]);
+
+volatile int parallax_x100 = 374;
+volatile int parallax_y100 = 0;
+volatile int zoom_x_pct = ALIGN_DEFAULT_ZX;
+volatile int zoom_y_pct = ALIGN_DEFAULT_ZY;
+volatile int align_distance_cm = ALIGN_DEFAULT_CM;
 volatile uint8_t tint_pct = 70;
 volatile DisplayMode display_mode = MODE_TINT;
 volatile RangeMode range_mode = RANGE_AUTO;
 volatile bool freeze_mode = false;
 volatile bool stream_mode = false;
-volatile bool ui_portrait = false;
 volatile uint8_t stream_view_mode = 0;  // 0=overlay, 1=camera, 2=thermal
 volatile bool stream_hud_enabled = true;
 volatile bool stream_crosshair_enabled = true;
@@ -1065,44 +1052,49 @@ volatile bool stream_crosshair_enabled = true;
 // transition isn't a jarring jump. Persisted across reboots.
 volatile float manual_lo = 22.0f;
 volatile float manual_hi = 38.0f;
-// Side-panel tab — swaps which sliders the panel shows:
-//   PANEL_TAB_POS:   X / Y / Zoom sliders (camera-vs-thermal alignment)
-//   PANEL_TAB_RANGE: LO / HI sliders (only useful when range_mode == MANUAL,
-//                    but visible/draggable in any mode so you can preview)
-enum PanelTab { PANEL_TAB_POS = 0, PANEL_TAB_RANGE = 1, PANEL_TAB_COUNT };
-volatile uint8_t panel_tab = PANEL_TAB_POS;
-// Slider domain for MANUAL — covers room temp through hot-ish electronics.
+// Side-panel tab:
+//   DIST: geometry-derived alignment, RNG: manual thermal range.
+enum PanelTab { PANEL_TAB_PRESET = 0, PANEL_TAB_RANGE, PANEL_TAB_COUNT };
+volatile uint8_t panel_tab = PANEL_TAB_PRESET;
+// Slider domain for MANUAL, from room temp through hot electronics.
 // If you need to range outside this, use a fixed preset.
 static constexpr float MANUAL_T_MIN = 5.0f;
 static constexpr float MANUAL_T_MAX = 60.0f;
 
-// Camera brightness: -2..+2, applied via the OV2640/OV3660 hardware register
-// (sensor's set_brightness call), so it costs zero CPU per pixel — the change
-// happens once over SCCB and the sensor's analog front-end does the rest.
+// Camera brightness is a sensor register write, not per-pixel CPU work.
 // 0 = neutral, +2 = brightest. Persisted in NVS.
 volatile int8_t cam_brightness = 0;
+volatile int8_t cam_contrast = 0;
+volatile int8_t cam_saturation = 0;
+volatile int8_t cam_sharpness = 0;
+volatile int8_t cam_denoise = 0;
+volatile bool cam_lenc = true;
+volatile bool cam_raw_gma = true;
 bool             brightness_apply_pending = false;
+static constexpr uint8_t STREAM_JPEG_QUALITY_DEFAULT = 45;
+static constexpr uint8_t STREAM_JPEG_QUALITY_MIN = 35;
+static constexpr uint8_t STREAM_JPEG_QUALITY_MAX = 85;
+volatile uint8_t stream_jpeg_quality = STREAM_JPEG_QUALITY_DEFAULT;
 
-// Lens FOVs. MLX90640 standard variant: 55°×35°. OV2640 with the stock
-// FireBeetle DVP lens: ~68°×51°. From these we derive how big each thermal
-// cell *should* be in camera-pixel space so the two views actually align.
+static inline uint8_t clampStreamJpegQuality(int q) {
+  if (q < STREAM_JPEG_QUALITY_MIN) return STREAM_JPEG_QUALITY_MIN;
+  if (q > STREAM_JPEG_QUALITY_MAX) return STREAM_JPEG_QUALITY_MAX;
+  return (uint8_t)q;
+}
+
+// Lens FOVs used to align camera pixels to MLX cells.
 static constexpr float MLX_HFOV_DEG = 55.0f;
 static constexpr float MLX_VFOV_DEG = 35.0f;
 static constexpr float CAM_HFOV_DEG = 68.0f;
 static constexpr float CAM_VFOV_DEG = 51.0f;
-// Default cell size in camera pixels at zoom = 100%. Outside this rectangle,
-// no thermal data exists — the camera image stays untouched.
+// Default cell size in camera pixels at zoom = 100%.
 static constexpr float BASE_CELL_PX_X = (MLX_HFOV_DEG / 32.0f) /
-                                        (CAM_HFOV_DEG / (float)IMG_W);   // ≈ 8.09
+                                        (CAM_HFOV_DEG / (float)IMG_W);   // about 8.09
 static constexpr float BASE_CELL_PX_Y = (MLX_VFOV_DEG / 24.0f) /
-                                        (CAM_VFOV_DEG / (float)IMG_H);   // ≈ 6.86
+                                        (CAM_VFOV_DEG / (float)IMG_H);   // about 6.86
 
 // ---------------------------------------------------------- Persistence --
-// Settings (parallax, zoom, tint, mode, range) are kept in NVS via the
-// Preferences library — flash-backed and wear-levelled. We auto-save 3 s
-// after the last change so the user never has to press a "save" button:
-// twiddle the controls, stop, and a moment later the values commit. A brief
-// "SAV" badge in the top bar confirms the write.
+// Settings are saved to NVS after a quiet period to reduce flash writes.
 Preferences prefs;
 bool     settings_dirty = false;
 uint32_t settings_dirty_ms = 0;
@@ -1114,74 +1106,175 @@ static inline void markDirty() {
   settings_dirty_ms = millis();
 }
 
+static inline void setDirtyInt(volatile int &dst, int value) {
+  if (dst != value) { dst = value; markDirty(); }
+}
+
+static inline void setDirtyU8(volatile uint8_t &dst, uint8_t value) {
+  if (dst != value) { dst = value; markDirty(); }
+}
+
+static inline int clampParallax100(int v) {
+  if (v < PARALLAX_MIN100) return PARALLAX_MIN100;
+  if (v > PARALLAX_MAX100) return PARALLAX_MAX100;
+  return v;
+}
+
+static inline int clampZoomPct(int v) {
+  if (v < ZOOM_MIN) return ZOOM_MIN;
+  if (v > ZOOM_MAX) return ZOOM_MAX;
+  return v;
+}
+
+static inline int round100(int v) {
+  return v >= 0 ? (v + 50) / 100 : (v - 50) / 100;
+}
+
+int presetIndexForCm(int cm) {
+  for (int i = 0; i < ALIGN_PRESET_COUNT; i++) {
+    if (ALIGN_PRESETS[i].cm == cm) return i;
+  }
+  return -1;
+}
+
+static inline int clampDistanceCm(int cm) {
+  if (cm < ALIGN_MIN_CM) return ALIGN_MIN_CM;
+  if (cm > ALIGN_MAX_CM) return ALIGN_MAX_CM;
+  return cm;
+}
+
+static inline int parallaxX100ForDistance(int cm) {
+  cm = clampDistanceCm(cm);
+  return (ALIGN_PARALLAX_COEFF_100_CM + cm / 2) / cm;
+}
+
+void applyAlignmentDistanceCm(int cm, bool dirty) {
+  align_distance_cm = clampDistanceCm(cm);
+  parallax_x100 = parallaxX100ForDistance(align_distance_cm);
+  parallax_y100 = 0;
+  zoom_x_pct = ALIGN_DEFAULT_ZX;
+  zoom_y_pct = ALIGN_DEFAULT_ZY;
+  if (dirty) markDirty();
+}
+
+bool applyAlignmentPresetCm(int cm, bool dirty) {
+  if (presetIndexForCm(cm) < 0) return false;
+  applyAlignmentDistanceCm(cm, dirty);
+  return true;
+}
+
+void resetAlignmentCalibrated(bool dirty) {
+  applyAlignmentDistanceCm(ALIGN_DEFAULT_CM, dirty);
+}
+
 void loadSettings() {
-  // Namespace bumped to flir2 in v14 — semantics of zoom_pct changed (now a
-  // camera-crop factor, default 124%). Old "flir" entries from v10..v13 are
-  // intentionally ignored so users get the new default on first v14 boot.
+  // Keep the flir2 namespace because older zoom/range semantics were not
+  // compatible with the current alignment model.
   prefs.begin("flir2", true);                  // read-only
-  parallax_x   = prefs.getInt  ("px",   0);
-  parallax_y   = prefs.getInt  ("py",   0);
-  zoom_pct     = prefs.getInt  ("zoom", 124);
+  align_distance_cm = prefs.getInt("dist", prefs.getInt("apcm", ALIGN_DEFAULT_CM));
+  applyAlignmentDistanceCm(align_distance_cm, false);
   tint_pct     = prefs.getUChar("tint", 70);
   uint8_t m    = prefs.getUChar("mode", MODE_TINT);
   uint8_t r    = prefs.getUChar("rng",  RANGE_AUTO);
+  uint8_t rv   = prefs.getUChar("rngv", 1);
   cam_brightness = (int8_t)prefs.getChar("brt", 0);
+  cam_contrast = (int8_t)prefs.getChar("con", 0);
+  cam_saturation = (int8_t)prefs.getChar("sat", 0);
+  cam_sharpness = (int8_t)prefs.getChar("shp", 0);
+  cam_denoise = (int8_t)prefs.getChar("den", 0);
+  cam_lenc = prefs.getBool("lenc", true);
+  cam_raw_gma = prefs.getBool("gma", true);
+  stream_jpeg_quality = clampStreamJpegQuality(prefs.getUChar("jpgq", STREAM_JPEG_QUALITY_DEFAULT));
   manual_lo    = prefs.getFloat("mlo", 22.0f);
   manual_hi    = prefs.getFloat("mhi", 38.0f);
-  uint8_t pt   = prefs.getUChar("ptab", PANEL_TAB_POS);
-  ui_portrait  = prefs.getBool ("port", false);
+  uint8_t pt   = prefs.getUChar("ptab", PANEL_TAB_PRESET);
   prefs.end();
   // Defensive clamps in case ranges have moved across firmware versions.
-  if (parallax_x < PARALLAX_MIN) parallax_x = PARALLAX_MIN; else if (parallax_x > PARALLAX_MAX) parallax_x = PARALLAX_MAX;
-  if (parallax_y < PARALLAX_MIN) parallax_y = PARALLAX_MIN; else if (parallax_y > PARALLAX_MAX) parallax_y = PARALLAX_MAX;
-  if (zoom_pct   < 100) zoom_pct   = 100; else if (zoom_pct  > 250) zoom_pct  = 250;
+  align_distance_cm = clampDistanceCm(align_distance_cm);
+  applyAlignmentDistanceCm(align_distance_cm, false);
   if (tint_pct   > 100) tint_pct   = 100;
   if (cam_brightness < -2) cam_brightness = -2; else if (cam_brightness > 2) cam_brightness = 2;
+  if (cam_contrast < -2) cam_contrast = -2; else if (cam_contrast > 2) cam_contrast = 2;
+  if (cam_saturation < -2) cam_saturation = -2; else if (cam_saturation > 2) cam_saturation = 2;
+  if (cam_sharpness < -2) cam_sharpness = -2; else if (cam_sharpness > 2) cam_sharpness = 2;
+  if (cam_denoise < 0) cam_denoise = 0; else if (cam_denoise > 1) cam_denoise = 1;
   if (manual_lo  < MANUAL_T_MIN) manual_lo = MANUAL_T_MIN;
   if (manual_lo  > MANUAL_T_MAX) manual_lo = MANUAL_T_MAX;
   if (manual_hi  < MANUAL_T_MIN) manual_hi = MANUAL_T_MIN;
   if (manual_hi  > MANUAL_T_MAX) manual_hi = MANUAL_T_MAX;
   if (manual_hi - manual_lo < 1.0f) manual_hi = manual_lo + 1.0f;
   display_mode = (m < MODE_COUNT)  ? (DisplayMode)m : MODE_TINT;
+  if (rv < 2) {
+    switch (r) {
+      case 2: r = RANGE_HMN; break;    // legacy SKIN
+      case 3: r = RANGE_HMN; break;    // legacy BODY
+      case 4: r = RANGE_WALL; break;   // legacy WARM
+      case 5: r = RANGE_PCB; break;    // legacy HOT
+      case 6: r = RANGE_PRNT; break;   // legacy VHOT
+      case 7: r = RANGE_MANUAL; break; // legacy MAN
+      default: break;
+    }
+  }
   range_mode   = (r < RANGE_COUNT) ? (RangeMode)r   : RANGE_AUTO;
-  panel_tab    = (pt < PANEL_TAB_COUNT) ? (uint8_t)pt : (uint8_t)PANEL_TAB_POS;
+  panel_tab    = (pt < PANEL_TAB_COUNT) ? (uint8_t)pt : (uint8_t)PANEL_TAB_PRESET;
   brightness_apply_pending = true;        // push into sensor on first frame
-  Serial.printf("Loaded: PX=%+d,%+d Z=%d%% Tint=%d%% Brt=%+d Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
-                parallax_x, parallax_y, zoom_pct, tint_pct, cam_brightness,
-                MODE_NAMES[display_mode], RANGE_NAMES[range_mode],
+  Serial.printf("Loaded: PX100=%+d,%+d ZX/Y=%d/%d%% Dist=%dcm Tint=%d%% Brt=%+d JPGQ=%u Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
+                parallax_x100, parallax_y100, zoom_x_pct, zoom_y_pct,
+                align_distance_cm, tint_pct, cam_brightness,
+                (unsigned)stream_jpeg_quality, MODE_NAMES[display_mode], RANGE_NAMES[range_mode],
                 manual_lo, manual_hi);
 }
 
 void saveSettings() {
   prefs.begin("flir2", false);                 // read-write
-  prefs.putInt  ("px",   parallax_x);
-  prefs.putInt  ("py",   parallax_y);
-  prefs.putInt  ("zoom", zoom_pct);
+  prefs.putInt  ("px",   round100(parallax_x100));
+  prefs.putInt  ("py",   round100(parallax_y100));
+  prefs.putInt  ("zoom", zoom_y_pct);
+  prefs.putInt  ("px100", parallax_x100);
+  prefs.putInt  ("py100", parallax_y100);
+  prefs.putInt  ("zx", zoom_x_pct);
+  prefs.putInt  ("zy", zoom_y_pct);
+  prefs.putInt  ("apcm", align_distance_cm);
+  prefs.putInt  ("dist", align_distance_cm);
   prefs.putUChar("tint", tint_pct);
   prefs.putUChar("mode", (uint8_t)display_mode);
   prefs.putUChar("rng",  (uint8_t)range_mode);
+  prefs.putUChar("rngv", 2);
   prefs.putChar ("brt",  (int8_t)cam_brightness);
+  prefs.putChar ("con",  (int8_t)cam_contrast);
+  prefs.putChar ("sat",  (int8_t)cam_saturation);
+  prefs.putChar ("shp",  (int8_t)cam_sharpness);
+  prefs.putChar ("den",  (int8_t)cam_denoise);
+  prefs.putBool ("lenc", cam_lenc);
+  prefs.putBool ("gma",  cam_raw_gma);
+  prefs.putUChar("jpgq", stream_jpeg_quality);
   prefs.putFloat("mlo",  manual_lo);
   prefs.putFloat("mhi",  manual_hi);
   prefs.putUChar("ptab", panel_tab);
-  prefs.putBool ("port", ui_portrait);
   prefs.end();
   save_indicator_until_ms = millis() + 1500;
-  Serial.printf("Saved: PX=%+d,%+d Z=%d%% Tint=%d%% Brt=%+d Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
-                parallax_x, parallax_y, zoom_pct, tint_pct, cam_brightness,
-                MODE_NAMES[display_mode], RANGE_NAMES[range_mode],
+  Serial.printf("Saved: PX100=%+d,%+d ZX/Y=%d/%d%% Dist=%dcm Tint=%d%% Brt=%+d JPGQ=%u Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
+                parallax_x100, parallax_y100, zoom_x_pct, zoom_y_pct,
+                align_distance_cm, tint_pct, cam_brightness,
+                (unsigned)stream_jpeg_quality, MODE_NAMES[display_mode], RANGE_NAMES[range_mode],
                 manual_lo, manual_hi);
 }
 
-// Apply brightness to the OV2640/OV3660 via SCCB. set_brightness() is one
-// I2C write — far cheaper than a software multiplier per pixel — and we
-// only call it when the value actually changes.
+// Apply camera register controls only when they change.
 void applyCameraBrightness() {
   if (!cam_ok) return;
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
   s->set_brightness(s, (int)cam_brightness);
-  Serial.printf("Cam brightness → %+d\n", cam_brightness);
+  s->set_contrast(s, (int)cam_contrast);
+  s->set_saturation(s, (int)cam_saturation);
+  s->set_sharpness(s, (int)cam_sharpness);
+  s->set_denoise(s, (int)cam_denoise);
+  s->set_lenc(s, cam_lenc ? 1 : 0);
+  s->set_raw_gma(s, cam_raw_gma ? 1 : 0);
+  Serial.printf("Cam regs: brt=%+d con=%+d sat=%+d sharp=%+d den=%d lenc=%d gma=%d\n",
+                cam_brightness, cam_contrast, cam_saturation, cam_sharpness,
+                cam_denoise, cam_lenc ? 1 : 0, cam_raw_gma ? 1 : 0);
 }
 
 // ---------------------------------------------------------- Battery ------
@@ -1190,10 +1283,10 @@ void applyCameraBrightness() {
 // firmware's pin map (most ADCs are claimed by camera/LCD), so set this to
 // the GPIO you've wired your divider to. Leave at -1 to disable the readout.
 #define BATTERY_ADC_PIN -1            // e.g. 6 if you free up VSYNC, or wire externally
-#define BATTERY_DIVIDER 2.0f          // (R_top + R_bot)/R_bot — typical 1:1 divider
+#define BATTERY_DIVIDER 2.0f          // (R_top + R_bot)/R_bot, typical 1:1 divider
 #define BATTERY_VREF    3.3f
-#define BATTERY_VMIN    3.30f         // 0%   — protect under-voltage cutoff
-#define BATTERY_VMAX    4.20f         // 100% — full charge
+#define BATTERY_VMIN    3.30f         // 0%, protect under-voltage cutoff
+#define BATTERY_VMAX    4.20f         // 100%, full charge
 
 float    battery_v   = 0.0f;
 int      battery_pct = -1;            // -1 = "no reading yet"
@@ -1201,7 +1294,7 @@ uint32_t last_bat_ms = 0;
 
 void readBattery() {
 #if BATTERY_ADC_PIN >= 0
-  // Average a few samples — ADC on ESP32-S3 has a noticeable ~LSB jitter.
+  // Average a few samples; ESP32-S3 ADC has noticeable jitter.
   uint32_t sum = 0;
   for (int i = 0; i < 8; i++) sum += analogRead(BATTERY_ADC_PIN);
   float v_adc = (sum / 8.0f) / 4095.0f * BATTERY_VREF;
@@ -1211,23 +1304,22 @@ void readBattery() {
   if (pct > 100) pct = 100;
   battery_pct = pct;
 #else
-  // Pin unset — leave battery_pct at -1 so the UI hides the indicator.
+  // Pin unset; leave battery_pct at -1 so the UI hides the indicator.
   battery_pct = -1;
 #endif
 }
 
 void getThermalRange(float &lo, float &hi) {
-  // MANUAL: user-set values — bypass the IIR-tracked range entirely.
+  // MANUAL bypasses the IIR-tracked range.
   if (range_mode == RANGE_MANUAL) {
     float ml = manual_lo, mh = manual_hi;
-    // Keep at least a 1 °C span so the palette never collapses to a point.
+    // Keep at least a 1 C span.
     if (mh - ml < 1.0f) mh = ml + 1.0f;
     lo = ml; hi = mh;
     return;
   }
-  // AUTO and AUTO2 both pipe through analyzeMLX → IIR-smoothed t_range_min/max.
-  // The "smart subject" math for AUTO2 lives in analyzeMLX, this just reads.
-  if (range_mode == RANGE_AUTO || range_mode == RANGE_AUTO2) {
+  // AUTO variants pipe through analyzeMLX -> IIR-smoothed t_range_min/max.
+  if (range_mode == RANGE_AUTO || range_mode == RANGE_AUTO2 || range_mode == RANGE_AUTO3) {
     portENTER_CRITICAL(&mlx_mux);
     lo = t_range_min; hi = t_range_max;
     portEXIT_CRITICAL(&mlx_mux);
@@ -1236,6 +1328,16 @@ void getThermalRange(float &lo, float &hi) {
   // Fixed preset.
   lo = RANGE_LO[range_mode];
   hi = RANGE_HI[range_mode];
+}
+
+void formatRangeDisplay(char *buf, size_t len, bool compact) {
+  float lo, hi;
+  getThermalRange(lo, hi);
+  if (compact) {
+    snprintf(buf, len, "%s %.0f-%.0fC", RANGE_NAMES[range_mode], lo, hi);
+  } else {
+    snprintf(buf, len, "%s %.1f-%.1fC", RANGE_NAMES[range_mode], lo, hi);
+  }
 }
 
 // ---------------------------------------------------------------- GT911 --
@@ -1284,14 +1386,9 @@ bool gt911_read_touch(uint16_t *tx, uint16_t *ty) {
   Wire.beginTransmission(gt911_addr);
   Wire.write(0x81); Wire.write(0x4E); Wire.write(0x00);
   Wire.endTransmission();
-  // GT911 native = 320x480 portrait. Rotation 1 remaps to landscape.
-  if (ui_portrait) {
-    *tx = rx;
-    *ty = ry;
-  } else {
-    *tx = ry;
-    *ty = 319 - rx;
-  }
+  // Map GT911 native 320x480 coordinates to LCD rotation 1.
+  *tx = ry;
+  *ty = 319 - rx;
   return true;
 }
 
@@ -1306,6 +1403,14 @@ struct TouchButton {
 bool adjust_unlocked = false;
 uint32_t adjust_unlock_until_ms = 0;
 static constexpr uint32_t ADJUST_UNLOCK_MS = 12000;
+
+bool shouldThrottleMLXForScreenCameraOnly() {
+  return display_mode == MODE_CAMERA_ONLY &&
+         !stream_mode &&
+         !freeze_mode &&
+         !adjust_unlocked;
+}
+
 static int PANEL_X = 348;
 static int PANEL_W = 128;
 static int PANEL_SLIDER_X = 352;
@@ -1314,8 +1419,6 @@ static int PANEL_SLIDER_H = 20;
 static constexpr int PANEL_NUDGE_W  = 22;
 static constexpr int PANEL_NUDGE_GAP = 3;
 static constexpr uint32_t NUDGE_REPEAT_MS = 130;
-static constexpr int PARALLAX_NUDGE_PX = 1;
-static constexpr int ZOOM_NUDGE_PCT = 1;
 static constexpr int TINT_NUDGE_PCT = 1;
 static constexpr float MANUAL_NUDGE_C = 0.1f;
 static constexpr float MANUAL_MIN_SPAN_C = 1.0f;
@@ -1325,46 +1428,29 @@ static int X_SLIDER_Y    = 94;
 static int Y_SLIDER_Y    = 136;
 static int Z_SLIDER_Y    = 178;
 static int TINT_SLIDER_Y = 232;
-// In the RANGE tab the slider lineup becomes LO / HI / (empty). The third
-// slot stays at Z_SLIDER_Y — we just clear it instead of drawing a slider.
-// LO and HI reuse the X / Y slider rows so the visual layout stays consistent.
+// RANGE tab reuses X/Y slider rows for LO/HI and clears the third slot.
 
 void btnToggleAdjust() {
   adjust_unlocked = !adjust_unlocked;
   adjust_unlock_until_ms = adjust_unlocked ? millis() + ADJUST_UNLOCK_MS : 0;
 }
 void btnCycleMode()  { display_mode = (DisplayMode)((display_mode + 1) % MODE_COUNT);  markDirty(); }
-void btnReset()      { if (adjust_unlocked) { parallax_x = 0; parallax_y = 0; zoom_pct = 100; markDirty(); } }
+void btnReset()      { if (adjust_unlocked) resetAlignmentCalibrated(true); }
 void btnCycleRange() {
   range_mode = (RangeMode)((range_mode + 1) % RANGE_COUNT);
-  // When the user lands on MANUAL, jump the panel into the RANGE tab so the
-  // sliders they need are immediately in front of them. Conversely, leaving
-  // MANUAL doesn't auto-switch back to POS — they might still want to nudge
-  // LO/HI to compare modes.
+  // Entering MANUAL opens the LO/HI controls.
   if (range_mode == RANGE_MANUAL) panel_tab = PANEL_TAB_RANGE;
   markDirty();
 }
-void btnTabPos()   { panel_tab = PANEL_TAB_POS;   markDirty(); }
+void btnTabPreset() { panel_tab = PANEL_TAB_PRESET; markDirty(); }
 void btnTabRange() { panel_tab = PANEL_TAB_RANGE; markDirty(); }
 
 void drawStaticUI();
 void layoutUi();
 
-void applyScreenOrientation() {
-  lcd.setRotation(ui_portrait ? 0 : 1);
-  layoutUi();
-}
-
 void redrawFullUi() {
   lcd.fillScreen(TFT_BLACK);
   drawStaticUI();
-}
-
-void btnToggleOrientation() {
-  ui_portrait = !ui_portrait;
-  markDirty();
-  applyScreenOrientation();
-  redrawFullUi();
 }
 
 // Tab-button widths split the panel into two roughly-equal halves with a
@@ -1412,160 +1498,84 @@ TouchButton buttons[] = {
   {0, 0, 0, 0, "ADJ",  TFT_DARKCYAN,  btnToggleAdjust },
   {0, 0, 0, 0, "MODE", TFT_DARKGREEN, btnCycleMode    },
   {0, 0, 0, 0, "RNG",  TFT_PURPLE,    btnCycleRange   },
-  {0, 0, 0, 0, "ROT",  TFT_DARKGREY,  btnToggleOrientation },
   // Tab row.
-  {0, 0, 0, 0, "POS",   TFT_DARKGREY, btnTabPos   },
-  {0, 0, 0, 0, "RANGE", TFT_DARKGREY, btnTabRange },
+  {0, 0, 0, 0, "DIST", TFT_DARKGREY, btnTabPreset },
+  {0, 0, 0, 0, "RNG", TFT_DARKGREY, btnTabRange },
   // Reset.
   {0, 0, 0, 0, "RST", TFT_MAROON, btnReset        },
 };
 const int NUM_BUTTONS = sizeof(buttons) / sizeof(buttons[0]);
 
 void layoutUi() {
-  if (ui_portrait) {
-    IMG_X = 0;
-    IMG_Y = 24;
-    PANEL_X = 4;
-    PANEL_W = 312;
-    PANEL_SLIDER_X = 8;
-    PANEL_SLIDER_W = 304;
-    PANEL_SLIDER_H = 16;
-    TAB_ROW_Y = 296;
-    TAB_ROW_H = 20;
-    X_SLIDER_Y = 330;
-    Y_SLIDER_Y = 362;
-    Z_SLIDER_Y = 394;
-    TINT_SLIDER_Y = 426;
-    TAB_W = (PANEL_W - 4) / 2;
-    SLIDER_X = PANEL_SLIDER_X;
-    SLIDER_Y = TINT_SLIDER_Y;
-    SLIDER_W = PANEL_SLIDER_W;
-    SLIDER_H = PANEL_SLIDER_H;
-    BRT_BAR_X = 32;
-    BRT_BAR_Y = 456;
-    BRT_CELL_W = 42;
-    BRT_CELL_H = 18;
-    BRT_CLEAR_X = 0;
-    BRT_CLEAR_R = 320;
-    PALETTE_X = 0;
-    PALETTE_Y_TOP = IMG_Y;
-    PALETTE_Y_BOTTOM = IMG_Y + IMG_H - 1;
-    PALETTE_W = 0;
-    TMAX_LABEL_X = 2;
-    TMAX_LABEL_Y = 4;
-    TMIN_LABEL_X = 2;
-    TMIN_LABEL_Y = -1;
-    TOPBAR_CLEAR_X = 40;
-    TOPBAR_CLEAR_W = 280;
-    TB_TMAX = TMAX_LABEL_X;
-    TB_CTR = 40;
-    TB_FPS = 108;
-    TB_ZOOM = 150;
-    TB_PARA = 184;
-    TB_MODE = 236;
-    TB_MODE_W = 34;
-    TB_RNG = 272;
-    TB_RNG_W = 30;
-    TB_STAT = -1;
-    TB_STAT_W = 0;
-    TB_BAT = -1;
-    READOUT_X = 0;
-    READOUT_Y = 0;
-    READOUT_W = 0;
-    READOUT_H = 0;
+  IMG_X = 24;
+  IMG_Y = 40;
+  PANEL_X = IMG_X + IMG_W + 4;
+  PANEL_W = 480 - PANEL_X - 4;
+  PANEL_SLIDER_X = PANEL_X + 4;
+  PANEL_SLIDER_W = PANEL_W - 8;
+  PANEL_SLIDER_H = 20;
+  TAB_ROW_Y = 58;
+  TAB_ROW_H = 22;
+  X_SLIDER_Y = 94;
+  Y_SLIDER_Y = 136;
+  Z_SLIDER_Y = 178;
+  TINT_SLIDER_Y = 232;
+  TAB_W = (PANEL_W - 4) / 2;
+  SLIDER_X = PANEL_SLIDER_X;
+  SLIDER_Y = TINT_SLIDER_Y;
+  SLIDER_W = PANEL_SLIDER_W;
+  SLIDER_H = PANEL_SLIDER_H;
+  BRT_BAR_X = 46;
+  BRT_BAR_Y = 290;
+  BRT_CELL_W = 50;
+  BRT_CELL_H = 24;
+  BRT_CLEAR_X = 40;
+  BRT_CLEAR_R = BRT_BAR_X + BRT_NUM_CELLS * BRT_CELL_W + 40;
+  PALETTE_X = 5;
+  PALETTE_Y_TOP = 24;
+  PALETTE_Y_BOTTOM = 280;
+  PALETTE_W = 12;
+  TMAX_LABEL_X = 2;
+  TMAX_LABEL_Y = 10;
+  TMIN_LABEL_X = 2;
+  TMIN_LABEL_Y = 290;
+  TOPBAR_CLEAR_X = 40;
+  TOPBAR_CLEAR_W = 440;
+  TB_TMAX = 2;
+  TB_CTR = 44;
+  TB_FPS = 116;
+  TB_ZOOM = 162;
+  TB_PARA = 200;
+  TB_MODE = 256;
+  TB_MODE_W = 42;
+  TB_RNG = 302;
+  TB_RNG_W = 36;
+  TB_STAT = 342;
+  TB_STAT_W = 24;
+  TB_BAT = 412;
+  READOUT_X = 378;
+  READOUT_Y = 158;
+  READOUT_W = 98;
+  READOUT_H = 10;
 
-    const int gap = 4;
-    int bw = (320 - 2 * PANEL_X - gap * 4) / 5;
-    int by = 268;
-    const int top_ids[] = {0, 1, 2, 3, 6};
-    for (int i = 0; i < 5; i++) {
-      TouchButton &b = buttons[top_ids[i]];
-      b.x = PANEL_X + i * (bw + gap);
-      b.y = by;
-      b.w = bw;
-      b.h = 24;
-    }
-    buttons[4].x = PANEL_X;
-    buttons[4].y = TAB_ROW_Y;
-    buttons[4].w = TAB_W;
-    buttons[4].h = TAB_ROW_H;
-    buttons[5].x = PANEL_X + TAB_W + 4;
-    buttons[5].y = TAB_ROW_Y;
-    buttons[5].w = TAB_W;
-    buttons[5].h = TAB_ROW_H;
-  } else {
-    IMG_X = 24;
-    IMG_Y = 40;
-    PANEL_X = IMG_X + IMG_W + 4;
-    PANEL_W = 480 - PANEL_X - 4;
-    PANEL_SLIDER_X = PANEL_X + 4;
-    PANEL_SLIDER_W = PANEL_W - 8;
-    PANEL_SLIDER_H = 20;
-    TAB_ROW_Y = 58;
-    TAB_ROW_H = 22;
-    X_SLIDER_Y = 94;
-    Y_SLIDER_Y = 136;
-    Z_SLIDER_Y = 178;
-    TINT_SLIDER_Y = 232;
-    TAB_W = (PANEL_W - 4) / 2;
-    SLIDER_X = PANEL_SLIDER_X;
-    SLIDER_Y = TINT_SLIDER_Y;
-    SLIDER_W = PANEL_SLIDER_W;
-    SLIDER_H = PANEL_SLIDER_H;
-    BRT_BAR_X = 46;
-    BRT_BAR_Y = 290;
-    BRT_CELL_W = 50;
-    BRT_CELL_H = 24;
-    BRT_CLEAR_X = 40;
-    BRT_CLEAR_R = BRT_BAR_X + BRT_NUM_CELLS * BRT_CELL_W + 40;
-    PALETTE_X = 5;
-    PALETTE_Y_TOP = 24;
-    PALETTE_Y_BOTTOM = 280;
-    PALETTE_W = 12;
-    TMAX_LABEL_X = 2;
-    TMAX_LABEL_Y = 10;
-    TMIN_LABEL_X = 2;
-    TMIN_LABEL_Y = 290;
-    TOPBAR_CLEAR_X = 40;
-    TOPBAR_CLEAR_W = 440;
-    TB_TMAX = 2;
-    TB_CTR = 44;
-    TB_FPS = 116;
-    TB_ZOOM = 162;
-    TB_PARA = 200;
-    TB_MODE = 256;
-    TB_MODE_W = 42;
-    TB_RNG = 302;
-    TB_RNG_W = 36;
-    TB_STAT = 342;
-    TB_STAT_W = 24;
-    TB_BAT = 412;
-    READOUT_X = 378;
-    READOUT_Y = 158;
-    READOUT_W = 98;
-    READOUT_H = 10;
-
-    const int gap = 3;
-    int bw = (PANEL_W - gap * 3) / 4;
-    for (int i = 0; i < 4; i++) {
-      buttons[i].x = PANEL_X + i * (bw + gap);
-      buttons[i].y = 22;
-      buttons[i].w = bw;
-      buttons[i].h = 28;
-    }
-    buttons[4].x = PANEL_X;
-    buttons[4].y = TAB_ROW_Y;
-    buttons[4].w = TAB_W;
-    buttons[4].h = TAB_ROW_H;
-    buttons[5].x = PANEL_X + TAB_W + 4;
-    buttons[5].y = TAB_ROW_Y;
-    buttons[5].w = TAB_W;
-    buttons[5].h = TAB_ROW_H;
-    buttons[6].x = PANEL_X;
-    buttons[6].y = 286;
-    buttons[6].w = PANEL_W;
-    buttons[6].h = 30;
+  const int gap = 3;
+  int bw = (PANEL_W - gap * 2) / 3;
+  for (int i = 0; i < 3; i++) {
+    buttons[i].x = PANEL_X + i * (bw + gap);
+    buttons[i].y = 22;
+    buttons[i].w = bw;
+    buttons[i].h = 28;
   }
+  for (int i = 0; i < 2; i++) {
+    buttons[3 + i].x = PANEL_X + i * (TAB_W + 4);
+    buttons[3 + i].y = TAB_ROW_Y;
+    buttons[3 + i].w = TAB_W;
+    buttons[3 + i].h = TAB_ROW_H;
+  }
+  buttons[5].x = PANEL_X;
+  buttons[5].y = 286;
+  buttons[5].w = PANEL_W;
+  buttons[5].h = 30;
 }
 
 void drawButtons() {
@@ -1575,21 +1585,18 @@ void drawButtons() {
     // Tab buttons highlight blue when active. Everything else keeps its
     // assigned color regardless of state. Previously RST went TFT_DARKGREY
     // when locked, which rendered as nearly-black on this panel and made
-    // the button look invisible — now it stays maroon and we indicate
+    // the button look invisible; now it stays maroon and we indicate
     // "locked" with a dim text/outline instead.
     uint16_t bg = b.color;
     if (b.action == btnToggleAdjust) bg = adjust_unlocked ? TFT_GREEN : TFT_DARKCYAN;
-    bool tab_active = (b.action == btnTabPos   && panel_tab == PANEL_TAB_POS) ||
+    bool tab_active = (b.action == btnTabPreset && panel_tab == PANEL_TAB_PRESET) ||
                       (b.action == btnTabRange && panel_tab == PANEL_TAB_RANGE);
-    if (b.action == btnTabPos || b.action == btnTabRange) {
+    if (b.action == btnTabPreset || b.action == btnTabRange) {
       bg = tab_active ? TFT_BLUE : TFT_DARKGREY;
     }
     bool dim = (b.action == btnReset && !adjust_unlocked);
     uint16_t outline = dim ? TFT_LIGHTGREY : TFT_WHITE;
-    uint16_t fg      = dim ? TFT_LIGHTGREY
-                           : ((b.action == btnToggleAdjust && adjust_unlocked) ||
-                              tab_active
-                                ? TFT_WHITE : TFT_WHITE);
+    uint16_t fg = dim ? TFT_LIGHTGREY : TFT_WHITE;
     lcd.fillRoundRect(b.x, b.y, b.w, b.h, 4, bg);
     lcd.drawRoundRect(b.x, b.y, b.w, b.h, 4, outline);
     lcd.setTextColor(fg, bg);
@@ -1609,7 +1616,7 @@ static inline int sliderTrackW(int w) {
 
 static inline bool sliderRowHit(uint16_t tx, uint16_t ty,
                                 int x, int y, int w, int h) {
-  return tx >= x && tx < x + w && ty >= y && ty < y + h;
+  return tx >= x && tx < x + w && ty >= y - 12 && ty < y + h + 5;
 }
 
 static inline int sliderNudgeDir(uint16_t tx, int x, int w) {
@@ -1703,30 +1710,37 @@ void setManualHiValue(float t) {
   }
 }
 
+void drawPresetPanel() {
+  bool enabled = adjust_unlocked;
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%dcm", align_distance_cm);
+  int pct = (align_distance_cm - ALIGN_MIN_CM) * 100 / (ALIGN_MAX_CM - ALIGN_MIN_CM);
+  drawHSlider(PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
+              pct, "DIST", buf, TFT_GREEN, enabled);
+
+  lcd.fillRect(PANEL_SLIDER_X, Y_SLIDER_Y - 12,
+               PANEL_SLIDER_W, Z_SLIDER_Y - Y_SLIDER_Y + PANEL_SLIDER_H + 18,
+               TFT_BLACK);
+  lcd.setTextSize(1);
+  lcd.setTextColor(enabled ? TFT_WHITE : TFT_LIGHTGREY, TFT_BLACK);
+  lcd.setCursor(PANEL_SLIDER_X, Y_SLIDER_Y);
+  lcd.print("Auto alignment");
+  snprintf(buf, sizeof(buf), "X %+.2fpx", parallax_x100 / 100.0f);
+  lcd.setCursor(PANEL_SLIDER_X, Y_SLIDER_Y + 14);
+  lcd.print(buf);
+  snprintf(buf, sizeof(buf), "ZX/Y %d/%d%%", zoom_x_pct, zoom_y_pct);
+  lcd.setCursor(PANEL_SLIDER_X, Y_SLIDER_Y + 28);
+  lcd.print(buf);
+  lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y + 8);
+  lcd.print("Unlock ADJ to change.");
+}
+
 void drawAdjustSliders() {
   char buf[18];
-  if (panel_tab == PANEL_TAB_POS) {
-    // Position / zoom sliders. Drag-enable depends on adjust_unlocked.
-    bool enabled = adjust_unlocked;
-    snprintf(buf, sizeof(buf), "%+d", parallax_x);
-    int xpct = (parallax_x - PARALLAX_MIN) * 100 / (PARALLAX_MAX - PARALLAX_MIN);
-    drawHSlider(PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-                xpct, "X", buf, TFT_NAVY, enabled);
-
-    snprintf(buf, sizeof(buf), "%+d", parallax_y);
-    int ypct = (parallax_y - PARALLAX_MIN) * 100 / (PARALLAX_MAX - PARALLAX_MIN);
-    drawHSlider(PANEL_SLIDER_X, Y_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-                ypct, "Y", buf, TFT_NAVY, enabled);
-
-    snprintf(buf, sizeof(buf), "%d%%", zoom_pct);
-    int zpct = (zoom_pct - 100) * 100 / 150;
-    drawHSlider(PANEL_SLIDER_X, Z_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-                zpct, "ZOOM", buf, TFT_DARKCYAN, enabled);
+  if (panel_tab == PANEL_TAB_PRESET) {
+    drawPresetPanel();
   } else {
-    // RANGE tab — LO and HI sliders (only have effect when range_mode == MAN
-    // but you can preview values in any mode). The third slider slot is
-    // unused on this tab; clear that strip so leftover Z slider pixels from
-    // the previous tab don't linger.
+    // Manual range sliders; values are previewed even outside MAN mode.
     bool enabled = (range_mode == RANGE_MANUAL);
     snprintf(buf, sizeof(buf), "%.1fC", manual_lo);
     drawHSlider(PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
@@ -1736,10 +1750,9 @@ void drawAdjustSliders() {
     drawHSlider(PANEL_SLIDER_X, Y_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
                 manualTempToPct(manual_hi), "HI", buf, TFT_RED, enabled);
 
-    // Wipe the old Z-slider area + its label/value row above it.
+    // Clear the inactive third slider slot.
     lcd.fillRect(PANEL_SLIDER_X, Z_SLIDER_Y - 13,
                  PANEL_SLIDER_W, PANEL_SLIDER_H + 17, TFT_BLACK);
-    // Hint text in that empty slot — keeps the layout from looking broken.
     if (!enabled) {
       lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
       lcd.setTextSize(1);
@@ -1752,7 +1765,7 @@ void drawAdjustSliders() {
 }
 
 void drawBrightnessSlider() {
-  // Clear only the brightness band — leave x<40 alone (that's where the
+  // Clear only the brightness band; leave x<40 alone (that's where the
   // side-palette t_min label lives) and stop before the bottom-right reset
   // button.
   lcd.fillRect(BRT_CLEAR_X, BRT_BAR_Y - 4,
@@ -1790,6 +1803,24 @@ bool nudgeReady(uint32_t now) {
   return true;
 }
 
+bool handlePresetTouch(uint16_t tx, uint16_t ty) {
+  if (!adjust_unlocked) return false;
+  if (!sliderRowHit(tx, ty, PANEL_SLIDER_X, X_SLIDER_Y,
+                    PANEL_SLIDER_W, PANEL_SLIDER_H)) {
+    return false;
+  }
+  int dir = sliderNudgeDir(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
+  if (dir && nudgeReady(millis())) {
+    applyAlignmentDistanceCm(align_distance_cm + dir * ALIGN_NUDGE_CM, true);
+  } else if (sliderTrackHit(tx, PANEL_SLIDER_X, PANEL_SLIDER_W)) {
+    int pct = sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
+    int cm = ALIGN_MIN_CM + pct * (ALIGN_MAX_CM - ALIGN_MIN_CM) / 100;
+    applyAlignmentDistanceCm(cm, true);
+  }
+  drawAdjustSliders();
+  return true;
+}
+
 void handleTouch() {
   uint16_t tx, ty;
   if (!gt911_read_touch(&tx, &ty)) return;
@@ -1801,72 +1832,36 @@ void handleTouch() {
     drawAdjustSliders();
   }
 
-  // Tint slider — drag-able, no rate limit so it tracks finger movement.
+  // Tint slider has no rate limit so it tracks finger movement.
   if (sliderRowHit(tx, ty, SLIDER_X, SLIDER_Y, SLIDER_W, SLIDER_H)) {
     int dir = sliderNudgeDir(tx, SLIDER_X, SLIDER_W);
     if (dir) {
       if (nudgeReady(now)) {
-        int v = constrain((int)tint_pct + dir * TINT_NUDGE_PCT, 0, 100);
-        if (v != tint_pct) { tint_pct = (uint8_t)v; markDirty(); }
+        setDirtyU8(tint_pct, (uint8_t)constrain((int)tint_pct + dir * TINT_NUDGE_PCT, 0, 100));
         drawSlider();
       }
       return;
     }
     if (sliderTrackHit(tx, SLIDER_X, SLIDER_W)) {
-      uint8_t new_pct = (uint8_t)sliderPctFromTrack(tx, SLIDER_X, SLIDER_W);
-      if (new_pct != tint_pct) { tint_pct = new_pct; markDirty(); }
+      setDirtyU8(tint_pct, (uint8_t)sliderPctFromTrack(tx, SLIDER_X, SLIDER_W));
       drawSlider();
     }
     return;
   }
 
-  // Side-panel slider drags. Behaviour depends on which tab is active.
-  // POS tab → X / Y / Zoom (gated by adjust_unlocked, same as before).
-  // RANGE tab → LO / HI in °C (gated by range_mode == MANUAL — the sliders
-  // are visible in other range modes for preview, but only mutable in MAN).
+  if (panel_tab == PANEL_TAB_PRESET && handlePresetTouch(tx, ty)) return;
+
+  // Side-panel sliders: POS controls alignment, RANGE controls manual LO/HI.
   if (tx >= PANEL_SLIDER_X && tx < PANEL_SLIDER_X + PANEL_SLIDER_W) {
     int dir = sliderNudgeDir(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
     bool track_hit = sliderTrackHit(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
 
-    if (panel_tab == PANEL_TAB_POS) {
-      bool hit_x = sliderRowHit(tx, ty, PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H);
-      bool hit_y = sliderRowHit(tx, ty, PANEL_SLIDER_X, Y_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H);
-      bool hit_z = sliderRowHit(tx, ty, PANEL_SLIDER_X, Z_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H);
-      if (hit_x || hit_y || hit_z) {
-        if (adjust_unlocked) {
-          adjust_unlock_until_ms = now + ADJUST_UNLOCK_MS;
-          if (hit_x && dir && nudgeReady(now)) {
-            int v = constrain((int)parallax_x + dir * PARALLAX_NUDGE_PX, PARALLAX_MIN, PARALLAX_MAX);
-            if (v != parallax_x) { parallax_x = v; markDirty(); }
-          } else if (hit_x && track_hit) {
-            int pct = sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
-            int v = PARALLAX_MIN + pct * (PARALLAX_MAX - PARALLAX_MIN) / 100;
-            if (v != parallax_x) { parallax_x = v; markDirty(); }
-          } else if (hit_y && dir && nudgeReady(now)) {
-            int v = constrain((int)parallax_y + dir * PARALLAX_NUDGE_PX, PARALLAX_MIN, PARALLAX_MAX);
-            if (v != parallax_y) { parallax_y = v; markDirty(); }
-          } else if (hit_y && track_hit) {
-            int pct = sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
-            int v = PARALLAX_MIN + pct * (PARALLAX_MAX - PARALLAX_MIN) / 100;
-            if (v != parallax_y) { parallax_y = v; markDirty(); }
-          } else if (hit_z && dir && nudgeReady(now)) {
-            int v = constrain((int)zoom_pct + dir * ZOOM_NUDGE_PCT, 100, 250);
-            if (v != zoom_pct) { zoom_pct = v; markDirty(); }
-          } else if (hit_z && track_hit) {
-            int pct = sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
-            int v = 100 + pct * 150 / 100;
-            if (v != zoom_pct) { zoom_pct = v; markDirty(); }
-          }
-          drawAdjustSliders();
-        }
-        return;
-      }
-    } else if (panel_tab == PANEL_TAB_RANGE && range_mode == RANGE_MANUAL) {
-      // Convert pct → temperature on the MANUAL_T_MIN..MAX scale.
+    if (panel_tab == PANEL_TAB_RANGE && range_mode == RANGE_MANUAL) {
+      // Convert percent to temperature on the MANUAL_T_MIN..MAX scale.
       bool hit_lo = sliderRowHit(tx, ty, PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H);
       bool hit_hi = sliderRowHit(tx, ty, PANEL_SLIDER_X, Y_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H);
       if (hit_lo) {
-        // LO can't go above HI (clamped to HI - 1 to keep at least 1 °C span).
+        // Keep at least a 1 C span.
         if (dir && nudgeReady(now)) {
           setManualLoValue(manual_lo + dir * MANUAL_NUDGE_C);
         } else if (track_hit) {
@@ -1889,8 +1884,7 @@ void handleTouch() {
     }
   }
 
-  // Brightness cells — discrete, rate-limited so a tap doesn't fire multiple
-  // cells when the finger lingers across a boundary.
+  // Brightness cells are rate-limited so one tap does not fire repeatedly.
   if (now - last_touch_ms >= 250 &&
       ty >= BRT_BAR_Y && ty < BRT_BAR_Y + BRT_CELL_H &&
       tx >= BRT_BAR_X && tx < BRT_BAR_X + BRT_NUM_CELLS * BRT_CELL_W) {
@@ -1924,7 +1918,7 @@ void handleTouch() {
 //
 // Return code is plain int rather than an enum because the Arduino IDE
 // auto-generates forward declarations at the top of the .ino file, before
-// any user-defined enum exists — using `int` dodges that trap.
+// any user-defined enum exists; using `int` dodges that trap.
 #define BTN_NONE  0
 #define BTN_SHORT 1
 #define BTN_LONG  2
@@ -1972,36 +1966,9 @@ int pollButton() {
 }
 
 // ---------------------------------------------------------------- Render --
-//
-// Chunk buffer in DRAM (fast). The render loops write swap565/wire-format
-// pixels and push with setSwapBytes(false), matching the camera fast path and
-// avoiding LovyanGFX's internal byte-swap copy buffer.
-//
-// Per thermal frame we precompute one 8-bit palette index for each of the 768
-// cells. During render we bilerp that scalar index at camera resolution, then
-// look up RGB/pixel values. That is cheaper than bilerp'ing R, G and B
-// separately and avoids rebuilding thermal colour data for every camera frame.
-//
-// Tint algorithm (additive, dark-object-friendly):
-//   outC = clamp255( cam_C + palC · p / 100 )      per channel
-// At p=0 you get the camera unchanged; at p=100 every channel gets the full
-// palette colour added on top, capped at 255.
-// v15 used a luminance-preserving blend (palC * Y / 255) which multiplied
-// the thermal colour by camera brightness — so a hot finger on a dark sleeve
-// became muddy, because the dark camera kills the heat tint. Additive blend
-// fixes that: heat ALWAYS brightens the pixel, regardless of how dark the
-// scene is. The iron-bow palette starts at near-black, so cold pixels add
-// almost nothing and don't blue-tint the camera image.
-// ============================================================================
-// Chunked LCD output buffer — we render N rows at a time and push them in
-// a single pushImage() so the per-call SPI/DMA setup overhead (CASET/PASET/
-// RAMWR command sequence, DMA descriptor build, lock acquire) is paid once
-// per chunk instead of once per row. With CHUNK_H=16 the overhead drops 16×
-// and the actual data transfer dominates as it should. 10 KB DRAM cost.
-//
-// Sizing rationale: bigger chunks reduce overhead but eat DRAM. 16 rows at
-// 320×2 bytes = 10 KB fits easily and gets us within ~10% of the maximum
-// theoretical SPI throughput on this panel.
+// Render into a 16-row DRAM bounce buffer, then push swap565 pixels with
+// setSwapBytes(false). This avoids direct PSRAM-to-LCD artifacts and keeps the
+// LCD transfer path fast.
 #define CHUNK_H 16
 DRAM_ATTR uint16_t chunk_buf[CHUNK_H * IMG_W];
 
@@ -2062,12 +2029,7 @@ void buildThermalPaletteFrame(float lo, float hi) {
     for (int col = 0; col < 32; col++) {
       float t = therm_build_src[row * 32 + (31 - col)];
       float f = (t - lo) / denom;
-      // Clip f into [0,1]. The negation pattern catches NaN too —
-      // `f < 0` is FALSE for NaN, so a plain compare lets NaN through and
-      // the (int) cast then saturates to INT_MAX, which indexes
-      // palR[INT_MAX] and reliably crashes. `!(f >= 0)` is TRUE for NaN.
-      // Defence-in-depth: analyzeMLX should never let NaN reach us here,
-      // but if it ever does, this stays safe.
+      // Clamp, catching NaN before palette indexing.
       if (!(f >= 0.0f)) f = 0.0f;
       else if (f > 1.0f) f = 1.0f;
       int idx = (int)(f * 255.0f + 0.5f);
@@ -2108,10 +2070,7 @@ static inline uint8_t bilerp_cell(const uint8_t *src,
   return (uint8_t)((top * ify + bottom * fy) >> 8);
 }
 
-// 16.16 fixed-point map from camera-pixel offset (relative to the thermal
-// centre in camera coords) → thermal cell coordinate. step_q is in cells per
-// camera pixel; centre_cell shifts the origin so that delta=0 lands on the
-// middle of the thermal grid (16, 12).
+// Map camera-pixel offset to thermal cell coordinate in 16.16 fixed point.
 static inline void thermal_indices_fov(int delta, int32_t step_q,
                                        int center_cell, int max_cell,
                                        int &c0, int &c1,
@@ -2125,7 +2084,7 @@ static inline void thermal_indices_fov(int delta, int32_t step_q,
   else                      { c0 = idx; c1 = idx + 1; frac = (q >> 8) & 0xFF; }
 }
 
-// Thermal grid fills the full 320×240 image area: 32×24 cells → 10×10 px.
+// Thermal grid fills the full 320x240 image area: 32x24 cells -> 10x10 px.
 static constexpr int32_t TH_STEP_X_Q = (int32_t)(((int64_t)32 << 16) / IMG_W);
 static constexpr int32_t TH_STEP_Y_Q = (int32_t)(((int64_t)24 << 16) / IMG_H);
 static inline void thermal_steps(int32_t &step_x_q, int32_t &step_y_q) {
@@ -2133,62 +2092,88 @@ static inline void thermal_steps(int32_t &step_x_q, int32_t &step_y_q) {
   step_y_q = TH_STEP_Y_Q;
 }
 
-// Camera digital crop: zoom and parallax both affect this. At zoom = 100%
-// the full 320×240 frame is shown. At zoom > 100%, a centred sub-rect of
-// (IMG_W/zoom × IMG_H/zoom) is sampled and stretched. Parallax then offsets
-// the centre of that crop rect — in OUTPUT-PIXEL units, so a +10 px shift
-// looks the same on screen at any zoom level. Negative shift in source
-// coordinates because moving the visible image RIGHT on screen requires
-// sampling further LEFT in the source frame.
-//
-// Output via reference parameters rather than a struct so the Arduino IDE's
-// auto-generated forward declaration doesn't trip over an undeclared type.
-static inline void cameraCropParamsFor(int z, int px, int py,
-                                       int &src_x0, int &src_y0,
+// Camera crop parameters for zoom and parallax. Output parameters avoid
+// Arduino's generated-prototype edge cases with local struct types.
+static inline void cameraCropParamsFor(int zx, int zy, int px100, int py100,
+                                       int32_t &src_x0_q, int32_t &src_y0_q,
                                        int32_t &step_x_q, int32_t &step_y_q)
 {
-  if (z < 100) z = 100;
-  int cw = (IMG_W * 100 + z / 2) / z;
-  int ch = (IMG_H * 100 + z / 2) / z;
+  zx = clampZoomPct(zx);
+  zy = clampZoomPct(zy);
+  px100 = clampParallax100(px100);
+  py100 = clampParallax100(py100);
+  int cw = (IMG_W * 100 + zx / 2) / zx;
+  int ch = (IMG_H * 100 + zy / 2) / zy;
   if (cw > IMG_W) cw = IMG_W;
   if (ch > IMG_H) ch = IMG_H;
-  // Convert parallax (output px) → source px shift via (cw/IMG_W).
-  int shift_src_x = px * cw / IMG_W;
-  int shift_src_y = py * ch / IMG_H;
-  src_x0 = (IMG_W - cw) / 2 - shift_src_x;
-  src_y0 = (IMG_H - ch) / 2 - shift_src_y;
+  int64_t shift_x_q = ((int64_t)px100 * cw << 16) / (PARALLAX_SCALE * IMG_W);
+  int64_t shift_y_q = ((int64_t)py100 * ch << 16) / (PARALLAX_SCALE * IMG_H);
+  src_x0_q = (int32_t)(((int64_t)(IMG_W - cw) << 15) - shift_x_q);
+  src_y0_q = (int32_t)(((int64_t)(IMG_H - ch) << 15) - shift_y_q);
   step_x_q = (int32_t)(((int64_t)cw << 16) / IMG_W);
   step_y_q = (int32_t)(((int64_t)ch << 16) / IMG_H);
 }
 
-static inline void cameraCropParams(int &src_x0, int &src_y0,
+static inline void cameraCropParams(int32_t &src_x0_q, int32_t &src_y0_q,
                                     int32_t &step_x_q, int32_t &step_y_q)
 {
-  cameraCropParamsFor(zoom_pct, parallax_x, parallax_y,
-                      src_x0, src_y0, step_x_q, step_y_q);
+  cameraCropParamsFor(zoom_x_pct, zoom_y_pct, parallax_x100, parallax_y100,
+                      src_x0_q, src_y0_q, step_x_q, step_y_q);
 }
 
+static inline int clampPixelCoord(int v, int hi) {
+  if (v < 0) return 0;
+  if (v > hi) return hi;
+  return v;
+}
+
+static inline uint16_t cameraPixelWireAt(const uint16_t *cam, bool valid,
+                                         int x, int y,
+                                         int32_t sample_x0_q,
+                                         int32_t sample_y0_q,
+                                         int32_t step_x_q,
+                                         int32_t step_y_q) {
+  if (!valid || !cam) return 0;
+
+  int sx = (int)((sample_x0_q + (int64_t)x * step_x_q) >> 16);
+  int sy = (int)((sample_y0_q + (int64_t)y * step_y_q) >> 16);
+  sx = clampPixelCoord(sx, IMG_W - 1);
+  sy = clampPixelCoord(sy, IMG_H - 1);
+  return cam[sy * IMG_W + sx];
+}
+
+static inline void drawCrosshairRow(uint16_t *row, int y) {
+  const int cx = IMG_W / 2;
+  const int cy = IMG_H / 2;
+  if (y < cy - CROSS_R || y > cy + CROSS_R) return;
+
+  if (y == cy || y == cy - CROSS_R || y == cy + CROSS_R) {
+    for (int x = cx - CROSS_R; x <= cx + CROSS_R; x++) row[x] = TFT_WHITE;
+  } else {
+    row[cx - CROSS_R] = TFT_WHITE;
+    row[cx] = TFT_WHITE;
+    row[cx + CROSS_R] = TFT_WHITE;
+  }
+}
+
+void drawCrossbar();
 void renderThermalOnly();      // forward decl
 
 void renderTinted() {
-  // No camera (disconnected / init failed) — gracefully fall back so the
-  // user still sees the thermal data instead of a frozen screen.
   if (!cam_ok || !cam_have_frame) { renderThermalOnly(); return; }
+
   float lo, hi; getThermalRange(lo, hi);
   buildThermalPaletteFrame(lo, hi);
 
   uint16_t *cam = (uint16_t*)cam_snapshot;
-  uint8_t pct = tint_pct;        // additive blend uses pct directly
-
+  uint8_t pct = tint_pct;
   int32_t step_x_q, step_y_q;
   thermal_steps(step_x_q, step_y_q);
-  // Thermal centre is FIXED at the middle of the image — parallax/zoom
-  // only adjust the camera crop, so the thermal grid never moves on screen.
   const int cx_center = IMG_W / 2;
   const int cy_center = IMG_H / 2;
 
-  int crop_x0, crop_y0; int32_t crop_step_x_q, crop_step_y_q;
-  cameraCropParams(crop_x0, crop_y0, crop_step_x_q, crop_step_y_q);
+  int32_t crop_x0_q, crop_y0_q, crop_step_x_q, crop_step_y_q;
+  cameraCropParams(crop_x0_q, crop_y0_q, crop_step_x_q, crop_step_y_q);
 
   lcd.setSwapBytes(false);
   lcd.startWrite();
@@ -2197,19 +2182,16 @@ void renderTinted() {
     for (int dy = 0; dy < chunk_h; dy++) {
       int y = y0 + dy;
       uint16_t *row = &chunk_buf[dy * IMG_W];
-
       int ty0, ty1; uint16_t fy; bool y_inside;
       thermal_indices_fov(y - cy_center, step_y_q, 12, 23, ty0, ty1, fy, y_inside);
 
-      int src_y = crop_y0 + (int)(((int64_t)y * crop_step_y_q) >> 16);
-      if (src_y < 0) src_y = 0; else if (src_y >= IMG_H) src_y = IMG_H - 1;
+      int src_y = (int)((crop_y0_q + (int64_t)y * crop_step_y_q) >> 16);
+      src_y = clampPixelCoord(src_y, IMG_H - 1);
       uint16_t *cam_row = &cam[src_y * IMG_W];
 
       for (int x = 0; x < IMG_W; x++) {
-        int src_x = crop_x0 + (int)(((int64_t)x * crop_step_x_q) >> 16);
-        if (src_x < 0) src_x = 0; else if (src_x >= IMG_W) src_x = IMG_W - 1;
-
-        uint16_t cbe = cam_row[src_x];
+        int src_x = (int)((crop_x0_q + (int64_t)x * crop_step_x_q) >> 16);
+        uint16_t cbe = cam_row[clampPixelCoord(src_x, IMG_W - 1)];
         uint16_t out = cbe;
 
         if (y_inside && pct > 0) {
@@ -2221,29 +2203,22 @@ void renderTinted() {
 #else
             uint8_t pidx = therm_idx[ty0 * 32 + tx0];
 #endif
-            uint8_t pr = palR[pidx];
-            uint8_t pg = palG[pidx];
-            uint8_t pb = palB[pidx];
-
-            // Wire-format swap565 -> native rgb565 for arithmetic.
             uint16_t cnat = swap565(cbe);
             uint8_t cr = ((cnat >> 11) & 0x1F) << 3;
             uint8_t cg = ((cnat >> 5)  & 0x3F) << 2;
             uint8_t cb =  (cnat        & 0x1F) << 3;
-
-            // Additive blend — heat is added, then clamped at 255.
-            uint16_t r = (uint16_t)cr + (uint16_t)pr * pct / 100;
-            uint16_t g = (uint16_t)cg + (uint16_t)pg * pct / 100;
-            uint16_t b = (uint16_t)cb + (uint16_t)pb * pct / 100;
+            uint16_t r = (uint16_t)cr + (uint16_t)palR[pidx] * pct / 100;
+            uint16_t g = (uint16_t)cg + (uint16_t)palG[pidx] * pct / 100;
+            uint16_t b = (uint16_t)cb + (uint16_t)palB[pidx] * pct / 100;
             if (r > 255) r = 255;
             if (g > 255) g = 255;
             if (b > 255) b = 255;
-            uint16_t onat = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-            out = swap565(onat);
+            out = swap565(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
           }
         }
-        row[x] = isCrosshairPixel(x, y) ? TFT_WHITE : out;
+        row[x] = out;
       }
+      drawCrosshairRow(row, y);
     }
     lcd.pushImage(IMG_X, IMG_Y + y0, IMG_W, chunk_h, chunk_buf);
   }
@@ -2266,7 +2241,6 @@ void renderThermalOnly() {
     for (int dy = 0; dy < chunk_h; dy++) {
       int y = y0 + dy;
       uint16_t *row = &chunk_buf[dy * IMG_W];
-
       int ty0, ty1; uint16_t fy; bool y_inside;
       thermal_indices_fov(y - cy_center, step_y_q, 12, 23, ty0, ty1, fy, y_inside);
 
@@ -2284,8 +2258,9 @@ void renderThermalOnly() {
             out = palette_wire[pidx];
           }
         }
-        row[x] = isCrosshairPixel(x, y) ? TFT_WHITE : out;
+        row[x] = out;
       }
+      drawCrosshairRow(row, y);
     }
     lcd.pushImage(IMG_X, IMG_Y + y0, IMG_W, chunk_h, chunk_buf);
   }
@@ -2294,7 +2269,6 @@ void renderThermalOnly() {
 
 void renderCameraOnly() {
   if (!cam_have_frame) {
-    // No camera — paint a placeholder so the screen doesn't look frozen.
     lcd.fillRect(IMG_X, IMG_Y, IMG_W, IMG_H, TFT_BLACK);
     lcd.setTextColor(TFT_RED, TFT_BLACK);
     lcd.setTextSize(2);
@@ -2317,54 +2291,48 @@ void renderCameraOnly() {
     tw = (int)strlen(detail) * 6;
     lcd.setCursor(IMG_X + (IMG_W - tw) / 2, IMG_Y + IMG_H / 2 + 14);
     lcd.print(detail);
-    lcd.setTextSize(1);
     return;
   }
-  // Fast path at zoom = 100% — no resampling needed.
-  if (zoom_pct == 100) {
-    lcd.setSwapBytes(false);  // cam_snapshot is wire-format (swap565)
-    uint16_t *cam = (uint16_t*)cam_snapshot;
+
+  uint16_t *cam = (uint16_t*)cam_snapshot;
+  if (!adjust_unlocked) {
+    lcd.setSwapBytes(false);
     lcd.startWrite();
     for (int y0 = 0; y0 < IMG_H; y0 += CHUNK_H) {
       int chunk_h = (y0 + CHUNK_H <= IMG_H) ? CHUNK_H : (IMG_H - y0);
       for (int dy = 0; dy < chunk_h; dy++) {
         int y = y0 + dy;
         uint16_t *row = &chunk_buf[dy * IMG_W];
-        uint16_t *cam_row = &cam[y * IMG_W];
-        for (int x = 0; x < IMG_W; x++) {
-          row[x] = isCrosshairPixel(x, y) ? TFT_WHITE : cam_row[x];
-        }
+        memcpy(row, &cam[y * IMG_W], IMG_W * sizeof(uint16_t));
+        drawCrosshairRow(row, y);
       }
       lcd.pushImage(IMG_X, IMG_Y + y0, IMG_W, chunk_h, chunk_buf);
     }
     lcd.endWrite();
     return;
   }
-  // Cropped zoom — read from a centred sub-rect, stretch to full output.
-  uint16_t *cam = (uint16_t*)cam_snapshot;
-  int crop_x0, crop_y0; int32_t crop_step_x_q, crop_step_y_q;
-  cameraCropParams(crop_x0, crop_y0, crop_step_x_q, crop_step_y_q);
-  lcd.setSwapBytes(false);    // chunk_buf carries wire-format swap565 in this path
+
+  int32_t crop_x0_q, crop_y0_q, crop_step_x_q, crop_step_y_q;
+  cameraCropParams(crop_x0_q, crop_y0_q, crop_step_x_q, crop_step_y_q);
+  lcd.setSwapBytes(false);
   lcd.startWrite();
   for (int y0 = 0; y0 < IMG_H; y0 += CHUNK_H) {
     int chunk_h = (y0 + CHUNK_H <= IMG_H) ? CHUNK_H : (IMG_H - y0);
     for (int dy = 0; dy < chunk_h; dy++) {
       int y = y0 + dy;
       uint16_t *row = &chunk_buf[dy * IMG_W];
-      int src_y = crop_y0 + (int)(((int64_t)y * crop_step_y_q) >> 16);
-      if (src_y < 0) src_y = 0; else if (src_y >= IMG_H) src_y = IMG_H - 1;
-      uint16_t *cam_row = &cam[src_y * IMG_W];
+      int src_y = (int)((crop_y0_q + (int64_t)y * crop_step_y_q) >> 16);
+      uint16_t *cam_row = &cam[clampPixelCoord(src_y, IMG_H - 1) * IMG_W];
       for (int x = 0; x < IMG_W; x++) {
-        int src_x = crop_x0 + (int)(((int64_t)x * crop_step_x_q) >> 16);
-        if (src_x < 0) src_x = 0; else if (src_x >= IMG_W) src_x = IMG_W - 1;
-        row[x] = isCrosshairPixel(x, y) ? TFT_WHITE : cam_row[src_x];
+        int src_x = (int)((crop_x0_q + (int64_t)x * crop_step_x_q) >> 16);
+        row[x] = cam_row[clampPixelCoord(src_x, IMG_W - 1)];
       }
+      drawCrosshairRow(row, y);
     }
     lcd.pushImage(IMG_X, IMG_Y + y0, IMG_W, chunk_h, chunk_buf);
   }
   lcd.endWrite();
 }
-
 // ------------------------------------------------------------- Freeze Share
 // Short-press freeze also opens a local WiFi AP. Connect to the SSID shown on
 // the screen or printed on Serial, then browse to http://192.168.4.1/ to save
@@ -2383,8 +2351,9 @@ bool share_routes_configured = false;
 char share_ap_ssid[32] = "ThermalCam";
 uint32_t freeze_capture_ms = 0;
 float freeze_range_lo = 20.0f, freeze_range_hi = 30.0f;
-int freeze_zoom_pct = 124;
-int freeze_parallax_x = 0, freeze_parallax_y = 0;
+int freeze_zoom_x_pct = ALIGN_DEFAULT_ZX;
+int freeze_zoom_y_pct = ALIGN_DEFAULT_ZY;
+int freeze_parallax_x100 = 0, freeze_parallax_y100 = 0;
 uint8_t freeze_tint_pct = 70;
 DRAM_ATTR uint8_t share_bmp_line[IMG_W * 3];
 DRAM_ATTR int16_t stream_thermal_packet[768];
@@ -2400,15 +2369,27 @@ uint32_t stream_thermal_req_count = 0;
 uint32_t stream_thermal_req_timer_ms = 0;
 float stream_thermal_req_fps = 0.0f;
 uint32_t stream_jpeg_fail_count = 0;
+float stream_cam_encode_ms = 0.0f;
+float stream_cam_send_ms = 0.0f;
+float stream_cam_total_ms = 0.0f;
+float stream_cam_jpeg_bytes = 0.0f;
+float diag_grab_ms = 0.0f, diag_render_ms = 0.0f, diag_ui_ms = 0.0f;
+uint32_t stream_cam_last_encode_ms = 0;
+uint32_t stream_cam_last_send_ms = 0;
+uint32_t stream_cam_last_total_ms = 0;
+uint32_t stream_cam_last_jpeg_bytes = 0;
 bool stream_stop_pending = false;
+uint32_t stream_stop_deadline_ms = 0;
+static constexpr uint32_t STREAM_STOP_DELAY_MS = 500;
 
 static constexpr uint8_t STREAM_VIEW_OVERLAY = 0;
 static constexpr uint8_t STREAM_VIEW_CAMERA  = 1;
 static constexpr uint8_t STREAM_VIEW_THERMAL = 2;
-static constexpr uint8_t STREAM_JPEG_QUALITY = 72;
+// RGB565 snapshot -> browser JPEG quality. Lower quality cuts encode time and WiFi payload.
 
 void setStreamMode(bool enabled);
 extern float current_fps, cam_fps, mlx_fps;
+extern uint32_t cam_count;
 extern uint32_t last_ui_ms;
 
 void noteStreamRequest(uint32_t &count, uint32_t &timer_ms, float &fps) {
@@ -2419,6 +2400,35 @@ void noteStreamRequest(uint32_t &count, uint32_t &timer_ms, float &fps) {
     fps = count * 1000.0f / (now - timer_ms);
     count = 0;
     timer_ms = now;
+  }
+}
+
+static inline uint32_t usToMsRounded(uint32_t us) {
+  return (us + 500U) / 1000U;
+}
+
+void noteStreamCamTiming(uint32_t encode_us, uint32_t send_us,
+                         uint32_t total_us, size_t jpeg_bytes) {
+  stream_cam_last_encode_ms = usToMsRounded(encode_us);
+  stream_cam_last_send_ms = usToMsRounded(send_us);
+  stream_cam_last_total_ms = usToMsRounded(total_us);
+  stream_cam_last_jpeg_bytes = (uint32_t)jpeg_bytes;
+
+  const float alpha = 0.22f;
+  float encode_ms = encode_us / 1000.0f;
+  float send_ms = send_us / 1000.0f;
+  float total_ms = total_us / 1000.0f;
+  float bytes = (float)jpeg_bytes;
+  if (stream_cam_jpeg_bytes <= 0.0f) {
+    stream_cam_encode_ms = encode_ms;
+    stream_cam_send_ms = send_ms;
+    stream_cam_total_ms = total_ms;
+    stream_cam_jpeg_bytes = bytes;
+  } else {
+    stream_cam_encode_ms += (encode_ms - stream_cam_encode_ms) * alpha;
+    stream_cam_send_ms += (send_ms - stream_cam_send_ms) * alpha;
+    stream_cam_total_ms += (total_ms - stream_cam_total_ms) * alpha;
+    stream_cam_jpeg_bytes += (bytes - stream_cam_jpeg_bytes) * alpha;
   }
 }
 
@@ -2433,90 +2443,85 @@ void resetStreamDiagnostics(uint32_t now) {
   stream_thermal_req_timer_ms = now;
   stream_thermal_req_fps = 0.0f;
   stream_jpeg_fail_count = 0;
+  stream_cam_encode_ms = 0.0f;
+  stream_cam_send_ms = 0.0f;
+  stream_cam_total_ms = 0.0f;
+  stream_cam_jpeg_bytes = 0.0f;
+  stream_cam_last_encode_ms = 0;
+  stream_cam_last_send_ms = 0;
+  stream_cam_last_total_ms = 0;
+  stream_cam_last_jpeg_bytes = 0;
 }
 
-static const char STREAM_PORTAL_HTML[] PROGMEM = R"STREAMHTML(
+// Portal assets are split so the root page loads reliably over the AP.
+
+static const char PORTAL_INDEX_HTML[] PROGMEM = R"PORTALINDEX(
 <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Thermal Stream</title>
-<style>
-body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:12px}.top{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}.badge{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px;color:#b8c7d3}.bad{background:#3a1b20;border-color:#8a2630;color:#ffd1d1}canvas{width:100%;height:auto;background:#000;image-rendering:auto}.grid{display:grid;grid-template-columns:minmax(280px,640px) 1fr;gap:12px;margin-top:10px}.panel{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:10px}.row{display:grid;grid-template-columns:96px 1fr 52px;gap:8px;align-items:center;margin:8px 0}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:8px}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:8px}button.primary{background:#1f7a4d}button.danger{background:#8a2630}input[type=range]{width:100%}.val{color:#9fe870;text-align:right;font-variant-numeric:tabular-nums}.hud{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}.hud div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}.small{font-size:12px;color:#9aa8b3}.rec{color:#ffb4b4}.hidden{display:none}@media(max-width:760px){.grid,.twocol{grid-template-columns:1fr}.row{grid-template-columns:82px 1fr 48px}}
-</style></head><body><main>
-<div class="top"><h2>Thermal Stream</h2><div><span class="badge" id="ssid">AP</span> <span class="badge" id="ip">192.168.4.1</span> <span class="badge" id="connState">online</span> <span class="badge" id="recState">idle</span></div></div>
-<div class="grid">
-<section class="panel"><canvas id="view" width="320" height="240"></canvas><canvas id="recCanvas" width="320" height="240" class="hidden"></canvas>
-<div class="hud"><div>Center <b id="tCenter">--</b>C</div><div>Scene <b id="tSpan">--</b>C</div><div>Range <b id="tRange">--</b>C</div><div>Cam <b id="camFps">--</b>fps</div><div>Cam Req <b id="camReqFps">--</b>fps</div><div>MLX <b id="mlxFps">--</b>fps</div><div>Therm Req <b id="thermalReqFps">--</b>fps</div><div>API <b id="apiFps">--</b>fps</div><div>Loop <b id="loopFps">--</b>fps</div><div>Marker <b id="markerTemp">--</b>C</div><div>Heap <b id="heap">--</b></div><div>PSRAM <b id="psram">--</b></div><div>Seq <b id="seq">--</b></div><div>Uptime <b id="uptime">--</b></div></div>
-<div class="twocol" style="margin-top:10px"><button class="primary" id="recBtn">Start recording</button><button class="danger" id="stopPortal">Stop portal</button></div>
-<p class="small" id="saveMsg">Recording is held in browser memory until stopped. Use short clips; if recording is not supported, use the phone screen recorder.</p></section>
-<section class="panel">
-<div class="row"><label>View</label><select id="viewMode"><option value="0">Overlay</option><option value="1">Camera only</option><option value="2">Thermal only</option></select><span></span></div>
-<div class="row"><label>Range</label><select id="rangeMode"><option value="0">AUTO</option><option value="1">AUT2</option><option value="2">SKIN</option><option value="3">BODY</option><option value="4">WARM</option><option value="5">HOT</option><option value="6">VHOT</option><option value="7">MAN</option></select><span></span></div>
-<div class="row"><label>X</label><input id="px" type="range" min="-90" max="90" step="1"><span class="val" id="pxv"></span></div>
-<div class="row"><label>Y</label><input id="py" type="range" min="-90" max="90" step="1"><span class="val" id="pyv"></span></div>
-<div class="row"><label>Zoom</label><input id="zoom" type="range" min="100" max="250" step="1"><span class="val" id="zoomv"></span></div>
-<div class="row"><label>Tint</label><input id="tint" type="range" min="0" max="100" step="1"><span class="val" id="tintv"></span></div>
-<div class="row"><label>Manual LO</label><input id="mlo" type="range" min="5" max="60" step="0.1"><span class="val" id="mlov"></span></div>
-<div class="row"><label>Manual HI</label><input id="mhi" type="range" min="5" max="60" step="0.1"><span class="val" id="mhiv"></span></div>
-<div class="row"><label>Brightness</label><input id="brt" type="range" min="-2" max="2" step="1"><span class="val" id="brtv"></span></div>
-<div class="twocol"><button id="resetAlign">Reset alignment</button><button id="snap">Snapshot</button></div>
-<p><label><input type="checkbox" id="hud" checked> Show HUD</label></p>
-<p><label><input type="checkbox" id="recHud" checked> Record HUD</label></p>
-<p><label><input type="checkbox" id="crosshair" checked> Crosshair</label></p>
-</section></div></main>
-<script>
-const W=320,H=240,canvas=document.getElementById('view'),ctx=canvas.getContext('2d'),recCanvas=document.getElementById('recCanvas'),recCtx=recCanvas.getContext('2d');
-const thermalCanvas=document.createElement('canvas');thermalCanvas.width=W;thermalCanvas.height=H;const thermalCtx=thermalCanvas.getContext('2d');
-let S={view:0,range:0,px:0,py:0,zoom:124,tint:70,mlo:22,mhi:38,brt:0,hud:1,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camFps:0,camReqFps:0,mlxFps:0,thermalReqFps:0,apiFps:0,loopFps:0,heap:0,psram:0,portalMs:0};
-let camImg=null,camUrl=null,thermal=null,dirtyThermal=true,marker=null,markerTemp=null,rec=null,chunks=[],recUrl=null,uiReady=false,running=true,stopping=false;
-let camTimer=0,thermalTimer=0,stateTimer=0,camBusy=false,thermalBusy=false,stateBusy=false,camFail=0,thermalFail=0,stateFail=0,overlayCamMs=83,camFastStreak=0,recStarted=0,recTick=0,recStopResolve=null;
-const activeControls=new Set();
-const $=id=>document.getElementById(id);
-function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
-function pal(i){let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]}
-const PAL=Array.from({length:256},(_,i)=>pal(i));
-function fetchTimeout(url,opt={},ms=1500){if(!window.AbortController)return fetch(url,opt);let c=new AbortController(),t=setTimeout(()=>c.abort(),ms);return fetch(url,Object.assign({},opt,{signal:c.signal})).finally(()=>clearTimeout(t))}
-function setConn(txt,bad){let e=$('connState');e.textContent=txt;e.classList.toggle('bad',!!bad)}
-function backoff(n){return Math.min(2000,250*Math.pow(2,Math.min(n,3)))}
-function tempAt(x,y){if(!thermal)return null;let tx=x*32/W,ty=y*24/H,x0=clamp(Math.floor(tx),0,31),y0=clamp(Math.floor(ty),0,23),x1=clamp(x0+1,0,31),y1=clamp(y0+1,0,23),fx=tx-x0,fy=ty-y0;function t(r,c){return thermal[r*32+(31-c)]}let a=t(y0,x0),b=t(y0,x1),c=t(y1,x0),d=t(y1,x1);return (a*(1-fx)+b*fx)*(1-fy)+(c*(1-fx)+d*fx)*fy}
-function rebuildThermal(){if(!thermal)return;let img=thermalCtx.createImageData(W,H),d=img.data,lo=S.lo,hi=S.hi,den=(hi-lo)||1;for(let y=0;y<H;y++){for(let x=0;x<W;x++){let t=tempAt(x,y),idx=clamp(Math.round((t-lo)/den*255),0,255),p=PAL[idx],o=(y*W+x)*4;d[o]=p[0];d[o+1]=p[1];d[o+2]=p[2];d[o+3]=255}}thermalCtx.putImageData(img,0,0);dirtyThermal=false}
-function drawCamera(c){if(!camImg)return;let z=clamp(+S.zoom||100,100,250),cw=Math.round(W*100/z),ch=Math.round(H*100/z),sx=(W-cw)/2-(S.px||0)*cw/W,sy=(H-ch)/2-(S.py||0)*ch/H;sx=clamp(sx,0,W-cw);sy=clamp(sy,0,H-ch);c.drawImage(camImg,sx,sy,cw,ch,0,0,W,H)}
-function drawHud(c){c.save();c.font='12px system-ui';c.fillStyle='rgba(0,0,0,.62)';c.fillRect(4,4,164,54);c.fillStyle='#fff';c.fillText(`Ctr ${fmt(S.tCenter)}C  Scene ${fmt(S.tMin)}-${fmt(S.tMax)}C`,10,20);c.fillText(`Range ${fmt(S.lo)}-${fmt(S.hi)}C  MLX ${fmt(S.mlxFps)}fps`,10,36);if(marker&&markerTemp!=null)c.fillText(`Marker ${fmt(markerTemp)}C`,10,52);c.restore()}
-function drawCross(c){c.save();c.strokeStyle='#fff';c.lineWidth=1;c.beginPath();c.moveTo(W/2-10,H/2);c.lineTo(W/2+10,H/2);c.moveTo(W/2,H/2-10);c.lineTo(W/2,H/2+10);c.rect(W/2-10,H/2-10,20,20);c.stroke();c.restore()}
-function drawScene(c,withHud){c.clearRect(0,0,W,H);c.fillStyle='#000';c.fillRect(0,0,W,H);let v=+S.view;if((v===0||v===1)&&camImg)drawCamera(c);if((v===0||v===2)&&thermal){if(dirtyThermal)rebuildThermal();c.save();if(v===0){c.globalCompositeOperation='lighter';c.globalAlpha=(+S.tint||0)/100}c.drawImage(thermalCanvas,0,0);c.restore()}if(S.crosshair)drawCross(c);if(marker){c.strokeStyle='#9fe870';c.beginPath();c.arc(marker.x,marker.y,6,0,Math.PI*2);c.stroke()}if(withHud)drawHud(c)}
-function render(){drawScene(ctx,$('hud').checked);if(rec)drawScene(recCtx,$('recHud').checked);requestAnimationFrame(render)}
-function fmt(v){return Number.isFinite(+v)?(+v).toFixed(1):'--'}
-function kb(v){return v?Math.round(v/1024)+'K':'--'}
-function mmss(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60);s%=60;return m+':'+String(s).padStart(2,'0')}
-function setVal(id,v){let e=$(id);if(e&&!activeControls.has(id))e.value=v}
-function setCheck(id,v){let e=$(id);if(e&&!activeControls.has(id))e.checked=!!v}
-function updateLabels(){$('pxv').textContent=S.px;$('pyv').textContent=S.py;$('zoomv').textContent=S.zoom+'%';$('tintv').textContent=S.tint+'%';$('mlov').textContent=fmt(S.mlo)+'C';$('mhiv').textContent=fmt(S.mhi)+'C';$('brtv').textContent=S.brt;$('tCenter').textContent=fmt(S.tCenter);$('tSpan').textContent=`${fmt(S.tMin)}-${fmt(S.tMax)}`;$('tRange').textContent=`${fmt(S.lo)}-${fmt(S.hi)}`;$('camFps').textContent=fmt(S.camFps);$('camReqFps').textContent=fmt(S.camReqFps);$('mlxFps').textContent=fmt(S.mlxFps);$('thermalReqFps').textContent=fmt(S.thermalReqFps);$('apiFps').textContent=fmt(S.apiFps);$('loopFps').textContent=fmt(S.loopFps);$('heap').textContent=kb(S.heap);$('psram').textContent=kb(S.psram);$('seq').textContent=S.seq||'--';$('uptime').textContent=mmss(S.portalMs);$('markerTemp').textContent=markerTemp==null?'--':fmt(markerTemp)}
-function syncControls(){setVal('px',S.px);setVal('py',S.py);setVal('zoom',S.zoom);setVal('tint',S.tint);setVal('mlo',S.mlo);setVal('mhi',S.mhi);setVal('brt',S.brt);setVal('rangeMode',S.range);setVal('viewMode',S.view);setCheck('hud',S.hud);setCheck('crosshair',S.crosshair);uiReady=true}
-function applyState(s){Object.assign(S,s);S.lo=s.rangeLo;S.hi=s.rangeHi;syncControls();dirtyThermal=true;updateLabels();$('ssid').textContent=s.ssid||'ThermalCam';$('ip').textContent=s.ip||'192.168.4.1'}
-function camTargetMs(){let v=+S.view;if(v===2)return 0;if(v===1)return 67;return overlayCamMs}
-function thermalTargetMs(){return +S.view===1?500:125}
-function tuneOverlay(dur){if(+S.view!==0)return;if(dur<60){camFastStreak++;if(camFastStreak>=15)overlayCamMs=67}else camFastStreak=0;if(dur>110)overlayCamMs=120;else if(dur>85)overlayCamMs=100;else if(dur<75&&overlayCamMs>83)overlayCamMs=83}
-function scheduleCam(dur=0,fail=false){clearTimeout(camTimer);if(!running||+S.view===2)return;let d=fail?backoff(camFail):Math.max(0,camTargetMs()-dur);camTimer=setTimeout(getCam,d)}
-function scheduleThermal(dur=0,fail=false){clearTimeout(thermalTimer);if(!running)return;let d=fail?backoff(thermalFail):Math.max(0,thermalTargetMs()-dur);thermalTimer=setTimeout(getThermal,d)}
-function scheduleState(dur=0,fail=false){clearTimeout(stateTimer);if(!running)return;let d=fail?backoff(stateFail):Math.max(0,700-dur);stateTimer=setTimeout(getState,d)}
-function kickStreams(){if(+S.view!==2)scheduleCam(999,false);scheduleThermal(999,false)}
-async function getState(){if(stateBusy||!running)return;let t=performance.now();stateBusy=true;try{let r=await fetchTimeout('/api/state',{cache:'no-store'},1500);if(!r.ok)throw new Error(r.status);applyState(await r.json());stateFail=0;setConn('online',false)}catch(e){stateFail++;setConn('state retry',true)}finally{stateBusy=false;scheduleState(performance.now()-t,stateFail>0)}}
-async function getThermal(){if(thermalBusy||!running)return;let t=performance.now();thermalBusy=true;try{let r=await fetchTimeout('/thermal.bin',{cache:'no-store'},1500);if(!r.ok)throw new Error(r.status);let b=await r.arrayBuffer();if(b.byteLength<1536)throw new Error('short thermal');let dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;thermal=a;S.seq=+(r.headers.get('X-Frame-Seq')||S.seq);S.lo=+(r.headers.get('X-Range-Lo')||S.lo);S.hi=+(r.headers.get('X-Range-Hi')||S.hi);dirtyThermal=true;if(marker)markerTemp=tempAt(marker.x,marker.y);thermalFail=0;setConn('online',false);updateLabels()}catch(e){thermalFail++;setConn('thermal retry',true)}finally{thermalBusy=false;scheduleThermal(performance.now()-t,thermalFail>0)}}
-function loadImageUrl(url){return new Promise((resolve,reject)=>{let img=new Image();img.onload=()=>resolve(img);img.onerror=()=>reject(new Error('decode'));img.src=url})}
-async function getCam(){if(camBusy||!running||+S.view===2)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1500);if(!r.ok)throw new Error('http '+r.status);let blob=await r.blob();if(!blob.size)throw new Error('empty');let url=URL.createObjectURL(blob);try{let img=await loadImageUrl(url);if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img;camFail=0;setConn('online',false);tuneOverlay(performance.now()-t)}catch(e){URL.revokeObjectURL(url);throw e}}catch(e){camFail++;setConn(e&&e.message==='decode'?'cam decode retry':'cam retry',true)}finally{camBusy=false;scheduleCam(performance.now()-t,camFail>0)}}
-let sendTimer=null,pending={};async function postControl(o){let p=new URLSearchParams(o);let r=await fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p},1800);if(!r.ok)throw new Error(r.status);return r}
-function flushSend(){let p=pending;pending={};postControl(p).then(()=>setConn('online',false)).catch(()=>setConn('control retry',true))}
-function send(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(flushSend,90)}
-['px','py','zoom','tint','mlo','mhi','brt'].forEach(id=>{let e=$(id);['pointerdown','touchstart','focus'].forEach(ev=>e.addEventListener(ev,()=>activeControls.add(id)));['pointerup','pointercancel','touchend','blur','change'].forEach(ev=>e.addEventListener(ev,()=>activeControls.delete(id)));e.addEventListener('input',ev=>{S[id]=+ev.target.value;dirtyThermal=true;updateLabels();send({[id]:ev.target.value})})});
-['rangeMode','viewMode','hud','crosshair'].forEach(id=>{let e=$(id);['focus','pointerdown','touchstart'].forEach(ev=>e.addEventListener(ev,()=>activeControls.add(id)));['blur','change','pointerup','touchend'].forEach(ev=>e.addEventListener(ev,()=>activeControls.delete(id)))});
-$('rangeMode').onchange=e=>{S.range=+e.target.value;send({range:S.range})};$('viewMode').onchange=e=>{S.view=+e.target.value;dirtyThermal=true;send({view:S.view});kickStreams()};$('hud').onchange=e=>{S.hud=e.target.checked?1:0;send({hud:S.hud})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;send({crosshair:S.crosshair})};$('resetAlign').onclick=()=>send({reset_alignment:1});$('stopPortal').onclick=stopPortal;$('snap').onclick=()=>{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()};
-canvas.onclick=e=>{let r=canvas.getBoundingClientRect();marker={x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height};markerTemp=tempAt(marker.x,marker.y);updateLabels()};
-function recType(){let types=['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];return types.find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||''}
-function updateRecElapsed(){if(!rec)return;let elapsed=Date.now()-recStarted;$('recState').textContent='rec '+mmss(elapsed);if(elapsed>60000)$('saveMsg').textContent='Recording is still in browser memory. Stop before leaving this page.'}
-function stopRecording(){if(!rec)return Promise.resolve();return new Promise(resolve=>{recStopResolve=resolve;rec.stop()})}
-$('recBtn').onclick=async()=>{if(rec){await stopRecording();return}if(!recCanvas.captureStream||!window.MediaRecorder){$('saveMsg').textContent='Browser recording is unavailable. Use screen recording.';return}chunks=[];let stream=recCanvas.captureStream(15),type=recType();rec=new MediaRecorder(stream,type?{mimeType:type}:undefined);rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};rec.onstop=()=>{clearInterval(recTick);let blob=new Blob(chunks,{type:type||'video/webm'});if(recUrl)URL.revokeObjectURL(recUrl);recUrl=URL.createObjectURL(blob);let a=document.createElement('a');a.href=recUrl;a.download='thermal-stream.'+(type.includes('mp4')?'mp4':'webm');a.textContent='Download recording';$('saveMsg').replaceChildren(a);$('recBtn').textContent='Start recording';$('recState').textContent='idle';$('recState').classList.remove('rec');rec=null;if(recStopResolve){recStopResolve();recStopResolve=null}};rec.start(1000);recStarted=Date.now();recTick=setInterval(updateRecElapsed,500);$('recBtn').textContent='Stop recording';$('recState').classList.add('rec');updateRecElapsed()};
-async function stopPortal(){if(stopping)return;stopping=true;$('stopPortal').disabled=true;clearTimeout(sendTimer);pending={};if(rec)await stopRecording();running=false;clearTimeout(camTimer);clearTimeout(thermalTimer);clearTimeout(stateTimer);setConn('stopping',true);try{await postControl({stop_stream:1});$('saveMsg').textContent='Portal stopping. Hold the button for 3 seconds if the browser loses connection first.'}catch(e){$('saveMsg').textContent='Stop request failed. Hold the physical button for 3 seconds to exit.';setConn('stop failed',true)}}
-getState();getThermal();getCam();render();
-</script></body></html>
-)STREAMHTML";
+<title>Thermal Portal</title><link rel="stylesheet" href="/portal.css"></head><body><main>
+<header><div><h1><span id="tCenter">--</span>C</h1><p>Scene <b id="tSpan">--</b>C - Range <b id="tRange">--</b>C - Marker <b id="markerTemp">--</b>C</p></div><b id="connState">loading</b></header>
+<section class="grid"><div class="video"><canvas id="view" width="320" height="240"></canvas><canvas id="recCanvas" width="320" height="240" hidden></canvas><div class="actions"><button id="recBtn">Record</button><button id="stopPortal">Stop portal</button></div><p id="saveMsg">Recording is stored in browser memory until stopped.</p></div>
+<div class="panel">
+<label>View<select id="viewMode"><option value="0">Overlay</option><option value="1">Camera only</option><option value="2">Thermal only</option></select></label>
+<label>Thermal<select id="thermalMode"><option value="smooth">Smooth</option><option value="cells">Cells</option><option value="enhanced">Enhanced</option></select></label>
+<label>Range<select id="rangeMode"><option value="0">AUTO</option><option value="1">AUT2</option><option value="2">AUT3</option><option value="3">HMN</option><option value="4">PCB</option><option value="5">PRNT</option><option value="6">WALL</option><option value="7">DRFT</option><option value="8">MAN</option></select></label>
+<label>Distance <span id="distv"></span><input id="dist" type="range" min="15" max="300" step="1"></label>
+<p id="alignInfo">Alignment --</p>
+<label>Tint <span id="tintv"></span><input id="tint" type="range" min="0" max="100" step="1"></label>
+<label>Manual LO <span id="mlov"></span><input id="mlo" type="range" min="5" max="60" step="0.1"></label>
+<label>Manual HI <span id="mhiv"></span><input id="mhi" type="range" min="5" max="60" step="0.1"></label>
+<label>Brightness <span id="brtv"></span><input id="brt" type="range" min="-2" max="2" step="1"></label>
+<label>Contrast <span id="conv"></span><input id="con" type="range" min="-2" max="2" step="1"></label>
+<label>Saturation <span id="satv"></span><input id="sat" type="range" min="-2" max="2" step="1"></label>
+<label>Sharpness <span id="shpv"></span><input id="shp" type="range" min="-2" max="2" step="1"></label>
+<label>Denoise <span id="denv"></span><input id="den" type="range" min="0" max="1" step="1"></label>
+<label>JPEG Q<select id="jpgq"><option value="35">35 fastest</option><option value="45">45 fast</option><option value="55">55 balanced</option><option value="65">65 detail</option><option value="75">75 high</option></select></label>
+<div class="actions"><button id="resetAlign">Reset 100 cm</button><button id="rotBtn">Rotate</button><button id="snap">Snapshot</button><button id="testFrame">Test frame</button></div>
+<label class="check"><input type="checkbox" id="crosshair" checked> Crosshair</label>
+</div></section>
+<section id="diag" class="diag"></section>
+</main><script src="/portal.js"></script></body></html>
+)PORTALINDEX";
+
+static const char PORTAL_CSS[] PROGMEM = R"PORTALCSS(
+body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:10px}header{display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap}h1{font-size:32px;margin:0}p{color:#9aa8b3;margin:.25rem 0}.grid{display:grid;grid-template-columns:minmax(280px,640px) minmax(280px,1fr);gap:10px}.video,.panel{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:9px}canvas{width:100%;height:auto;background:#000;image-rendering:auto}label{display:grid;grid-template-columns:92px 1fr;gap:8px;align-items:center;margin:7px 0}label span{justify-self:end;color:#9fe870;font-variant-numeric:tabular-nums}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:7px}button{cursor:pointer}.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-top:8px}.check{display:block}.diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px;margin-top:10px}.diag div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}#connState{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px}.bad{background:#3a1b20!important;border-color:#8a2630!important;color:#ffd1d1!important}@media(max-width:760px){.grid{grid-template-columns:1fr}label{grid-template-columns:80px 1fr}}
+)PORTALCSS";
+
+static const char PORTAL_JS[] PROGMEM = R"PORTALJS(
+const W=320,H=240,$=id=>document.getElementById(id),canvas=$('view'),ctx=canvas.getContext('2d'),recCanvas=$('recCanvas'),recCtx=recCanvas.getContext('2d');
+const scene=document.createElement('canvas');scene.width=W;scene.height=H;const sctx=scene.getContext('2d');const th=document.createElement('canvas');th.width=W;th.height=H;const thx=th.getContext('2d');
+let S={view:0,range:0,px:0,py:0,px100:374,py100:0,zx:100,zy:124,alignDistanceCm:100,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--'},thermal=null,thermalSmooth=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle';
+const PAL=Array.from({length:256},(_,i)=>{let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]});
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}function fmt(v,d=1){return Number.isFinite(+v)?(+v).toFixed(d):'--'}function mmss(ms){let s=Math.floor((ms||0)/1000),m=Math.floor(s/60);return m+':'+String(s%60).padStart(2,'0')}function kb(v){return v?Math.round(v/1024)+'K':'--'}function bytes(v){return v?Math.round(v/102.4)/10+'K':'--'}
+function fetchTimeout(url,opt={},ms=1500){let c=new AbortController(),t=setTimeout(()=>c.abort(),ms);return fetch(url,Object.assign({},opt,{signal:c.signal})).finally(()=>clearTimeout(t))}function conn(t,b){let e=$('connState');e.textContent=t;e.classList.toggle('bad',!!b)}
+function setCanvasRotation(){rot=((rot%4)+4)%4;let rw=rot%2?H:W,rh=rot%2?W:H;canvas.width=rw;canvas.height=rh;recCanvas.width=rw;recCanvas.height=rh;$('rotBtn').textContent='Rotate '+rot*90;localStorage.thermalRotate=rot}
+function drawRot(out,src){out.setTransform(1,0,0,1,0,0);out.clearRect(0,0,out.canvas.width,out.canvas.height);out.save();if(rot===1){out.translate(H,0);out.rotate(Math.PI/2)}else if(rot===2){out.translate(W,H);out.rotate(Math.PI)}else if(rot===3){out.translate(0,W);out.rotate(-Math.PI/2)}out.drawImage(src,0,0);out.restore()}
+function viewToScene(x,y){let p=rot===1?{x:y,y:H-x}:rot===2?{x:W-x,y:H-y}:rot===3?{x:W-y,y:x}:{x,y};p.x=clamp(p.x,0,W-1);p.y=clamp(p.y,0,H-1);return p}
+function rawTempAt(x,y,src=thermal){if(!src)return null;let tx=x*32/W,ty=y*24/H,x0=clamp(Math.floor(tx),0,31),y0=clamp(Math.floor(ty),0,23),x1=clamp(x0+1,0,31),y1=clamp(y0+1,0,23),fx=tx-x0,fy=ty-y0;let t=(r,c)=>src[r*32+(31-c)],a=t(y0,x0),b=t(y0,x1),c=t(y1,x0),d=t(y1,x1);return(a*(1-fx)+b*fx)*(1-fy)+(c*(1-fx)+d*fx)*fy}
+function colorFor(t){let f=clamp(Math.round((t-S.lo)/((S.hi-S.lo)||1)*255),0,255);return PAL[f]}
+function rebuildThermal(){if(!thermal)return;let mode=$('thermalMode').value,src=mode==='enhanced'&&thermalSmooth?thermalSmooth:thermal;if(mode==='cells'){thx.clearRect(0,0,W,H);for(let r=0;r<24;r++)for(let c=0;c<32;c++){let p=colorFor(src[r*32+(31-c)]);thx.fillStyle=`rgb(${p[0]},${p[1]},${p[2]})`;thx.fillRect(c*10,r*10,10,10)}dirtyThermal=false;return}let img=thx.createImageData(W,H),d=img.data;for(let y=0;y<H;y++)for(let x=0;x<W;x++){let p=colorFor(rawTempAt(x,y,src)),o=(y*W+x)*4;d[o]=p[0];d[o+1]=p[1];d[o+2]=p[2];d[o+3]=255}thx.putImageData(img,0,0);dirtyThermal=false}
+function drawCamera(c){let img=camImg,iw=img&&(img.naturalWidth||img.width),ih=img&&(img.naturalHeight||img.height);if(!img||!iw||!ih)return;let zx=clamp(+S.zx||100,100,250),zy=clamp(+S.zy||124,100,250),cw=W*100/zx,ch=H*100/zy,px=(+S.px100||0)/100,py=(+S.py100||0)/100,sx=(W-cw)/2-px*cw/W,sy=(H-ch)/2-py*ch/H;sx=clamp(sx,0,W-cw);sy=clamp(sy,0,H-ch);c.drawImage(img,sx*iw/W,sy*ih/H,cw*iw/W,ch*ih/H,0,0,W,H)}
+function drawCross(c){if(!S.crosshair)return;c.save();c.strokeStyle='#fff';c.lineWidth=1;c.beginPath();c.moveTo(W/2-10,H/2);c.lineTo(W/2+10,H/2);c.moveTo(W/2,H/2-10);c.lineTo(W/2,H/2+10);c.rect(W/2-10,H/2-10,20,20);c.stroke();c.restore()}
+function drawScene(){sctx.clearRect(0,0,W,H);sctx.fillStyle='#000';sctx.fillRect(0,0,W,H);if(+S.view!==2)drawCamera(sctx);if(+S.view!==1&&thermal){if(dirtyThermal)rebuildThermal();sctx.save();if(+S.view===0){sctx.globalCompositeOperation='lighter';sctx.globalAlpha=(+S.tint||0)/100}sctx.drawImage(th,0,0);sctx.restore()}if(marker){sctx.strokeStyle='#9fe870';sctx.beginPath();sctx.arc(marker.x,marker.y,6,0,Math.PI*2);sctx.stroke()}drawCross(sctx)}
+function render(){drawScene();drawRot(ctx,scene);if(rec)drawRot(recCtx,scene);requestAnimationFrame(render)}
+function labels(){let px=(S.px100/100).toFixed(2);$('tCenter').textContent=fmt(S.tCenter);$('tSpan').textContent=`${fmt(S.tMin)}-${fmt(S.tMax)}`;$('tRange').textContent=`${fmt(S.lo)}-${fmt(S.hi)}`;$('markerTemp').textContent=markerTemp==null?'--':fmt(markerTemp);$('distv').textContent=(S.alignDistanceCm||100)+'cm';$('alignInfo').textContent=`RGB shift ${px}px right - crop ${S.zx}/${S.zy}%`;$('tintv').textContent=S.tint+'%';$('mlov').textContent=fmt(S.mlo)+'C';$('mhiv').textContent=fmt(S.mhi)+'C';$('brtv').textContent=S.brt;$('conv').textContent=S.con;$('satv').textContent=S.sat;$('shpv').textContent=S.shp;$('denv').textContent=S.den;let items=[['Cam',S.camFps,'fps'],['Cam Req',S.camReqFps,'fps'],['Transport',S.camTransport,''],['JPEG Q',S.jpegQuality,''],['Cam Enc',S.camEncodeMs,'ms'],['Cam Send',S.camSendMs,'ms'],['Cam Total',S.camTotalMs,'ms'],['Cam Size',bytes(S.camJpegBytes||camBytes),''],['Fetch',fmt(camFetchMs),'ms'],['Decode',fmt(camDecodeMs),'ms'],['Grab',fmt(S.grabMs),'ms'],['Render',fmt(S.renderMs),'ms'],['UI',fmt(S.uiMs),'ms'],['MLX',S.mlxFps,'fps'],['Therm Req',S.thermalReqFps,'fps'],['API',S.apiFps,'fps'],['Loop',S.loopFps,'fps'],['Heap',kb(S.heap),''],['PSRAM',kb(S.psram),''],['Seq',S.seq||'--',''],['Uptime',mmss(S.portalMs),''],['Cam',camStatus,'']];$('diag').innerHTML=items.map(i=>`<div>${i[0]} <b>${i[1]??'--'}</b>${i[2]}</div>`).join('')}
+function sync(){for(let id of ['rangeMode','viewMode','tint','mlo','mhi','brt','con','sat','shp','den','jpgq'])if($(id))$(id).value=S[id==='rangeMode'?'range':id==='viewMode'?'view':id==='jpgq'?'jpegQuality':id];$('dist').value=S.alignDistanceCm||100;$('crosshair').checked=!!S.crosshair;labels()}
+function applyState(s){Object.assign(S,s);S.lo=s.rangeLo;S.hi=s.rangeHi;sync();dirtyThermal=true;conn('online',false)}
+async function getState(){if(stateBusy||!running)return;stateBusy=true;try{let r=await fetchTimeout('/api/state',{cache:'no-store'},1500);if(!r.ok)throw 0;applyState(await r.json())}catch(e){conn('state retry',true)}finally{stateBusy=false;setTimeout(getState,1000)}}
+async function getThermal(){if(thermBusy||!running)return;thermBusy=true;try{let r=await fetchTimeout('/thermal.bin',{cache:'no-store'},1500);if(!r.ok)throw 0;let b=await r.arrayBuffer(),dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;if(!thermalSmooth)thermalSmooth=new Float32Array(a);else for(let i=0;i<768;i++)thermalSmooth[i]+= (a[i]-thermalSmooth[i])*0.35;thermal=a;let h=r.headers;S.seq=+(h.get('X-Frame-Seq')||S.seq);S.lo=+(h.get('X-Range-Lo')||S.lo);S.hi=+(h.get('X-Range-Hi')||S.hi);S.tCenter=+(h.get('X-Temp-Center')||S.tCenter);S.tMin=+(h.get('X-Temp-Min')||S.tMin);S.tMax=+(h.get('X-Temp-Max')||S.tMax);if(marker)markerTemp=rawTempAt(marker.x,marker.y);dirtyThermal=true;labels()}catch(e){conn('thermal retry',true)}finally{thermBusy=false;setTimeout(getThermal,+S.view===1?750:(+S.view===2?125:250))}}
+function loadImg(url){return new Promise((res,rej)=>{let i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=url})}
+async function setCam(blob){let t=performance.now(),url=URL.createObjectURL(blob);try{let img=await loadImg(url);if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img;camDecodeMs=performance.now()-t;camStatus='ok'}catch(e){URL.revokeObjectURL(url);camStatus='decode failed';throw e}}
+async function getCam(){if(camBusy||!running||+S.view===2)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1800);if(!r.ok)throw 0;let h=r.headers;S.camEncodeMs=+(h.get('X-Cam-Encode-Ms')||S.camEncodeMs);S.camSendMs=+(h.get('X-Cam-Send-Ms')||S.camSendMs);S.camTotalMs=+(h.get('X-Cam-Total-Ms')||S.camTotalMs);S.camJpegBytes=+(h.get('X-Cam-Bytes')||S.camJpegBytes);S.jpegQuality=+(h.get('X-JPEG-Quality')||S.jpegQuality);S.camTransport=h.get('X-Cam-Transport')||S.camTransport;let blob=await r.blob();camFetchMs=performance.now()-t;camBytes=blob.size;await setCam(blob);labels()}catch(e){camStatus='retry';conn('cam retry',true)}finally{camBusy=false;setTimeout(getCam,+S.view===1?70:110)}}
+function post(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(()=>{let p=new URLSearchParams(pending);pending={};fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p},1800).catch(()=>conn('control retry',true))},90)}
+for(let id of ['dist','tint','mlo','mhi','brt','con','sat','shp','den'])$(id).oninput=e=>{let v=+e.target.value;if(id==='dist'){S.alignDistanceCm=v;S.px100=Math.round(37440/v);S.py100=0;S.zx=100;S.zy=124;post({dist:v})}else{S[id]=v;post({[id]:v})}dirtyThermal=true;labels()};
+$('viewMode').onchange=e=>{S.view=+e.target.value;post({view:S.view});getCam();getThermal()};$('rangeMode').onchange=e=>{S.range=+e.target.value;post({range:S.range})};$('jpgq').onchange=e=>{S.jpegQuality=+e.target.value;post({jpgq:S.jpegQuality})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;post({crosshair:S.crosshair})};$('thermalMode').onchange=()=>{dirtyThermal=true};$('resetAlign').onclick=()=>post({reset_alignment:1});$('rotBtn').onclick=()=>{rot=(rot+1)%4;setCanvasRotation()};$('testFrame').onclick=()=>open('/cam.jpg?ts='+Date.now(),'_blank');$('snap').onclick=()=>{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()};canvas.onclick=e=>{let r=canvas.getBoundingClientRect(),p=viewToScene((e.clientX-r.left)*canvas.width/r.width,(e.clientY-r.top)*canvas.height/r.height);marker=p;markerTemp=rawTempAt(p.x,p.y);labels()};
+function recType(){return['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||''}function stopRec(){if(rec)rec.stop()}$('recBtn').onclick=()=>{if(rec){stopRec();return}if(!recCanvas.captureStream||!window.MediaRecorder){$('saveMsg').textContent='Recording unavailable; use screen recording.';return}chunks=[];let type=recType();rec=new MediaRecorder(recCanvas.captureStream(15),type?{mimeType:type}:undefined);rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};rec.onstop=()=>{clearInterval(recTimer);let blob=new Blob(chunks,{type:type||'video/webm'});if(recUrl)URL.revokeObjectURL(recUrl);recUrl=URL.createObjectURL(blob);$('saveMsg').innerHTML=`<a href="${recUrl}" download="thermal-stream.${type.includes('mp4')?'mp4':'webm'}">Download recording</a>`;$('recBtn').textContent='Record';rec=null};rec.start(1000);recStarted=Date.now();recTimer=setInterval(()=>{$('saveMsg').textContent='Recording '+mmss(Date.now()-recStarted)},500);$('recBtn').textContent='Stop'};
+$('stopPortal').onclick=async()=>{running=false;try{await fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({stop_stream:1})},1200)}catch(e){}$('saveMsg').textContent='Stop requested. Hold button 3s if needed.'};
+setCanvasRotation();getState();getThermal();getCam();render();
+)PORTALJS";
+
+static constexpr size_t PORTAL_INDEX_HTML_LEN = sizeof(PORTAL_INDEX_HTML) - 1;
+static constexpr size_t PORTAL_CSS_LEN = sizeof(PORTAL_CSS) - 1;
+static constexpr size_t PORTAL_JS_LEN = sizeof(PORTAL_JS) - 1;
 
 // Plain constants avoid Arduino's auto-prototype pass referencing an enum type
 // before its declaration.
@@ -2536,9 +2541,10 @@ bool ensureFreezeCameraBuffer() {
 
 void captureFreezeShareSnapshot() {
   freeze_capture_ms = millis();
-  freeze_zoom_pct = zoom_pct;
-  freeze_parallax_x = parallax_x;
-  freeze_parallax_y = parallax_y;
+  freeze_zoom_x_pct = zoom_x_pct;
+  freeze_zoom_y_pct = zoom_y_pct;
+  freeze_parallax_x100 = parallax_x100;
+  freeze_parallax_y100 = parallax_y100;
   freeze_tint_pct = tint_pct;
   getThermalRange(freeze_range_lo, freeze_range_hi);
 
@@ -2573,16 +2579,16 @@ static inline void bmpPut32(uint8_t *h, int off, uint32_t v) {
   h[off + 2] = (v >> 16) & 0xFF; h[off + 3] = (v >> 24) & 0xFF;
 }
 
-void writeBmpHeader(WiFiClient &client) {
+void writeBmpHeader(WiFiClient &client, int bmp_w, int bmp_h) {
   uint8_t hdr[54] = {0};
-  const uint32_t row_bytes = IMG_W * 3;
-  const uint32_t img_size = row_bytes * IMG_H;
+  const uint32_t row_bytes = bmp_w * 3;
+  const uint32_t img_size = row_bytes * bmp_h;
   hdr[0] = 'B'; hdr[1] = 'M';
   bmpPut32(hdr, 2, 54 + img_size);
   bmpPut32(hdr, 10, 54);
   bmpPut32(hdr, 14, 40);
-  bmpPut32(hdr, 18, IMG_W);
-  bmpPut32(hdr, 22, IMG_H);
+  bmpPut32(hdr, 18, bmp_w);
+  bmpPut32(hdr, 22, bmp_h);
   bmpPut16(hdr, 26, 1);
   bmpPut16(hdr, 28, 24);
   bmpPut32(hdr, 34, img_size);
@@ -2598,16 +2604,14 @@ static inline void rgb565WireToRgb888(uint16_t cbe,
 }
 
 static inline uint16_t freezeCameraPixelWire(int x, int y,
-                                             int crop_x0, int crop_y0,
-                                             int32_t crop_step_x_q,
-                                             int32_t crop_step_y_q) {
-  if (!freeze_cam_valid) return 0;
-  int src_y = crop_y0 + (int)(((int64_t)y * crop_step_y_q) >> 16);
-  if (src_y < 0) src_y = 0; else if (src_y >= IMG_H) src_y = IMG_H - 1;
-  int src_x = crop_x0 + (int)(((int64_t)x * crop_step_x_q) >> 16);
-  if (src_x < 0) src_x = 0; else if (src_x >= IMG_W) src_x = IMG_W - 1;
+                                             int32_t sample_x0_q,
+                                             int32_t sample_y0_q,
+                                             int32_t sample_step_x_q,
+                                             int32_t sample_step_y_q) {
   uint16_t *cam = (uint16_t*)freeze_cam_snapshot;
-  return cam[src_y * IMG_W + src_x];
+  return cameraPixelWireAt(cam, freeze_cam_valid, x, y,
+                           sample_x0_q, sample_y0_q,
+                           sample_step_x_q, sample_step_y_q);
 }
 
 static inline float freezeThermalCell(int row, int display_col) {
@@ -2652,23 +2656,28 @@ void sendFreezeBmp(uint8_t mode, const char *filename) {
 
   share_server.sendHeader("Content-Disposition",
                           String("inline; filename=\"") + filename + "\"");
-  share_server.setContentLength(54 + IMG_W * IMG_H * 3);
+  int bmp_w = IMG_W;
+  int bmp_h = IMG_H;
+  size_t row_bytes = (size_t)bmp_w * 3;
+  share_server.setContentLength(54 + row_bytes * bmp_h);
   share_server.send(200, "image/bmp", "");
   WiFiClient client = share_server.client();
-  writeBmpHeader(client);
+  writeBmpHeader(client, bmp_w, bmp_h);
 
-  int crop_x0, crop_y0;
-  int32_t crop_step_x_q, crop_step_y_q;
-  cameraCropParamsFor(freeze_zoom_pct, freeze_parallax_x, freeze_parallax_y,
-                      crop_x0, crop_y0, crop_step_x_q, crop_step_y_q);
+  int32_t sample_x0_q, sample_y0_q;
+  int32_t sample_step_x_q, sample_step_y_q;
+  cameraCropParamsFor(freeze_zoom_x_pct, freeze_zoom_y_pct,
+                      freeze_parallax_x100, freeze_parallax_y100,
+                      sample_x0_q, sample_y0_q,
+                      sample_step_x_q, sample_step_y_q);
 
-  for (int y = IMG_H - 1; y >= 0; y--) {
-    for (int x = 0; x < IMG_W; x++) {
+  for (int y = bmp_h - 1; y >= 0; y--) {
+    for (int x = 0; x < bmp_w; x++) {
       uint8_t r = 0, g = 0, b = 0;
 
       if (mode == SHARE_BMP_CAMERA || mode == SHARE_BMP_OVERLAY) {
-        rgb565WireToRgb888(freezeCameraPixelWire(x, y, crop_x0, crop_y0,
-                                                 crop_step_x_q, crop_step_y_q),
+        rgb565WireToRgb888(freezeCameraPixelWire(x, y, sample_x0_q, sample_y0_q,
+                                                 sample_step_x_q, sample_step_y_q),
                            r, g, b);
       }
 
@@ -2694,7 +2703,7 @@ void sendFreezeBmp(uint8_t mode, const char *filename) {
       share_bmp_line[off + 1] = g;
       share_bmp_line[off + 2] = r;
     }
-    client.write(share_bmp_line, sizeof(share_bmp_line));
+    client.write(share_bmp_line, row_bytes);
     delay(0);
   }
 }
@@ -2711,6 +2720,8 @@ void handleShareIndex() {
   html += F(" | IP ");
   html += WiFi.softAPIP().toString();
   html += F(" | range ");
+  html += RANGE_NAMES[range_mode];
+  html += F(" ");
   html += String(freeze_range_lo, 1);
   html += F(" C to ");
   html += String(freeze_range_hi, 1);
@@ -2769,25 +2780,60 @@ void handleThermalCsvRoute() {
 void handlePortalIndex() {
   if (stream_mode) {
     share_server.sendHeader("Cache-Control", "no-store");
-    share_server.send_P(200, PSTR("text/html"), STREAM_PORTAL_HTML);
+    share_server.send_P(200, PSTR("text/html"), PORTAL_INDEX_HTML,
+                        PORTAL_INDEX_HTML_LEN);
   } else {
     handleShareIndex();
   }
 }
 
-size_t streamJpgChunk(void *arg, size_t index, const void *data, size_t len) {
-  (void)index;
-  WebServer *server = (WebServer*)arg;
-  server->sendContent((const char*)data, len);
-  return len;
+void handlePortalCss() {
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.send_P(200, PSTR("text/css"), PORTAL_CSS, PORTAL_CSS_LEN);
 }
 
-void sendStreamJpegBuffer(const uint8_t *jpg, size_t jpg_len) {
+void handlePortalJs() {
   share_server.sendHeader("Cache-Control", "no-store");
+  share_server.send_P(200, PSTR("application/javascript"), PORTAL_JS, PORTAL_JS_LEN);
+}
+
+void handleApiPing() {
+  String json;
+  json.reserve(220);
+  json += F("{\"ok\":true,\"stream\":");
+  json += stream_mode ? F("true") : F("false");
+  json += F(",\"uptimeMs\":"); json += millis();
+  json += F(",\"heap\":"); json += ESP.getFreeHeap();
+  json += F(",\"psram\":"); json += ESP.getFreePsram();
+  json += F(",\"indexBytes\":"); json += PORTAL_INDEX_HTML_LEN;
+  json += F(",\"cssBytes\":"); json += PORTAL_CSS_LEN;
+  json += F(",\"jsBytes\":"); json += PORTAL_JS_LEN;
+  json += F("}");
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.send(200, "application/json", json);
+}
+
+void addStreamJpegTimingHeaders(size_t jpg_len, uint32_t encode_us) {
+  share_server.sendHeader("Cache-Control", "no-store");
+  share_server.sendHeader("X-Cam-Encode-Ms", String(encode_us / 1000.0f, 1));
+  share_server.sendHeader("X-Cam-Send-Ms", String(stream_cam_send_ms, 1));
+  share_server.sendHeader("X-Cam-Total-Ms", String(stream_cam_total_ms, 1));
+  share_server.sendHeader("X-Cam-Bytes", String((unsigned)jpg_len));
+  share_server.sendHeader("X-Cam-Seq", String((unsigned long)thermal_frame_seq));
+  share_server.sendHeader("X-JPEG-Quality", String((int)stream_jpeg_quality));
+}
+
+void sendStreamJpegBuffer(const uint8_t *jpg, size_t jpg_len,
+                          uint32_t encode_us, uint32_t total_start_us) {
+  addStreamJpegTimingHeaders(jpg_len, encode_us);
+  share_server.sendHeader("X-Cam-Transport", "rgb565-jpeg");
   share_server.setContentLength(jpg_len);
   share_server.send(200, "image/jpeg", "");
   WiFiClient client = share_server.client();
+  uint32_t send_start_us = micros();
   client.write(jpg, jpg_len);
+  uint32_t send_us = micros() - send_start_us;
+  noteStreamCamTiming(encode_us, send_us, micros() - total_start_us, jpg_len);
 }
 
 void handleStreamCameraJpg() {
@@ -2798,78 +2844,60 @@ void handleStreamCameraJpg() {
 
   noteStreamRequest(stream_cam_req_count, stream_cam_req_timer_ms,
                     stream_cam_req_fps);
+  uint32_t total_start_us = micros();
 
-#if STREAM_CAMERA_NATIVE_JPEG
   if (stream_native_jpeg_active) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-      share_server.send(404, "text/plain", "No camera frame available");
-      return;
-    }
-
-    if (fb->format == PIXFORMAT_JPEG) {
-      sendStreamJpegBuffer(fb->buf, fb->len);
-    } else {
-#if STREAM_CAMERA_CHUNKED_JPEG
-      share_server.sendHeader("Cache-Control", "no-store");
-      share_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+      stream_jpeg_fail_count++;
+      stream_native_jpeg_active = false;
+      deinitCameraDriver();
+      delay(30);
+      initCamera();
+    } else if (fb->format == PIXFORMAT_JPEG && fb->len) {
+      uint32_t send_start_us = micros();
+      addStreamJpegTimingHeaders(fb->len, 0);
+      share_server.sendHeader("X-Cam-Transport", "native-jpeg");
+      share_server.setContentLength(fb->len);
       share_server.send(200, "image/jpeg", "");
-      bool ok = frame2jpg_cb(fb, STREAM_JPEG_QUALITY, streamJpgChunk,
-                             &share_server);
-      if (!ok) {
-        stream_jpeg_fail_count++;
-        Serial.println("Stream camera: JPEG callback failed");
-      }
-#else
-      uint8_t *jpg = nullptr;
-      size_t jpg_len = 0;
-      bool ok = frame2jpg(fb, STREAM_JPEG_QUALITY, &jpg, &jpg_len);
-      if (ok && jpg && jpg_len) {
-        sendStreamJpegBuffer(jpg, jpg_len);
-      } else {
-        stream_jpeg_fail_count++;
-        share_server.send(500, "text/plain", "JPEG conversion failed");
-      }
-      if (jpg) free(jpg);
-#endif
+      WiFiClient client = share_server.client();
+      client.write(fb->buf, fb->len);
+      uint32_t send_us = micros() - send_start_us;
+      noteStreamCamTiming(0, send_us, micros() - total_start_us, fb->len);
+      cam_count++;
+      esp_camera_fb_return(fb);
+      return;
+    } else {
+      stream_jpeg_fail_count++;
+      esp_camera_fb_return(fb);
+      stream_native_jpeg_active = false;
+      deinitCameraDriver();
+      delay(30);
+      initCamera();
     }
-    esp_camera_fb_return(fb);
-    return;
   }
-#endif
 
   if (!cam_have_frame || !cam_snapshot) {
     share_server.send(404, "text/plain", "No camera frame available");
     return;
   }
 
-#if STREAM_CAMERA_CHUNKED_JPEG
-  share_server.sendHeader("Cache-Control", "no-store");
-  share_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  share_server.send(200, "image/jpeg", "");
-  bool ok = fmt2jpg_cb(cam_snapshot, cam_snapshot_len, IMG_W, IMG_H,
-                       PIXFORMAT_RGB565, STREAM_JPEG_QUALITY,
-                       streamJpgChunk, &share_server);
-  if (!ok) {
-    stream_jpeg_fail_count++;
-    Serial.println("Stream camera: RGB565 JPEG callback failed");
-  }
-#else
+  uint8_t jpeg_quality = stream_jpeg_quality;
   uint8_t *jpg = nullptr;
   size_t jpg_len = 0;
+  uint32_t encode_start_us = micros();
   bool ok = fmt2jpg(cam_snapshot, cam_snapshot_len, IMG_W, IMG_H,
-                    PIXFORMAT_RGB565, STREAM_JPEG_QUALITY, &jpg, &jpg_len);
+                    PIXFORMAT_RGB565, jpeg_quality, &jpg, &jpg_len);
+  uint32_t encode_us = micros() - encode_start_us;
   if (!ok || !jpg || !jpg_len) {
     stream_jpeg_fail_count++;
     if (jpg) free(jpg);
     share_server.send(500, "text/plain", "JPEG conversion failed");
     return;
   }
-  sendStreamJpegBuffer(jpg, jpg_len);
+  sendStreamJpegBuffer(jpg, jpg_len, encode_us, total_start_us);
   free(jpg);
-#endif
 }
-
 void handleStreamThermalBin() {
   if (!stream_mode) {
     share_server.send(404, "text/plain", "Stream portal is not active");
@@ -2930,6 +2958,18 @@ static inline float argFloatClamped(const char *name, float current, float lo, f
   return v;
 }
 
+static inline int argPx100Clamped(const char *px100_name, const char *px_name,
+                                  int current) {
+  int v = current;
+  if (share_server.hasArg(px100_name)) {
+    v = share_server.arg(px100_name).toInt();
+  } else if (share_server.hasArg(px_name)) {
+    float f = share_server.arg(px_name).toFloat();
+    v = (int)(f >= 0.0f ? f * 100.0f + 0.5f : f * 100.0f - 0.5f);
+  }
+  return clampParallax100(v);
+}
+
 void handleStreamControl() {
   if (!stream_mode) {
     share_server.send(409, "text/plain", "Stream portal is not active");
@@ -2944,19 +2984,54 @@ void handleStreamControl() {
     int r = argIntClamped("range", (int)range_mode, 0, RANGE_COUNT - 1);
     if (r != (int)range_mode) { range_mode = (RangeMode)r; dirty = true; }
   }
-  int px = argIntClamped("px", parallax_x, PARALLAX_MIN, PARALLAX_MAX);
-  int py = argIntClamped("py", parallax_y, PARALLAX_MIN, PARALLAX_MAX);
-  int z  = argIntClamped("zoom", zoom_pct, 100, 250);
+  if (share_server.hasArg("preset_cm")) {
+    int cm = share_server.arg("preset_cm").toInt();
+    if (applyAlignmentPresetCm(cm, false)) dirty = true;
+  }
+  if (share_server.hasArg("dist") || share_server.hasArg("distance_cm")) {
+    int cm = share_server.hasArg("dist") ? share_server.arg("dist").toInt()
+                                         : share_server.arg("distance_cm").toInt();
+    applyAlignmentDistanceCm(cm, false);
+    dirty = true;
+  }
+  int px100 = argPx100Clamped("px100", "px", parallax_x100);
+  int py100 = argPx100Clamped("py100", "py", parallax_y100);
+  int zx = argIntClamped("zx", zoom_x_pct, ZOOM_MIN, ZOOM_MAX);
+  int zy = argIntClamped("zy", zoom_y_pct, ZOOM_MIN, ZOOM_MAX);
+  if (share_server.hasArg("zoom")) zy = argIntClamped("zoom", zy, ZOOM_MIN, ZOOM_MAX);
   int ti = argIntClamped("tint", tint_pct, 0, 100);
   int br = argIntClamped("brt", cam_brightness, -2, 2);
-  if (px != parallax_x) { parallax_x = px; dirty = true; }
-  if (py != parallax_y) { parallax_y = py; dirty = true; }
-  if (z  != zoom_pct)   { zoom_pct = z; dirty = true; }
+  int con = argIntClamped("con", cam_contrast, -2, 2);
+  int sat = argIntClamped("sat", cam_saturation, -2, 2);
+  int shp = argIntClamped("shp", cam_sharpness, -2, 2);
+  int den = argIntClamped("den", cam_denoise, 0, 1);
+  int jq = argIntClamped("jpgq", stream_jpeg_quality,
+                         STREAM_JPEG_QUALITY_MIN, STREAM_JPEG_QUALITY_MAX);
+  if (px100 != parallax_x100) { parallax_x100 = px100; dirty = true; }
+  if (py100 != parallax_y100) { parallax_y100 = py100; dirty = true; }
+  if (zx != zoom_x_pct)       { zoom_x_pct = zx; dirty = true; }
+  if (zy != zoom_y_pct)       { zoom_y_pct = zy; dirty = true; }
   if (ti != tint_pct)   { tint_pct = (uint8_t)ti; dirty = true; }
+  if (jq != stream_jpeg_quality) {
+    stream_jpeg_quality = (uint8_t)jq;
+    dirty = true;
+  }
   if (br != cam_brightness) {
     cam_brightness = (int8_t)br;
     brightness_apply_pending = true;
     dirty = true;
+  }
+  if (con != cam_contrast) { cam_contrast = (int8_t)con; brightness_apply_pending = true; dirty = true; }
+  if (sat != cam_saturation) { cam_saturation = (int8_t)sat; brightness_apply_pending = true; dirty = true; }
+  if (shp != cam_sharpness) { cam_sharpness = (int8_t)shp; brightness_apply_pending = true; dirty = true; }
+  if (den != cam_denoise) { cam_denoise = (int8_t)den; brightness_apply_pending = true; dirty = true; }
+  if (share_server.hasArg("lenc")) {
+    bool v = share_server.arg("lenc").toInt() != 0;
+    if (v != cam_lenc) { cam_lenc = v; brightness_apply_pending = true; dirty = true; }
+  }
+  if (share_server.hasArg("gma")) {
+    bool v = share_server.arg("gma").toInt() != 0;
+    if (v != cam_raw_gma) { cam_raw_gma = v; brightness_apply_pending = true; dirty = true; }
   }
   if (share_server.hasArg("mlo")) {
     float before = manual_lo;
@@ -2975,10 +3050,14 @@ void handleStreamControl() {
     stream_crosshair_enabled = share_server.arg("crosshair").toInt() != 0;
   }
   if (share_server.hasArg("reset_alignment")) {
-    parallax_x = 0; parallax_y = 0; zoom_pct = 100; dirty = true;
+    resetAlignmentCalibrated(false);
+    dirty = true;
   }
   if (share_server.hasArg("stop_stream")) {
     stream_stop_pending = true;
+    stream_stop_deadline_ms = millis() + STREAM_STOP_DELAY_MS;
+    share_server.sendHeader("Cache-Control", "no-store");
+    share_server.sendHeader("Connection", "close");
     share_server.send(200, "application/json", "{\"ok\":true,\"stopping\":true}");
     return;
   }
@@ -3001,7 +3080,6 @@ void handleStreamState() {
     stream_thermal_req_fps = 0.0f;
     stream_thermal_req_timer_ms = now;
   }
-
   float lo, hi;
   getThermalRange(lo, hi);
   uint32_t seq;
@@ -3013,20 +3091,33 @@ void handleStreamState() {
 
   String json;
   updateCameraMemoryDiagnostics();
-  json.reserve(1800);
+  json.reserve(3200);
   json += F("{\"stream\":");
   json += stream_mode ? F("true") : F("false");
   json += F(",\"ssid\":\""); json += share_ap_ssid; json += F("\"");
   json += F(",\"ip\":\""); json += WiFi.softAPIP().toString(); json += F("\"");
   json += F(",\"view\":"); json += stream_view_mode;
   json += F(",\"range\":"); json += (int)range_mode;
-  json += F(",\"px\":"); json += parallax_x;
-  json += F(",\"py\":"); json += parallax_y;
-  json += F(",\"zoom\":"); json += zoom_pct;
+  json += F(",\"rangeName\":\""); json += RANGE_NAMES[range_mode]; json += F("\"");
+  json += F(",\"px\":"); json += String(parallax_x100 / 100.0f, 2);
+  json += F(",\"py\":"); json += String(parallax_y100 / 100.0f, 2);
+  json += F(",\"px100\":"); json += parallax_x100;
+  json += F(",\"py100\":"); json += parallax_y100;
+  json += F(",\"zoom\":"); json += zoom_y_pct;
+  json += F(",\"zx\":"); json += zoom_x_pct;
+  json += F(",\"zy\":"); json += zoom_y_pct;
+  json += F(",\"alignPresetCm\":"); json += align_distance_cm;
+  json += F(",\"alignDistanceCm\":"); json += align_distance_cm;
   json += F(",\"tint\":"); json += tint_pct;
   json += F(",\"mlo\":"); json += String(manual_lo, 1);
   json += F(",\"mhi\":"); json += String(manual_hi, 1);
   json += F(",\"brt\":"); json += (int)cam_brightness;
+  json += F(",\"con\":"); json += (int)cam_contrast;
+  json += F(",\"sat\":"); json += (int)cam_saturation;
+  json += F(",\"shp\":"); json += (int)cam_sharpness;
+  json += F(",\"den\":"); json += (int)cam_denoise;
+  json += F(",\"lenc\":"); json += cam_lenc ? 1 : 0;
+  json += F(",\"gma\":"); json += cam_raw_gma ? 1 : 0;
   json += F(",\"hud\":"); json += stream_hud_enabled ? 1 : 0;
   json += F(",\"crosshair\":"); json += stream_crosshair_enabled ? 1 : 0;
   json += F(",\"rangeLo\":"); json += String(lo, 2);
@@ -3040,12 +3131,27 @@ void handleStreamState() {
   json += F(",\"mlxFps\":"); json += String(mlx_fps, 1);
   json += F(",\"thermalReqFps\":"); json += String(stream_thermal_req_fps, 1);
   json += F(",\"loopFps\":"); json += String(current_fps, 1);
+  json += F(",\"grabMs\":"); json += String(diag_grab_ms, 1);
+  json += F(",\"renderMs\":"); json += String(diag_render_ms, 1);
+  json += F(",\"uiMs\":"); json += String(diag_ui_ms, 1);
   json += F(",\"apiFps\":"); json += String(stream_api_fps, 1);
   json += F(",\"portalMs\":"); json += stream_started_ms ? (now - stream_started_ms) : 0;
   json += F(",\"heap\":"); json += ESP.getFreeHeap();
   json += F(",\"psram\":"); json += ESP.getFreePsram();
-  json += F(",\"nativeJpeg\":"); json += stream_native_jpeg_active ? 1 : 0;
-  json += F(",\"jpegChunked\":"); json += STREAM_CAMERA_CHUNKED_JPEG ? 1 : 0;
+  json += F(",\"indexBytes\":"); json += PORTAL_INDEX_HTML_LEN;
+  json += F(",\"cssBytes\":"); json += PORTAL_CSS_LEN;
+  json += F(",\"jsBytes\":"); json += PORTAL_JS_LEN;
+  json += F(",\"camTransport\":\"");
+  json += stream_native_jpeg_active ? F("native-jpeg\"") : F("rgb565-jpeg\"");
+  json += F(",\"jpegQuality\":"); json += (int)stream_jpeg_quality;
+  json += F(",\"camEncodeMs\":"); json += String(stream_cam_encode_ms, 1);
+  json += F(",\"camSendMs\":"); json += String(stream_cam_send_ms, 1);
+  json += F(",\"camTotalMs\":"); json += String(stream_cam_total_ms, 1);
+  json += F(",\"camJpegBytes\":"); json += (unsigned long)(stream_cam_jpeg_bytes + 0.5f);
+  json += F(",\"camLastEncodeMs\":"); json += (unsigned long)stream_cam_last_encode_ms;
+  json += F(",\"camLastSendMs\":"); json += (unsigned long)stream_cam_last_send_ms;
+  json += F(",\"camLastTotalMs\":"); json += (unsigned long)stream_cam_last_total_ms;
+  json += F(",\"camLastJpegBytes\":"); json += (unsigned long)stream_cam_last_jpeg_bytes;
   json += F(",\"camOk\":"); json += cam_ok ? 1 : 0;
   json += F(",\"camHaveFrame\":"); json += cam_have_frame ? 1 : 0;
   json += F(",\"camFailStage\":\""); json += cameraStageName(cam_fail_stage); json += F("\"");
@@ -3069,6 +3175,9 @@ void handleStreamState() {
 void configureShareRoutes() {
   if (share_routes_configured) return;
   share_server.on("/", handlePortalIndex);
+  share_server.on("/portal.css", HTTP_GET, handlePortalCss);
+  share_server.on("/portal.js", HTTP_GET, handlePortalJs);
+  share_server.on("/api/ping", HTTP_GET, handleApiPing);
   share_server.on("/camera.bmp", [](){ sendFreezeBmp(SHARE_BMP_CAMERA, "camera.bmp"); });
   share_server.on("/thermal.bmp", [](){ sendFreezeBmp(SHARE_BMP_THERMAL, "thermal.bmp"); });
   share_server.on("/overlay.bmp", [](){ sendFreezeBmp(SHARE_BMP_OVERLAY, "overlay.bmp"); });
@@ -3077,6 +3186,18 @@ void configureShareRoutes() {
   share_server.on("/thermal.bin", HTTP_GET, handleStreamThermalBin);
   share_server.on("/api/state", HTTP_GET, handleStreamState);
   share_server.on("/api/control", HTTP_POST, handleStreamControl);
+  share_server.on("/generate_204", [](){
+    share_server.sendHeader("Location", "/", true);
+    share_server.send(302, "text/plain", "");
+  });
+  share_server.on("/hotspot-detect.html", [](){
+    share_server.sendHeader("Location", "/", true);
+    share_server.send(302, "text/plain", "");
+  });
+  share_server.on("/connecttest.txt", [](){
+    share_server.sendHeader("Location", "/", true);
+    share_server.send(302, "text/plain", "");
+  });
   share_server.onNotFound([](){
     share_server.sendHeader("Location", "/", true);
     share_server.send(302, "text/plain", "");
@@ -3149,7 +3270,7 @@ void drawStreamStatusDynamic() {
   if (now - stream_last_status_ms < 1000) return;
   stream_last_status_ms = now;
   int x = 18;
-  int y = ui_portrait ? 224 : 206;
+  int y = 206;
   lcd.fillRect(x, y, lcd.width() - 2 * x, 54, TFT_BLACK);
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
@@ -3176,12 +3297,11 @@ void setStreamMode(bool enabled) {
     }
 
     stream_stop_pending = false;
+    stream_stop_deadline_ms = 0;
     stream_view_mode = STREAM_VIEW_OVERLAY;
-    if (!enterStreamCameraMode()) {
-      Serial.println("Stream portal: camera mode switch failed, continuing");
-    }
     stream_started_ms = millis();
     resetStreamDiagnostics(stream_started_ms);
+    enterStreamCameraMode();
     if (!startFreezeShareAP()) {
       stopFreezeShareAP();
       exitStreamCameraMode();
@@ -3205,6 +3325,7 @@ void setStreamMode(bool enabled) {
     exitStreamCameraMode();
     stream_mode = false;
     stream_stop_pending = false;
+    stream_stop_deadline_ms = 0;
     stream_started_ms = 0;
     lcd.setBrightness(255);
     lcd.fillScreen(TFT_BLACK);
@@ -3247,6 +3368,12 @@ uint32_t mlx_fps_seq_prev = 0;
 float current_fps = 0, cam_fps = 0, mlx_fps = 0;
 uint32_t last_ui_ms = 0;
 
+static inline void noteLoopTiming(float &dst, uint32_t elapsed_us) {
+  float ms = elapsed_us / 1000.0f;
+  if (dst <= 0.0f) dst = ms;
+  else dst += (ms - dst) * 0.20f;
+}
+
 void drawStaticUI() {
   layoutUi();
   if (PALETTE_W > 0) {
@@ -3258,11 +3385,7 @@ void drawStaticUI() {
                         palette_native[palette_i]);
     }
   }
-  if (ui_portrait) {
-    lcd.drawFastHLine(0, IMG_Y + IMG_H, lcd.width(), TFT_DARKGREY);
-  } else {
-    lcd.drawFastVLine(PANEL_X - 3, 22, 296, TFT_DARKGREY);
-  }
+  lcd.drawFastVLine(PANEL_X - 3, 22, 296, TFT_DARKGREY);
   drawButtons(); drawAdjustSliders(); drawSlider(); drawBrightnessSlider();
 }
 
@@ -3270,18 +3393,15 @@ void drawDynamicUI() {
   lcd.setTextColor(TFT_WHITE, TFT_BLACK); lcd.setTextSize(1);
   char buf[40];
 
-  // Side palette labels — t_max sits in the top-bar gap on the left,
-  // t_min sits in the bottom strip next to the brightness slider.
+  // Side palette labels.
   lcd.fillRect(TMAX_LABEL_X, TMAX_LABEL_Y, 38, 12, TFT_BLACK);
   snprintf(buf, sizeof(buf), "%4.1fC", t_max);
   lcd.setCursor(TB_TMAX, TMAX_LABEL_Y); lcd.print(buf);
-  if (TMIN_LABEL_Y >= 0) {
-    lcd.fillRect(TMIN_LABEL_X, TMIN_LABEL_Y, 38, 12, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "%4.1fC", t_min);
-    lcd.setCursor(TMIN_LABEL_X, TMIN_LABEL_Y); lcd.print(buf);
-  }
+  lcd.fillRect(TMIN_LABEL_X, TMIN_LABEL_Y, 38, 12, TFT_BLACK);
+  snprintf(buf, sizeof(buf), "%4.1fC", t_min);
+  lcd.setCursor(TMIN_LABEL_X, TMIN_LABEL_Y); lcd.print(buf);
 
-  // Top bar — full-width clear so battery on the right doesn't leave a gap.
+  // Top bar: full-width clear so battery on the right doesn't leave a gap.
   lcd.fillRect(TOPBAR_CLEAR_X, 0, TOPBAR_CLEAR_W, 18, TFT_BLACK);
 
   // Centre temperature, large.
@@ -3295,9 +3415,9 @@ void drawDynamicUI() {
   snprintf(buf, sizeof(buf), "%.1ffps", current_fps);
   lcd.setCursor(TB_FPS, 5); lcd.print(buf);
   lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-  snprintf(buf, sizeof(buf), "Z%d%%", zoom_pct);
+  snprintf(buf, sizeof(buf), "D%d", align_distance_cm);
   lcd.setCursor(TB_ZOOM, 5); lcd.print(buf);
-  snprintf(buf, sizeof(buf), "P%+d,%+d", parallax_x, parallax_y);
+  snprintf(buf, sizeof(buf), "X%+d.%01d", parallax_x100 / 100, abs(parallax_x100 % 100) / 10);
   lcd.setCursor(TB_PARA, 5); lcd.print(buf);
 
   // Mode tag.
@@ -3311,21 +3431,21 @@ void drawDynamicUI() {
   lcd.setCursor(TB_RNG + 3, 5); lcd.print(RANGE_NAMES[range_mode]);
 
   // Status badge: AP implies a frozen frame is being shared.
-  if (TB_STAT >= 0 && share_ap_running) {
+  if (share_ap_running) {
     lcd.fillRect(TB_STAT, 2, TB_STAT_W, 14, TFT_RED);
     lcd.setTextColor(TFT_WHITE, TFT_RED);
     lcd.setCursor(TB_STAT + 6, 5); lcd.print("AP");
-  } else if (TB_STAT >= 0 && freeze_mode) {
+  } else if (freeze_mode) {
     lcd.fillRect(TB_STAT, 2, TB_STAT_W, 14, TFT_RED);
     lcd.setTextColor(TFT_WHITE, TFT_RED);
     lcd.setCursor(TB_STAT + 3, 5); lcd.print("FRZ");
-  } else if (TB_STAT >= 0 && millis() < save_indicator_until_ms) {
+  } else if (millis() < save_indicator_until_ms) {
     lcd.fillRect(TB_STAT, 2, TB_STAT_W, 14, TFT_DARKGREEN);
     lcd.setTextColor(TFT_WHITE, TFT_DARKGREEN);
     lcd.setCursor(TB_STAT + 3, 5); lcd.print("SAV");
   }
 
-  // Battery — right-justified. Hidden if BATTERY_ADC_PIN is -1 (default).
+  // Battery. Hidden if BATTERY_ADC_PIN is -1 (default).
   if (TB_BAT >= 0 && battery_pct >= 0) {
     uint16_t col = battery_pct < 20 ? TFT_RED
                  : battery_pct < 50 ? TFT_YELLOW
@@ -3335,17 +3455,14 @@ void drawDynamicUI() {
     lcd.setCursor(TB_BAT, 5); lcd.print(buf);
   }
 
-  // Right-column readout under the X+/Y+ buttons.
-  if (READOUT_W > 0 && READOUT_H > 0) {
-    lcd.fillRect(READOUT_X, READOUT_Y, READOUT_W, READOUT_H, TFT_BLACK);
-    lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-    if (share_ap_running) {
-      snprintf(buf, sizeof(buf), "%s", share_ap_ssid);
-    } else {
-      snprintf(buf, sizeof(buf), "X%+d Y%+d", parallax_x, parallax_y);
-    }
-    lcd.setCursor(READOUT_X + 2, READOUT_Y); lcd.print(buf);
+  lcd.fillRect(READOUT_X, READOUT_Y, READOUT_W, READOUT_H, TFT_BLACK);
+  lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+  if (share_ap_running) {
+    snprintf(buf, sizeof(buf), "%s", share_ap_ssid);
+  } else {
+    snprintf(buf, sizeof(buf), "%dcm", align_distance_cm);
   }
+  lcd.setCursor(READOUT_X + 2, READOUT_Y); lcd.print(buf);
 }
 
 // --------------------------------------------------------------- Storage --
@@ -3376,7 +3493,7 @@ void setup() {
 
   Serial.println("[3/8] Camera (must precede LCD init)");
   if (!initCamera()) {
-    Serial.println("CAMERA: init failed — continuing without camera. "
+    Serial.println("CAMERA: init failed; continuing without camera. "
                    "TINT/CAM modes will fall back to thermal-only.");
   }
 
@@ -3385,7 +3502,7 @@ void setup() {
 
   Serial.println("[5/8] LCD");
   lcd.init();
-  lcd.setRotation(1); // Temporary boot orientation; settings load later.
+  lcd.setRotation(1);
   lcd.setBrightness(255);
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_WHITE); lcd.setTextSize(2);
@@ -3406,8 +3523,7 @@ void setup() {
   Serial.printf("MLX: EEPROM broken=%d outlier=%d\n",
                 countPixelList(mlx_params.brokenPixels),
                 countPixelList(mlx_params.outlierPixels));
-  // Block until we've seen both subpages, so mlx_temps_full is ready before
-  // the first render. Bounded by a few seconds; the cap is just paranoia.
+  // Wait for one complete MLX frame before first render.
   {
     uint32_t mlx_t0 = millis();
     while (millis() - mlx_t0 < 2000) {
@@ -3421,7 +3537,7 @@ void setup() {
   Serial.println("[7/8] Palette + UI + Battery");
   buildPalette();
   loadSettings();
-  applyScreenOrientation();
+  layoutUi();
   if (brightness_apply_pending) { applyCameraBrightness(); brightness_apply_pending = false; }
   readBattery();
   lcd.fillScreen(TFT_BLACK);
@@ -3462,7 +3578,8 @@ void loop() {
     setFreezeMode(!freeze_mode);
   }
   handleFreezeShareAP();
-  if (stream_stop_pending) {
+  if (stream_stop_pending && stream_stop_deadline_ms &&
+      (int32_t)(millis() - stream_stop_deadline_ms) >= 0) {
     setStreamMode(false);
   }
 
@@ -3471,7 +3588,7 @@ void loop() {
   uint32_t now = millis();
 
   // Push a pending brightness change into the sensor. One SCCB write per
-  // change, not per frame — touchscreen handler sets the flag, we apply it
+  // change, not per frame; touchscreen handler sets the flag, we apply it
   // at the next loop iteration.
   if (brightness_apply_pending) {
     applyCameraBrightness();
@@ -3481,12 +3598,13 @@ void loop() {
   // MLX normally runs on its own core so foreground rendering doesn't pause
   // for I2C reads and MLX90640_CalculateTo(). This fallback only runs if the
   // task could not be created.
-  if (!mlx_task_handle && !freeze_mode && now - last_mlx_ms >= MLX_POLL_MS) {
+  if (!mlx_task_handle && !freeze_mode && !shouldThrottleMLXForScreenCameraOnly() &&
+      now - last_mlx_ms >= MLX_POLL_MS) {
     last_mlx_ms = now;
     if (readMLXSubpage() == MLX_READ_FULL) analyzeMLX();
   }
 
-  // Battery roughly twice a second — the divider draws no current to speak
+  // Battery roughly twice a second; the divider draws no current to speak
   // of, but ADC sampling isn't free either, and percentage doesn't change
   // that fast.
   if (now - last_bat_ms >= 500) {
@@ -3495,9 +3613,12 @@ void loop() {
   }
 
   if (!freeze_mode) {
+    uint32_t grab_t0 = micros();
     if (grabCamera()) cam_count++;
+    noteLoopTiming(diag_grab_ms, micros() - grab_t0);
   }
 
+  uint32_t render_t0 = micros();
   if (stream_mode) {
     drawStreamStatusDynamic();
   } else {
@@ -3508,8 +3629,14 @@ void loop() {
       default: break;
     }
   }
+  noteLoopTiming(diag_render_ms, micros() - render_t0);
 
-  if (!stream_mode && now - last_ui_ms >= 200) { drawDynamicUI(); last_ui_ms = now; }
+  if (!stream_mode && now - last_ui_ms >= 200) {
+    uint32_t ui_t0 = micros();
+    drawDynamicUI();
+    noteLoopTiming(diag_ui_ms, micros() - ui_t0);
+    last_ui_ms = now;
+  }
 
   // Auto-save tuned settings 3 s after the last change.
   if (settings_dirty && now - settings_dirty_ms >= SETTINGS_DEBOUNCE_MS) {
@@ -3526,11 +3653,14 @@ void loop() {
     mlx_fps = (mlx_seq_now - mlx_fps_seq_prev) * 1000.0f / fps_elapsed;
     mlx_fps_seq_prev = mlx_seq_now;
     fps_count = 0; cam_count = 0; fps_timer = now;
-    Serial.printf("Loop=%.1f Cam=%.1f MLX=%.1f Ctr=%.1fC [%.1f,%.1f] Mode=%s Rng=%s Tint=%d%% "
-                  "Z=%d%% PX=%+d,%+d Btn=%d Frz=%d\n",
-                  current_fps, cam_fps, mlx_fps, t_center, t_min, t_max,
+    Serial.printf("Loop=%.1f Cam=%.1f MLX=%.1f Grab=%.1fms Render=%.1fms UI=%.1fms Ctr=%.1fC [%.1f,%.1f] Mode=%s Rng=%s Tint=%d%% "
+                  "ZX/Y=%d/%d%% PX100=%+d,%+d Dist=%dcm Btn=%d Frz=%d\n",
+                  current_fps, cam_fps, mlx_fps,
+                  diag_grab_ms, diag_render_ms, diag_ui_ms,
+                  t_center, t_min, t_max,
                   MODE_NAMES[display_mode], RANGE_NAMES[range_mode], tint_pct,
-                  zoom_pct, parallax_x, parallax_y,
+                  zoom_x_pct, zoom_y_pct, parallax_x100, parallax_y100,
+                  align_distance_cm,
                   digitalRead(BUTTON_PIN), freeze_mode);
     Serial.printf("MLXdiag ok=%lu full=%lu stale=%lu i2c=%lu dup=%lu nr=%lu read_us=%lu max=%lu cbias=%.2f\n",
                   (unsigned long)mlx_diag_ok_subpages,
