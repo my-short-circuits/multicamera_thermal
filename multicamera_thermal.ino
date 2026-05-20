@@ -1203,11 +1203,9 @@ static constexpr int ZOOM_MAX = 250;
 // mismatch so ADV sliders are only extra offsets.
 static constexpr int ALIGN_BASE_PX100 = -720;
 static constexpr int ALIGN_BASE_PY100 = -670;
-static constexpr int ALIGN_LEGACY_OFFSET_PX100 = -1920;
-static constexpr int ALIGN_LEGACY_OFFSET_PY100 = -1120;
 static constexpr int ALIGN_BASE_ZX = 126;
 static constexpr int ALIGN_BASE_ZY = 126;
-static constexpr uint8_t ALIGN_SETTINGS_VERSION = 4;
+static constexpr uint8_t ALIGN_SETTINGS_VERSION = 5;
 static constexpr int ALIGN_DEFAULT_CM = 30;
 static constexpr int ALIGN_MIN_CM = 5;
 static constexpr int ALIGN_MAX_CM = 500;
@@ -1467,6 +1465,7 @@ void loadSettings() {
   bool has_panel_tab = prefs.isKey("ptab");
   uint8_t pt   = prefs.getUChar("ptab", PANEL_TAB_TUNE);
   prefs.end();
+  bool migrated_alignment = false;
   // Defensive clamps in case ranges have moved across firmware versions.
   align_distance_cm = clampDistanceCm(align_distance_cm);
   if (av < 1) {
@@ -1474,16 +1473,13 @@ void loadSettings() {
     align_offset_y100 = old_py100 - baseParallaxY100();
     align_zoom_x_offset = old_zx - ALIGN_BASE_ZX;
     align_zoom_y_offset = old_zy - ALIGN_BASE_ZY;
-  } else if (av < ALIGN_SETTINGS_VERSION) {
-    if (abs(align_offset_x100 - ALIGN_LEGACY_OFFSET_PX100) <= 125 &&
-        abs(align_offset_y100 - ALIGN_LEGACY_OFFSET_PY100) <= 125 &&
-        abs(align_zoom_x_offset - 6) <= 1 &&
-        abs(align_zoom_y_offset - 4) <= 1) {
-      align_offset_x100 = 0;
-      align_offset_y100 = 0;
-      align_zoom_x_offset = 0;
-      align_zoom_y_offset = 0;
-    }
+  }
+  if (av < ALIGN_SETTINGS_VERSION) {
+    align_offset_x100 = 0;
+    align_offset_y100 = 0;
+    align_zoom_x_offset = 0;
+    align_zoom_y_offset = 0;
+    migrated_alignment = true;
   }
   setAlignmentOffsets(align_offset_x100, align_offset_y100,
                       align_zoom_x_offset, align_zoom_y_offset, false);
@@ -1548,6 +1544,7 @@ void loadSettings() {
   range_mode   = (r < RANGE_COUNT) ? (RangeMode)r   : RANGE_AUTO;
   panel_tab    = (has_panel_tab && pt < PANEL_TAB_COUNT) ? (uint8_t)pt : (uint8_t)PANEL_TAB_TUNE;
   brightness_apply_pending = true;        // push into sensor on first frame
+  if (migrated_alignment) markDirty();
   Serial.printf("Loaded: PX100=%+d,%+d Off=%+d,%+d Z=%d/%d%% Zoff=%+d/%+d Dist=%dcm Tint=%d%% Brt=%+d LCD=%u JPGQ=%u Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
                 parallax_x100, parallax_y100,
                 align_offset_x100, align_offset_y100,
@@ -3313,8 +3310,8 @@ body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-syst
 static const char PORTAL_JS[] PROGMEM = R"PORTALJS(
 const W=320,H=240,$=id=>document.getElementById(id),canvas=$('view'),ctx=canvas.getContext('2d'),recCanvas=$('recCanvas'),recCtx=recCanvas.getContext('2d');
 const scene=document.createElement('canvas');scene.width=W;scene.height=H;const sctx=scene.getContext('2d');const th=document.createElement('canvas');th.width=W;th.height=H;const thx=th.getContext('2d');
-let S={view:0,range:0,px:0,py:0,px100:-732,py100:-1120,offx100:0,offy100:0,offzx:0,offzy:0,zx:126,zy:126,basePx100:-732,basePy100:-1120,baseZx:126,baseZy:126,alignDistanceCm:30,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--',camPreCropped:1,camStreamW:320,camStreamH:240},thermal=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,sceneDirty=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,diagBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
-const PRESETS=[['Macro',5],['Close',15],['Desk',30],['Room',100],['Far',500]],PARA_COEFF=35654,BASE_PX100=-1920,BASE_PY100=-1120,BASE_ZX=126,BASE_ZY=126;
+let S={view:0,range:0,px:0,py:0,px100:468,py100:-670,offx100:0,offy100:0,offzx:0,offzy:0,zx:126,zy:126,basePx100:468,basePy100:-670,baseZx:126,baseZy:126,alignDistanceCm:30,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--',camPreCropped:1,camStreamW:320,camStreamH:240},thermal=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,sceneDirty=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,diagBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
+const PRESETS=[['Macro',5],['Close',15],['Desk',30],['Room',100],['Far',500]],PARA_COEFF=35654,BASE_PX100=-720,BASE_PY100=-670,BASE_ZX=126,BASE_ZY=126;
 const PAL=Array.from({length:256},(_,i)=>{let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]});
 const thImg=thx.createImageData(W,H),xMap=[],yMap=[];for(let x=0;x<W;x++){let tx=x*32/W,x0=clamp(Math.floor(tx),0,31),x1=clamp(x0+1,0,31),fx=tx-x0;xMap[x]=[31-x0,31-x1,fx]}for(let y=0;y<H;y++){let ty=y*24/H,y0=clamp(Math.floor(ty),0,23),y1=clamp(y0+1,0,23),fy=ty-y0;yMap[y]=[y0,y1,fy]}
 let mjpegImg=new Image(),mjpegActive=false;mjpegImg.crossOrigin='anonymous';
