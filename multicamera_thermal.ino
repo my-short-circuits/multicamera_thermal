@@ -101,8 +101,8 @@
 #define MLX_SDA  11
 #define MLX_SCL  14
 
-// LCD SPI write clock. 40 MHz is the known-safe baseline; 60 MHz produced
-// random full-width line artifacts, so 50 MHz is the current cap.
+// LCD SPI write clock. Camera-only artifacts have been traced to camera pixels,
+// not panel writes, so keep the faster 50 MHz display path.
 static constexpr uint32_t TFT_WRITE_FREQ_HZ = 50000000UL;
 
 #define XCLK_GPIO_NUM 45
@@ -239,11 +239,14 @@ volatile float mlx_diag_chess_bias_last = 0.0f;
 // needs to consult. Full definitions live further down (~line 670). Kept
 // here because Arduino doesn't auto-generate forward decls for variables
 // or enums, only for free functions.
-enum RangeMode { RANGE_AUTO=0, RANGE_DETAIL, RANGE_HOT, RANGE_SKIN,
-                 RANGE_PCB, RANGE_HIGH, RANGE_WIDE, RANGE_COLD,
-                 RANGE_MANUAL, RANGE_COUNT };
+enum RangeMode { RANGE_AUTO=0, RANGE_INVERT, RANGE_AUTO2, RANGE_AUTO3,
+                 RANGE_DETAIL, RANGE_HOT, RANGE_SKIN, RANGE_PCB,
+                 RANGE_HIGH, RANGE_WIDE, RANGE_COLD, RANGE_MANUAL,
+                 RANGE_COUNT };
 extern volatile RangeMode range_mode;
 static constexpr int   DETAIL_NARROW_TRIM_PCT = 15;
+static constexpr float AUTO2_ROOM_FLOOR_DELTA_C = 0.5f;
+static constexpr float AUTO3_ROOM_CEILING_DELTA_C = 0.5f;
 static constexpr float HOT_AMBIENT_FLOOR_DELTA_C = 0.7f;
 static constexpr float HOT_HEADROOM_MIN_C = 2.0f;
 static constexpr float HOT_HEADROOM_FRACTION = 0.20f;
@@ -612,17 +615,32 @@ void analyzeMLX() {
   float mn_trimmed = mlxRangePercentile(mn, mx, hist_valid, MLX_AUTO_TRIM_LO_PCT);
   float mx_trimmed = mlxRangePercentile(mn, mx, hist_valid, 100 - MLX_AUTO_TRIM_HI_PCT);
 
-  // Pick the AUTO target. DETAIL uses tighter percentile clipping for higher
-  // contrast. HOT estimates ambient from the median, raises the palette floor,
-  // and leaves high-end headroom so hot objects do not immediately go white.
+  // Pick the AUTO target. AUT2 raises the floor above the median so warm
+  // subjects show without painting the background. AUT3 caps the range below
+  // the median and uses an inverted palette for cold subjects.
   float auto_target_lo = mn_trimmed;
   float auto_target_hi = mx_trimmed;
+  float median = mlxRangePercentile(mn, mx, hist_valid, 50);
+  float auto2_floor = -1000.0f;
+  float auto3_ceiling = 1000.0f;
   float hot_floor = -1000.0f;
-  if (range_mode == RANGE_DETAIL) {
+  if (range_mode == RANGE_AUTO2) {
+    auto2_floor = median + AUTO2_ROOM_FLOOR_DELTA_C;
+    if (auto_target_lo < auto2_floor) auto_target_lo = auto2_floor;
+    if (auto_target_hi < auto_target_lo + MLX_AUTO_MIN_SPAN_C) {
+      auto_target_hi = auto_target_lo + MLX_AUTO_MIN_SPAN_C;
+    }
+  } else if (range_mode == RANGE_AUTO3) {
+    auto3_ceiling = median - AUTO3_ROOM_CEILING_DELTA_C;
+    if (auto_target_hi > auto3_ceiling) auto_target_hi = auto3_ceiling;
+    if (auto_target_lo > auto_target_hi - MLX_AUTO_MIN_SPAN_C) {
+      auto_target_lo = auto_target_hi - MLX_AUTO_MIN_SPAN_C;
+    }
+  } else if (range_mode == RANGE_DETAIL) {
     auto_target_lo = mlxRangePercentile(mn, mx, hist_valid, DETAIL_NARROW_TRIM_PCT);
     auto_target_hi = mlxRangePercentile(mn, mx, hist_valid, 100 - DETAIL_NARROW_TRIM_PCT);
   } else if (range_mode == RANGE_HOT) {
-    hot_floor = mlxRangePercentile(mn, mx, hist_valid, 50) + HOT_AMBIENT_FLOOR_DELTA_C;
+    hot_floor = median + HOT_AMBIENT_FLOOR_DELTA_C;
     if (auto_target_lo < hot_floor) auto_target_lo = hot_floor;
     float headroom = (auto_target_hi - auto_target_lo) * HOT_HEADROOM_FRACTION;
     if (headroom < HOT_HEADROOM_MIN_C) headroom = HOT_HEADROOM_MIN_C;
@@ -636,6 +654,21 @@ void analyzeMLX() {
                   t[12*32 + 15] + t[12*32 + 16]) * 0.25f;
   float range_lo, range_hi;
   updateAutoDisplayRange(auto_target_lo, auto_target_hi, range_lo, range_hi);
+  if (range_mode == RANGE_AUTO2 && range_lo < auto2_floor) {
+    range_lo = auto2_floor;
+    if (range_hi < range_lo + MLX_AUTO_MIN_SPAN_C) {
+      range_hi = range_lo + MLX_AUTO_MIN_SPAN_C;
+    }
+    mlx_range_lo = range_lo;
+    mlx_range_hi = range_hi;
+  } else if (range_mode == RANGE_AUTO3 && range_hi > auto3_ceiling) {
+    range_hi = auto3_ceiling;
+    if (range_lo > range_hi - MLX_AUTO_MIN_SPAN_C) {
+      range_lo = range_hi - MLX_AUTO_MIN_SPAN_C;
+    }
+    mlx_range_lo = range_lo;
+    mlx_range_hi = range_hi;
+  }
   if (range_mode == RANGE_HOT && range_lo < hot_floor) {
     range_lo = hot_floor;
     if (range_hi < range_lo + MLX_AUTO_MIN_SPAN_C) {
@@ -787,6 +820,7 @@ void applyCameraSensorDefaults() {
   s->set_saturation(s, (int)cam_saturation);
   s->set_sharpness(s, (int)cam_sharpness);
   s->set_denoise(s, (int)cam_denoise);
+  if (s->set_aec2) s->set_aec2(s, 1);
   s->set_lenc(s, cam_lenc ? 1 : 0);
   s->set_raw_gma(s, cam_raw_gma ? 1 : 0);
   if (s->set_quality) s->set_quality(s, (int)stream_jpeg_quality);
@@ -1105,13 +1139,22 @@ void buildPalette() {
   }
 }
 
-uint8_t tempToPaletteIndex(float t, float lo, float hi) {
-  float f = (t - lo) / ((hi - lo) + 0.001f);
+static inline bool rangeUsesColdPalette(RangeMode mode) {
+  return mode == RANGE_INVERT || mode == RANGE_AUTO3;
+}
+
+uint8_t tempToPaletteIndexForMode(float t, float lo, float hi, bool cold_palette) {
+  float f = cold_palette ? (hi - t) / ((hi - lo) + 0.001f)
+                         : (t - lo) / ((hi - lo) + 0.001f);
   if (!(f >= 0.0f)) f = 0.0f;
   else if (f > 1.0f) f = 1.0f;
   int idx = (int)(f * 255.0f + 0.5f);
   if (idx < 0) idx = 0; else if (idx > 255) idx = 255;
   return (uint8_t)idx;
+}
+
+uint8_t tempToPaletteIndex(float t, float lo, float hi) {
+  return tempToPaletteIndexForMode(t, lo, hi, rangeUsesColdPalette(range_mode));
 }
 
 // ---------------------------------------------------------------- State ---
@@ -1122,6 +1165,9 @@ const uint16_t MODE_BG[MODE_COUNT] = {TFT_GREEN, TFT_ORANGE, TFT_BLUE};
 // Range presets.
 //
 // AUTO : stable percentile auto range.
+// INV  : same range as AUTO, but with the palette direction inverted.
+// AUT2 : warm-subject auto; raises the low end above estimated background.
+// AUT3 : cold-subject auto; caps the high end below estimated background.
 // DET  : tighter percentile clipping for subtle differences.
 // HOT  : ambient-suppressed auto range with high-end headroom.
 // SKIN : 28 - 38 C.
@@ -1134,14 +1180,16 @@ const uint16_t MODE_BG[MODE_COUNT] = {TFT_GREEN, TFT_ORANGE, TFT_BLUE};
 // RangeMode enum + auto-range constants are forward-declared near the top of the
 // file (right under the MLX block) because analyzeMLX needs them before this
 // point. Only the *arrays* live here.
-const char *RANGE_NAMES[RANGE_COUNT] = {"AUTO", "DET", "HOT", "SKIN",
-                                        "PCB", "HIGH", "WIDE", "COLD", "MAN"};
-static constexpr float RANGE_LO[RANGE_COUNT] = {0.0f,  0.0f,  0.0f, 28.0f,
-                                                30.0f, 40.0f, -10.0f, -20.0f,
-                                                0.0f};
-static constexpr float RANGE_HI[RANGE_COUNT] = {0.0f,  0.0f,  0.0f, 38.0f,
-                                                110.0f, 260.0f, 120.0f, 25.0f,
-                                                0.0f};
+const char *RANGE_NAMES[RANGE_COUNT] = {"AUTO", "INV", "AUT2", "AUT3", "DET",
+                                        "HOT", "SKIN", "PCB", "HIGH", "WIDE",
+                                        "COLD", "MAN"};
+static constexpr float RANGE_LO[RANGE_COUNT] = {0.0f,  0.0f,  0.0f,  0.0f,  0.0f,
+                                                0.0f, 28.0f, 30.0f, 40.0f,
+                                                -10.0f, -20.0f, 0.0f};
+static constexpr float RANGE_HI[RANGE_COUNT] = {0.0f,  0.0f,  0.0f,  0.0f,  0.0f,
+                                                0.0f, 38.0f, 110.0f, 260.0f,
+                                                120.0f, 25.0f, 0.0f};
+static constexpr uint8_t RANGE_SETTINGS_VERSION = 5;
 
 static constexpr int PARALLAX_MIN = -90;
 static constexpr int PARALLAX_MAX =  90;
@@ -1150,12 +1198,15 @@ static constexpr int PARALLAX_MIN100 = PARALLAX_MIN * PARALLAX_SCALE;
 static constexpr int PARALLAX_MAX100 = PARALLAX_MAX * PARALLAX_SCALE;
 static constexpr int ZOOM_MIN = 100;
 static constexpr int ZOOM_MAX = 250;
-// RGB/MLX alignment model. The OV3660 module FOV is treated as diagonal FOV
-// on a 4:3 frame; the resulting base crop matches MLX90640's 55 x 35 degree
-// standard lens before distance parallax and manual offsets are applied.
-static constexpr int ALIGN_BASE_ZX = 101;
-static constexpr int ALIGN_BASE_ZY = 125;
-static constexpr int ALIGN_DEFAULT_CM = 100;
+// Field calibration from the 20-30 cm overlay test. Distance still changes the
+// X parallax term; these constants correct the fixed optical-center and FOV
+// mismatch so ADV sliders are only extra offsets.
+static constexpr int ALIGN_BASE_PX100 = -1920;
+static constexpr int ALIGN_BASE_PY100 = -1120;
+static constexpr int ALIGN_BASE_ZX = 126;
+static constexpr int ALIGN_BASE_ZY = 126;
+static constexpr uint8_t ALIGN_SETTINGS_VERSION = 4;
+static constexpr int ALIGN_DEFAULT_CM = 30;
 static constexpr int ALIGN_MIN_CM = 5;
 static constexpr int ALIGN_MAX_CM = 500;
 static constexpr int ALIGN_NUDGE_CM = 5;
@@ -1207,9 +1258,9 @@ uint32_t screen_marker_seq = 0;
 // transition isn't a jarring jump. Persisted across reboots.
 volatile float manual_lo = 22.0f;
 volatile float manual_hi = 38.0f;
-// Side-panel tab:
-//   DIST: geometry-derived alignment, ADV: offsets, RNG: manual thermal range.
-enum PanelTab { PANEL_TAB_PRESET = 0, PANEL_TAB_ADVANCED, PANEL_TAB_RANGE, PANEL_TAB_COUNT };
+// Side-panel tab. Numeric values keep old persisted tabs meaningful:
+// 0=ALIGN, 1=ADV, 2=MAN, 3=TUNE.
+enum PanelTab { PANEL_TAB_PRESET = 0, PANEL_TAB_ADVANCED, PANEL_TAB_RANGE, PANEL_TAB_TUNE, PANEL_TAB_COUNT };
 volatile uint8_t panel_tab = PANEL_TAB_PRESET;
 static constexpr float MANUAL_T_MIN = -20.0f;
 static constexpr float MANUAL_T_MAX = 300.0f;
@@ -1235,17 +1286,6 @@ static inline uint8_t clampStreamJpegQuality(int q) {
   if (q > STREAM_JPEG_QUALITY_MAX) return STREAM_JPEG_QUALITY_MAX;
   return (uint8_t)q;
 }
-
-// Lens FOVs used to align camera pixels to MLX cells.
-static constexpr float MLX_HFOV_DEG = 55.0f;
-static constexpr float MLX_VFOV_DEG = 35.0f;
-static constexpr float CAM_HFOV_DEG = 68.0f;
-static constexpr float CAM_VFOV_DEG = 51.0f;
-// Default cell size in camera pixels at zoom = 100%.
-static constexpr float BASE_CELL_PX_X = (MLX_HFOV_DEG / 32.0f) /
-                                        (CAM_HFOV_DEG / (float)IMG_W);   // about 8.09
-static constexpr float BASE_CELL_PX_Y = (MLX_VFOV_DEG / 24.0f) /
-                                        (CAM_VFOV_DEG / (float)IMG_H);   // about 6.86
 
 // ---------------------------------------------------------- Persistence --
 // Settings are saved to NVS after a quiet period to reduce flash writes.
@@ -1308,13 +1348,18 @@ static inline int parallaxX100ForDistance(int cm) {
   return (ALIGN_PARALLAX_COEFF_100_CM + cm / 2) / cm;
 }
 
+static inline int baseParallaxX100ForDistance(int cm) {
+  return clampParallax100(ALIGN_BASE_PX100 + parallaxX100ForDistance(cm));
+}
+
+static inline int baseParallaxY100() { return ALIGN_BASE_PY100; }
 static inline int baseZoomXPct() { return ALIGN_BASE_ZX; }
 static inline int baseZoomYPct() { return ALIGN_BASE_ZY; }
 
 void recomputeAlignmentTransform() {
-  int base_px100 = parallaxX100ForDistance(align_distance_cm);
+  int base_px100 = baseParallaxX100ForDistance(align_distance_cm);
   parallax_x100 = clampParallax100(base_px100 + align_offset_x100);
-  parallax_y100 = clampParallax100(align_offset_y100);
+  parallax_y100 = clampParallax100(baseParallaxY100() + align_offset_y100);
   zoom_x_pct = clampZoomPct(baseZoomXPct() + align_zoom_x_offset);
   zoom_y_pct = clampZoomPct(baseZoomYPct() + align_zoom_y_offset);
 }
@@ -1354,7 +1399,7 @@ void loadSettings() {
   prefs.begin("flir2", true);                  // read-only
   align_distance_cm = prefs.getInt("dist", prefs.getInt("apcm", ALIGN_DEFAULT_CM));
   uint8_t av   = prefs.getUChar("alv", 0);
-  int old_px100 = prefs.getInt("px100", parallaxX100ForDistance(align_distance_cm));
+  int old_px100 = prefs.getInt("px100", baseParallaxX100ForDistance(align_distance_cm));
   int old_py100 = prefs.getInt("py100", 0);
   int old_zx = prefs.getInt("zx", ALIGN_BASE_ZX);
   int old_zy = prefs.getInt("zy", ALIGN_BASE_ZY);
@@ -1376,15 +1421,26 @@ void loadSettings() {
   stream_jpeg_quality = clampStreamJpegQuality(prefs.getUChar("jpgq", STREAM_JPEG_QUALITY_DEFAULT));
   manual_lo    = prefs.getFloat("mlo", 22.0f);
   manual_hi    = prefs.getFloat("mhi", 38.0f);
-  uint8_t pt   = prefs.getUChar("ptab", PANEL_TAB_PRESET);
+  bool has_panel_tab = prefs.isKey("ptab");
+  uint8_t pt   = prefs.getUChar("ptab", PANEL_TAB_TUNE);
   prefs.end();
   // Defensive clamps in case ranges have moved across firmware versions.
   align_distance_cm = clampDistanceCm(align_distance_cm);
   if (av < 1) {
-    align_offset_x100 = old_px100 - parallaxX100ForDistance(align_distance_cm);
-    align_offset_y100 = old_py100;
+    align_offset_x100 = old_px100 - baseParallaxX100ForDistance(align_distance_cm);
+    align_offset_y100 = old_py100 - baseParallaxY100();
     align_zoom_x_offset = old_zx - ALIGN_BASE_ZX;
     align_zoom_y_offset = old_zy - ALIGN_BASE_ZY;
+  } else if (av < ALIGN_SETTINGS_VERSION) {
+    if (abs(align_offset_x100 - ALIGN_BASE_PX100) <= 125 &&
+        abs(align_offset_y100 - ALIGN_BASE_PY100) <= 125 &&
+        abs(align_zoom_x_offset - 6) <= 1 &&
+        abs(align_zoom_y_offset - 4) <= 1) {
+      align_offset_x100 = 0;
+      align_offset_y100 = 0;
+      align_zoom_x_offset = 0;
+      align_zoom_y_offset = 0;
+    }
   }
   setAlignmentOffsets(align_offset_x100, align_offset_y100,
                       align_zoom_x_offset, align_zoom_y_offset, false);
@@ -1408,6 +1464,7 @@ void loadSettings() {
   display_mode = (m < MODE_COUNT)  ? (DisplayMode)m : MODE_TINT;
   if (rv < 2) {
     switch (r) {
+      case 1: r = RANGE_AUTO2; break;  // legacy AUT2
       case 2: r = RANGE_SKIN; break;   // legacy SKIN
       case 3: r = RANGE_SKIN; break;   // legacy BODY
       case 4: r = RANGE_HOT; break;    // legacy WARM
@@ -1416,9 +1473,36 @@ void loadSettings() {
       case 7: r = RANGE_MANUAL; break; // legacy MAN
       default: break;
     }
+  } else if (rv == 2) {
+    switch (r) {
+      case 1: r = RANGE_DETAIL; break;
+      case 2: r = RANGE_HOT; break;
+      case 3: r = RANGE_SKIN; break;
+      case 4: r = RANGE_PCB; break;
+      case 5: r = RANGE_HIGH; break;
+      case 6: r = RANGE_WIDE; break;
+      case 7: r = RANGE_COLD; break;
+      case 8: r = RANGE_MANUAL; break;
+      default: break;
+    }
+  } else if (rv == 3) {
+    switch (r) {
+      case 1: r = RANGE_DETAIL; break;
+      case 2: r = RANGE_AUTO2; break;
+      case 3: r = RANGE_HOT; break;
+      case 4: r = RANGE_SKIN; break;
+      case 5: r = RANGE_PCB; break;
+      case 6: r = RANGE_HIGH; break;
+      case 7: r = RANGE_WIDE; break;
+      case 8: r = RANGE_COLD; break;
+      case 9: r = RANGE_MANUAL; break;
+      default: break;
+    }
+  } else if (rv == 4 && r >= RANGE_INVERT) {
+    r++;
   }
   range_mode   = (r < RANGE_COUNT) ? (RangeMode)r   : RANGE_AUTO;
-  panel_tab    = (pt < PANEL_TAB_COUNT) ? (uint8_t)pt : (uint8_t)PANEL_TAB_PRESET;
+  panel_tab    = (has_panel_tab && pt < PANEL_TAB_COUNT) ? (uint8_t)pt : (uint8_t)PANEL_TAB_TUNE;
   brightness_apply_pending = true;        // push into sensor on first frame
   Serial.printf("Loaded: PX100=%+d,%+d Off=%+d,%+d Z=%d/%d%% Zoff=%+d/%+d Dist=%dcm Tint=%d%% Brt=%+d JPGQ=%u Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
                 parallax_x100, parallax_y100,
@@ -1443,13 +1527,13 @@ void saveSettings() {
   prefs.putInt  ("offy100", align_offset_y100);
   prefs.putInt  ("offzx", align_zoom_x_offset);
   prefs.putInt  ("offzy", align_zoom_y_offset);
-  prefs.putUChar("alv", 1);
+  prefs.putUChar("alv", ALIGN_SETTINGS_VERSION);
   prefs.putInt  ("apcm", align_distance_cm);
   prefs.putInt  ("dist", align_distance_cm);
   prefs.putUChar("tint", tint_pct);
   prefs.putUChar("mode", (uint8_t)display_mode);
   prefs.putUChar("rng",  (uint8_t)range_mode);
-  prefs.putUChar("rngv", 2);
+  prefs.putUChar("rngv", RANGE_SETTINGS_VERSION);
   prefs.putChar ("brt",  (int8_t)cam_brightness);
   prefs.putChar ("con",  (int8_t)cam_contrast);
   prefs.putChar ("sat",  (int8_t)cam_saturation);
@@ -1483,43 +1567,12 @@ void applyCameraBrightness() {
   s->set_saturation(s, (int)cam_saturation);
   s->set_sharpness(s, (int)cam_sharpness);
   s->set_denoise(s, (int)cam_denoise);
+  if (s->set_aec2) s->set_aec2(s, 1);
   s->set_lenc(s, cam_lenc ? 1 : 0);
   s->set_raw_gma(s, cam_raw_gma ? 1 : 0);
   Serial.printf("Cam regs: brt=%+d con=%+d sat=%+d sharp=%+d den=%d lenc=%d gma=%d\n",
                 cam_brightness, cam_contrast, cam_saturation, cam_sharpness,
                 cam_denoise, cam_lenc ? 1 : 0, cam_raw_gma ? 1 : 0);
-}
-
-// ---------------------------------------------------------- Battery ------
-// Reads via on-board voltage divider on a configurable ADC pin. The DFRobot
-// FireBeetle 2 ESP32-S3 doesn't have a documented battery sense pin in this
-// firmware's pin map (most ADCs are claimed by camera/LCD), so set this to
-// the GPIO you've wired your divider to. Leave at -1 to disable the readout.
-#define BATTERY_ADC_PIN -1            // e.g. 6 if you free up VSYNC, or wire externally
-#define BATTERY_DIVIDER 2.0f          // (R_top + R_bot)/R_bot, typical 1:1 divider
-#define BATTERY_VREF    3.3f
-#define BATTERY_VMIN    3.30f         // 0%, protect under-voltage cutoff
-#define BATTERY_VMAX    4.20f         // 100%, full charge
-
-float    battery_v   = 0.0f;
-int      battery_pct = -1;            // -1 = "no reading yet"
-uint32_t last_bat_ms = 0;
-
-void readBattery() {
-#if BATTERY_ADC_PIN >= 0
-  // Average a few samples; ESP32-S3 ADC has noticeable jitter.
-  uint32_t sum = 0;
-  for (int i = 0; i < 8; i++) sum += analogRead(BATTERY_ADC_PIN);
-  float v_adc = (sum / 8.0f) / 4095.0f * BATTERY_VREF;
-  battery_v = v_adc * BATTERY_DIVIDER;
-  int pct = (int)((battery_v - BATTERY_VMIN) * 100.0f / (BATTERY_VMAX - BATTERY_VMIN));
-  if (pct < 0) pct = 0;
-  if (pct > 100) pct = 100;
-  battery_pct = pct;
-#else
-  // Pin unset; leave battery_pct at -1 so the UI hides the indicator.
-  battery_pct = -1;
-#endif
 }
 
 void getThermalRange(float &lo, float &hi) {
@@ -1531,8 +1584,10 @@ void getThermalRange(float &lo, float &hi) {
     lo = ml; hi = mh;
     return;
   }
-  // AUTO/DET/HOT pipe through analyzeMLX -> IIR-smoothed t_range_min/max.
-  if (range_mode == RANGE_AUTO || range_mode == RANGE_DETAIL || range_mode == RANGE_HOT) {
+  // AUTO-like modes pipe through analyzeMLX -> IIR-smoothed t_range_min/max.
+  if (range_mode == RANGE_AUTO || range_mode == RANGE_INVERT ||
+      range_mode == RANGE_AUTO2 || range_mode == RANGE_AUTO3 ||
+      range_mode == RANGE_DETAIL || range_mode == RANGE_HOT) {
     portENTER_CRITICAL(&mlx_mux);
     lo = t_range_min; hi = t_range_max;
     portEXIT_CRITICAL(&mlx_mux);
@@ -1613,15 +1668,11 @@ struct TouchButton {
   void (*action)();
 };
 
-bool adjust_unlocked = false;
-uint32_t adjust_unlock_until_ms = 0;
-static constexpr uint32_t ADJUST_UNLOCK_MS = 12000;
-
 bool shouldThrottleMLXForScreenCameraOnly() {
   return display_mode == MODE_CAMERA_ONLY &&
          !stream_mode &&
          !freeze_mode &&
-         !adjust_unlocked;
+         panel_tab != PANEL_TAB_ADVANCED;
 }
 
 static int PANEL_X = 348;
@@ -1637,20 +1688,24 @@ static constexpr float MANUAL_NUDGE_C = 0.1f;
 static constexpr int ALIGN_OFFSET_UI_MAX100 = 4000; // +/- 40 px
 static constexpr int ALIGN_OFFSET_NUDGE100 = 25;    // 0.25 px
 static constexpr int ALIGN_ZOOM_NUDGE_PCT = 1;
-static int TAB_ROW_Y     = 58;       // tabs sit between top buttons and X slider
-static int TAB_ROW_H     = 22;
-static int X_SLIDER_Y    = 94;
-static int Y_SLIDER_Y    = 136;
-static int Z_SLIDER_Y    = 178;
-static int TINT_SLIDER_Y = 232;
-// RANGE tab reuses X/Y slider rows for LO/HI and clears the third slot.
+static int ACTION_ROW_Y  = 286;
+static int ACTION_ROW_H  = 30;
+static int TAB_ROW_Y     = 8;
+static int TAB_ROW_H     = 28;
+static int TAB_COL_W     = 62;
+static int X_SLIDER_Y    = 126;
+static int Y_SLIDER_Y    = 168;
+static int Z_SLIDER_Y    = 210;
+static int TINT_SLIDER_Y = 126;
+static int ADV_X_Y       = 118;
+static int ADV_Y_Y       = 148;
+static int ADV_ZX_Y      = 178;
+static int ADV_ZY_Y      = 208;
+static int ADV_BRT_Y     = 238;
+static int ADV_RESET_Y   = 262;
 
-void btnToggleAdjust() {
-  adjust_unlocked = !adjust_unlocked;
-  adjust_unlock_until_ms = adjust_unlocked ? millis() + ADJUST_UNLOCK_MS : 0;
-}
 void btnCycleMode()  { display_mode = (DisplayMode)((display_mode + 1) % MODE_COUNT);  markDirty(); }
-void btnReset()      { if (adjust_unlocked) resetAlignmentCalibrated(true); }
+void btnReset()      { resetAlignmentCalibrated(true); }
 void btnCycleRange() {
   range_mode = (RangeMode)((range_mode + 1) % RANGE_COUNT);
   // Entering MANUAL opens the LO/HI controls.
@@ -1660,6 +1715,7 @@ void btnCycleRange() {
 void btnTabPreset() { panel_tab = PANEL_TAB_PRESET; markDirty(); }
 void btnTabAdvanced() { panel_tab = PANEL_TAB_ADVANCED; markDirty(); }
 void btnTabRange() { panel_tab = PANEL_TAB_RANGE; markDirty(); }
+void btnTabTune() { panel_tab = PANEL_TAB_TUNE; markDirty(); }
 
 void drawStaticUI();
 void layoutUi();
@@ -1669,58 +1725,50 @@ void redrawFullUi() {
   drawStaticUI();
 }
 
-// Tab-button widths split the panel into compact equal controls.
-static int TAB_W = 62;
-static int SLIDER_X = 352;
-static int SLIDER_Y = 232;
-static int SLIDER_W = 120;
-static int SLIDER_H = 20;
-static int BRT_BAR_X     = 46;
-static int BRT_BAR_Y     = 290;
-static int BRT_CELL_W    = 50;
-static int BRT_CELL_H    = 24;
 static constexpr int BRT_NUM_CELLS = 5;
-static int BRT_CLEAR_X   = 40;
-static int BRT_CLEAR_R   = 336;
 static int PALETTE_X = 5;
-static int PALETTE_Y_TOP = 24;
-static int PALETTE_Y_BOTTOM = 280;
+static int PALETTE_Y_TOP = 70;
+static int PALETTE_Y_BOTTOM = 260;
 static int PALETTE_W = 12;
-static int TMAX_LABEL_X = 2;
-static int TMAX_LABEL_Y = 10;
-static int TMIN_LABEL_X = 2;
-static int TMIN_LABEL_Y = 290;
-static int TOPBAR_CLEAR_X = 40;
-static int TOPBAR_CLEAR_W = 440;
-static int TB_TMAX  =   2;
-static int TB_CTR   =  44;
-static int TB_FPS   = 116;
-static int TB_ZOOM  = 162;
-static int TB_PARA  = 200;
-static int TB_MODE  = 256;
-static int TB_MODE_W = 42;
-static int TB_RNG   = 302;
-static int TB_RNG_W = 36;
-static int TB_STAT  = 342;
-static int TB_STAT_W = 24;
-static int TB_BAT   = 412;
-static int READOUT_X = 378;
-static int READOUT_Y = 158;
-static int READOUT_W = 98;
-static int READOUT_H = 10;
+static int STATUS_BADGE_X = 1;
+static int STATUS_MODE_Y = 3;
+static int STATUS_RANGE_Y = 22;
+static int STATUS_BADGE_W = 58;
+static int STATUS_BADGE_H = 16;
+static int STATUS_EVENT_X = 1;
+static int STATUS_EVENT_Y = 42;
+static int STATUS_EVENT_W = 22;
+static int STATUS_EVENT_H = 14;
+static int TEMP_CLEAR_X = 70;
+static int TEMP_CLEAR_Y = 0;
+static int TEMP_CLEAR_W = 270;
+static int TEMP_CLEAR_H = 36;
+static int FPS_X = 1;
+static int FPS_Y = 304;
+static int FPS_W = 78;
+static int FPS_H = 12;
 
 TouchButton buttons[] = {
-  {0, 0, 0, 0, "ADJ",  TFT_DARKCYAN,  btnToggleAdjust },
-  {0, 0, 0, 0, "MODE", TFT_DARKGREEN, btnCycleMode    },
-  {0, 0, 0, 0, "RNG",  TFT_PURPLE,    btnCycleRange   },
-  // Tab row.
-  {0, 0, 0, 0, "DIST", TFT_DARKGREY, btnTabPreset },
-  {0, 0, 0, 0, "ADV", TFT_DARKGREY, btnTabAdvanced },
-  {0, 0, 0, 0, "RNG", TFT_DARKGREY, btnTabRange },
-  // Reset.
-  {0, 0, 0, 0, "RST", TFT_MAROON, btnReset        },
+  {0, 0, 0, 0, "VIEW",  TFT_DARKGREEN, btnCycleMode    },
+  {0, 0, 0, 0, "RANGE", TFT_PURPLE,    btnCycleRange   },
+  {0, 0, 0, 0, "ALIGN", TFT_DARKGREY,  btnTabPreset    },
+  {0, 0, 0, 0, "TUNE",  TFT_DARKGREY,  btnTabTune      },
+  {0, 0, 0, 0, "MAN",   TFT_DARKGREY,  btnTabRange     },
+  {0, 0, 0, 0, "ADV",   TFT_DARKGREY,  btnTabAdvanced  },
 };
 const int NUM_BUTTONS = sizeof(buttons) / sizeof(buttons[0]);
+
+uint16_t rangeButtonColor() {
+  switch (range_mode) {
+    case RANGE_INVERT:
+    case RANGE_AUTO3:
+    case RANGE_COLD: return TFT_BLUE;
+    case RANGE_AUTO2:
+    case RANGE_HOT:  return TFT_DARKGREEN;
+    case RANGE_MANUAL: return TFT_MAROON;
+    default: return TFT_PURPLE;
+  }
+}
 
 void layoutUi() {
   IMG_X = 24;
@@ -1730,96 +1778,87 @@ void layoutUi() {
   PANEL_SLIDER_X = PANEL_X + 4;
   PANEL_SLIDER_W = PANEL_W - 8;
   PANEL_SLIDER_H = 20;
-  TAB_ROW_Y = 58;
-  TAB_ROW_H = 22;
-  X_SLIDER_Y = 94;
-  Y_SLIDER_Y = 136;
-  Z_SLIDER_Y = 178;
-  TINT_SLIDER_Y = 232;
-  TAB_W = (PANEL_W - 8) / 3;
-  SLIDER_X = PANEL_SLIDER_X;
-  SLIDER_Y = TINT_SLIDER_Y;
-  SLIDER_W = PANEL_SLIDER_W;
-  SLIDER_H = PANEL_SLIDER_H;
-  BRT_BAR_X = 46;
-  BRT_BAR_Y = 290;
-  BRT_CELL_W = 50;
-  BRT_CELL_H = 24;
-  BRT_CLEAR_X = 40;
-  BRT_CLEAR_R = BRT_BAR_X + BRT_NUM_CELLS * BRT_CELL_W + 40;
+  ACTION_ROW_Y = 286;
+  ACTION_ROW_H = 30;
+  TAB_ROW_Y = 8;
+  TAB_ROW_H = 28;
+  TAB_COL_W = (PANEL_W - 4) / 2;
+  X_SLIDER_Y = 126;
+  Y_SLIDER_Y = 168;
+  Z_SLIDER_Y = 210;
+  TINT_SLIDER_Y = 126;
+  ADV_X_Y = 118;
+  ADV_Y_Y = 148;
+  ADV_ZX_Y = 178;
+  ADV_ZY_Y = 208;
+  ADV_BRT_Y = 238;
+  ADV_RESET_Y = 262;
   PALETTE_X = 5;
-  PALETTE_Y_TOP = 24;
-  PALETTE_Y_BOTTOM = 280;
+  PALETTE_Y_TOP = 70;
+  PALETTE_Y_BOTTOM = 260;
   PALETTE_W = 12;
-  TMAX_LABEL_X = 2;
-  TMAX_LABEL_Y = 10;
-  TMIN_LABEL_X = 2;
-  TMIN_LABEL_Y = 290;
-  TOPBAR_CLEAR_X = 40;
-  TOPBAR_CLEAR_W = 440;
-  TB_TMAX = 2;
-  TB_CTR = 44;
-  TB_FPS = 116;
-  TB_ZOOM = 162;
-  TB_PARA = 200;
-  TB_MODE = 256;
-  TB_MODE_W = 42;
-  TB_RNG = 302;
-  TB_RNG_W = 36;
-  TB_STAT = 342;
-  TB_STAT_W = 24;
-  TB_BAT = 412;
-  READOUT_X = 378;
-  READOUT_Y = 158;
-  READOUT_W = 98;
-  READOUT_H = 10;
+  STATUS_BADGE_X = 1;
+  STATUS_MODE_Y = 3;
+  STATUS_RANGE_Y = 22;
+  STATUS_BADGE_W = 58;
+  STATUS_BADGE_H = 16;
+  STATUS_EVENT_X = 1;
+  STATUS_EVENT_Y = 42;
+  STATUS_EVENT_W = 22;
+  STATUS_EVENT_H = 14;
+  TEMP_CLEAR_X = 70;
+  TEMP_CLEAR_Y = 0;
+  TEMP_CLEAR_W = 270;
+  TEMP_CLEAR_H = 36;
+  FPS_X = 1;
+  FPS_Y = 304;
+  FPS_W = 78;
+  FPS_H = 12;
 
-  const int gap = 3;
-  int bw = (PANEL_W - gap * 2) / 3;
-  for (int i = 0; i < 3; i++) {
-    buttons[i].x = PANEL_X + i * (bw + gap);
-    buttons[i].y = 22;
-    buttons[i].w = bw;
-    buttons[i].h = 28;
+  const int gap = 4;
+  const int action_gap = 6;
+  const int action_x = FPS_X + FPS_W + 6;
+  int action_w = (PANEL_X - action_x - action_gap - 4) / 2;
+  for (int i = 0; i < 2; i++) {
+    buttons[i].x = action_x + i * (action_w + action_gap);
+    buttons[i].y = ACTION_ROW_Y;
+    buttons[i].w = action_w;
+    buttons[i].h = ACTION_ROW_H;
   }
-  for (int i = 0; i < 3; i++) {
-    buttons[3 + i].x = PANEL_X + i * (TAB_W + 4);
-    buttons[3 + i].y = TAB_ROW_Y;
-    buttons[3 + i].w = TAB_W;
-    buttons[3 + i].h = TAB_ROW_H;
+  for (int i = 0; i < 4; i++) {
+    int row = i / 2;
+    int col = i % 2;
+    buttons[2 + i].x = PANEL_X + col * (TAB_COL_W + gap);
+    buttons[2 + i].y = TAB_ROW_Y + row * (TAB_ROW_H + 4);
+    buttons[2 + i].w = TAB_COL_W;
+    buttons[2 + i].h = TAB_ROW_H;
   }
-  buttons[6].x = PANEL_X;
-  buttons[6].y = 286;
-  buttons[6].w = PANEL_W;
-  buttons[6].h = 30;
 }
 
 void drawButtons() {
   for (int i = 0; i < NUM_BUTTONS; i++) {
     auto &b = buttons[i];
-    // Background: ADJ flips between green (unlocked) and dark-cyan (locked).
-    // Tab buttons highlight blue when active. Everything else keeps its
-    // assigned color regardless of state. Previously RST went TFT_DARKGREY
-    // when locked, which rendered as nearly-black on this panel and made
-    // the button look invisible; now it stays maroon and we indicate
-    // "locked" with a dim text/outline instead.
     uint16_t bg = b.color;
-    if (b.action == btnToggleAdjust) bg = adjust_unlocked ? TFT_GREEN : TFT_DARKCYAN;
+    const char *label = b.label;
+    if (b.action == btnCycleMode) bg = MODE_BG[display_mode];
+    if (b.action == btnCycleRange) bg = rangeButtonColor();
+    if (b.action == btnCycleMode) label = MODE_NAMES[display_mode];
+    if (b.action == btnCycleRange) label = RANGE_NAMES[range_mode];
     bool tab_active = (b.action == btnTabPreset && panel_tab == PANEL_TAB_PRESET) ||
                       (b.action == btnTabAdvanced && panel_tab == PANEL_TAB_ADVANCED) ||
-                      (b.action == btnTabRange && panel_tab == PANEL_TAB_RANGE);
-    if (b.action == btnTabPreset || b.action == btnTabAdvanced || b.action == btnTabRange) {
+                      (b.action == btnTabRange && panel_tab == PANEL_TAB_RANGE) ||
+                      (b.action == btnTabTune && panel_tab == PANEL_TAB_TUNE);
+    if (b.action == btnTabPreset || b.action == btnTabAdvanced ||
+        b.action == btnTabRange || b.action == btnTabTune) {
       bg = tab_active ? TFT_BLUE : TFT_DARKGREY;
     }
-    bool dim = (b.action == btnReset && !adjust_unlocked);
-    uint16_t outline = dim ? TFT_LIGHTGREY : TFT_WHITE;
-    uint16_t fg = dim ? TFT_LIGHTGREY : TFT_WHITE;
+    uint16_t fg = (b.action == btnCycleMode && display_mode == MODE_TINT) ? TFT_BLACK : TFT_WHITE;
     lcd.fillRoundRect(b.x, b.y, b.w, b.h, 4, bg);
-    lcd.drawRoundRect(b.x, b.y, b.w, b.h, 4, outline);
+    lcd.drawRoundRect(b.x, b.y, b.w, b.h, 4, TFT_WHITE);
     lcd.setTextColor(fg, bg);
     lcd.setTextSize(1);
-    lcd.setCursor(b.x + (b.w - (int)strlen(b.label) * 6) / 2, b.y + (b.h - 8) / 2);
-    lcd.print(b.label);
+    lcd.setCursor(b.x + (b.w - (int)strlen(label) * 6) / 2, b.y + (b.h - 8) / 2);
+    lcd.print(label);
   }
 }
 
@@ -1893,11 +1932,34 @@ void drawHSlider(int x, int y, int w, int h, int pct,
   lcd.fillRect(knob_x - 2, y - 2, 5, h + 4, enabled ? TFT_WHITE : TFT_LIGHTGREY);
 }
 
-void drawSlider() {
-  char buf[12];
-  snprintf(buf, sizeof(buf), "%d%%", tint_pct);
-  drawHSlider(SLIDER_X, SLIDER_Y, SLIDER_W, SLIDER_H,
-              tint_pct, "TINT", buf, TFT_CYAN, true, "-", "+");
+static inline bool compactSliderRowHit(uint16_t tx, uint16_t ty,
+                                       int x, int y, int w, int h) {
+  return tx >= x && tx < x + w && ty >= y - 8 && ty < y + h + 4;
+}
+
+void drawCompactSlider(int x, int y, int w, int h, int pct,
+                       const char *label, const char *value,
+                       uint16_t fill, bool enabled) {
+  if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+  uint16_t bg = enabled ? TFT_DARKGREY : 0x4208;
+  uint16_t fg = enabled ? TFT_WHITE : TFT_LIGHTGREY;
+  int track_x = sliderTrackX(x);
+  int track_w = sliderTrackW(w);
+  lcd.fillRect(x, y - 9, w, h + 13, TFT_BLACK);
+  lcd.setTextSize(1);
+  lcd.setTextColor(fg, TFT_BLACK);
+  lcd.setCursor(x, y - 8); lcd.print(label);
+  int tw = (int)strlen(value) * 6;
+  lcd.setCursor(x + w - tw, y - 8); lcd.print(value);
+  drawNudgeButton(x, y, PANEL_NUDGE_W, h, "-", enabled);
+  drawNudgeButton(x + w - PANEL_NUDGE_W, y, PANEL_NUDGE_W, h, "+", enabled);
+  lcd.fillRect(track_x, y, track_w, h, bg);
+  lcd.drawRect(track_x, y, track_w, h, TFT_WHITE);
+  int fill_w = (pct * (track_w - 4)) / 100;
+  if (fill_w > 0) lcd.fillRect(track_x + 2, y + 2, fill_w, h - 4, enabled ? fill : TFT_DARKGREY);
+  int knob_x = track_x + 2 + fill_w;
+  if (knob_x > track_x + track_w - 4) knob_x = track_x + track_w - 4;
+  lcd.fillRect(knob_x - 2, y - 2, 5, h + 4, enabled ? TFT_WHITE : TFT_LIGHTGREY);
 }
 
 // Convert a manual_lo/hi temperature in [MANUAL_T_MIN..MANUAL_T_MAX] into the
@@ -1928,15 +1990,17 @@ void setManualHiValue(float t) {
   }
 }
 
+void clearPanelContent() {
+  lcd.fillRect(PANEL_X, 104, PANEL_W, 216, TFT_BLACK);
+}
+
 void drawPresetPanel() {
-  bool enabled = adjust_unlocked;
   char buf[24];
   snprintf(buf, sizeof(buf), "%dcm", align_distance_cm);
   int pct = (align_distance_cm - ALIGN_MIN_CM) * 100 / (ALIGN_MAX_CM - ALIGN_MIN_CM);
-  lcd.fillRect(PANEL_SLIDER_X, X_SLIDER_Y - 13,
-               PANEL_SLIDER_W, 146, TFT_BLACK);
+  clearPanelContent();
   drawHSlider(PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-              pct, "DIST", buf, TFT_GREEN, enabled, "-5", "+5");
+              pct, "DIST", buf, TFT_GREEN, true, "-5", "+5");
 
   int chip_gap = 3;
   int chip_w = (PANEL_SLIDER_W - chip_gap * 2) / 3;
@@ -1950,28 +2014,25 @@ void drawPresetPanel() {
     int y = chip_y + row * (chip_h + 4);
     bool active = align_distance_cm == ALIGN_PRESETS[i].cm;
     uint16_t bg = active ? TFT_DARKGREEN : TFT_DARKGREY;
-    uint16_t fg = enabled ? TFT_WHITE : TFT_LIGHTGREY;
     lcd.fillRoundRect(x, y, chip_w, chip_h, 4, bg);
     lcd.drawRoundRect(x, y, chip_w, chip_h, 4, TFT_WHITE);
     snprintf(buf, sizeof(buf), "%d", ALIGN_PRESETS[i].cm);
-    lcd.setTextColor(fg, bg);
+    lcd.setTextColor(TFT_WHITE, bg);
     lcd.setTextSize(1);
     lcd.setCursor(x + (chip_w - (int)strlen(buf) * 6) / 2, y + 5);
     lcd.print(buf);
   }
 
   lcd.setTextSize(1);
-  lcd.setTextColor(enabled ? TFT_WHITE : TFT_LIGHTGREY, TFT_BLACK);
-  lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y - 4);
-  lcd.print("Valid at distance");
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y);
+  lcd.print("Plane-specific");
   snprintf(buf, sizeof(buf), "X %+.2fpx", parallax_x100 / 100.0f);
-  lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y + 10);
+  lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y + 14);
   lcd.print(buf);
   snprintf(buf, sizeof(buf), "ZX/Y %d/%d%%", zoom_x_pct, zoom_y_pct);
-  lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y + 24);
+  lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y + 28);
   lcd.print(buf);
-  lcd.setCursor(PANEL_SLIDER_X, TINT_SLIDER_Y - 16);
-  lcd.print("Unlock ADJ to change.");
 }
 
 static inline int offset100ToPct(int v) {
@@ -1997,86 +2058,110 @@ static inline int pctToZoomOffset(int pct) {
          pct * (ALIGN_ZOOM_OFFSET_MAX - ALIGN_ZOOM_OFFSET_MIN) / 100;
 }
 
+void drawPanelBrightness() {
+  char buf[8];
+  const int gap = 2;
+  const int h = 18;
+  int cell_w = (PANEL_SLIDER_W - gap * (BRT_NUM_CELLS - 1)) / BRT_NUM_CELLS;
+  lcd.fillRect(PANEL_SLIDER_X, ADV_BRT_Y - 10, PANEL_SLIDER_W, h + 12, TFT_BLACK);
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setCursor(PANEL_SLIDER_X, ADV_BRT_Y - 9);
+  lcd.print("BRT");
+  snprintf(buf, sizeof(buf), "%+d", cam_brightness);
+  lcd.setCursor(PANEL_SLIDER_X + PANEL_SLIDER_W - (int)strlen(buf) * 6, ADV_BRT_Y - 9);
+  lcd.print(buf);
+  for (int i = 0; i < BRT_NUM_CELLS; i++) {
+    int v = i - 2;
+    int x = PANEL_SLIDER_X + i * (cell_w + gap);
+    bool on = (v == cam_brightness);
+    uint16_t bg = on ? TFT_CYAN : TFT_DARKGREY;
+    uint16_t fg = on ? TFT_BLACK : TFT_WHITE;
+    lcd.fillRoundRect(x, ADV_BRT_Y, cell_w, h, 3, bg);
+    lcd.drawRoundRect(x, ADV_BRT_Y, cell_w, h, 3, TFT_WHITE);
+    snprintf(buf, sizeof(buf), "%+d", v);
+    lcd.setTextColor(fg, bg);
+    lcd.setCursor(x + (cell_w - (int)strlen(buf) * 6) / 2, ADV_BRT_Y + 5);
+    lcd.print(buf);
+  }
+}
+
+void drawAdvancedResetButton() {
+  const int h = 28;
+  lcd.fillRoundRect(PANEL_X, ADV_RESET_Y, PANEL_W, h, 4, TFT_MAROON);
+  lcd.drawRoundRect(PANEL_X, ADV_RESET_Y, PANEL_W, h, 4, TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_WHITE, TFT_MAROON);
+  const char *label = "RESET ALIGN";
+  lcd.setCursor(PANEL_X + (PANEL_W - (int)strlen(label) * 6) / 2, ADV_RESET_Y + 10);
+  lcd.print(label);
+}
+
 void drawAdvancedAlignmentPanel() {
-  bool enabled = adjust_unlocked;
   char buf[18];
-  lcd.fillRect(PANEL_SLIDER_X, X_SLIDER_Y - 13,
-               PANEL_SLIDER_W, 172, TFT_BLACK);
+  clearPanelContent();
   snprintf(buf, sizeof(buf), "%+.2fpx", align_offset_x100 / 100.0f);
-  drawHSlider(PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-              offset100ToPct(align_offset_x100), "X OFF", buf, TFT_CYAN, enabled, "-", "+");
+  drawCompactSlider(PANEL_SLIDER_X, ADV_X_Y, PANEL_SLIDER_W, 16,
+                    offset100ToPct(align_offset_x100), "X OFF", buf, TFT_CYAN, true);
   snprintf(buf, sizeof(buf), "%+.2fpx", align_offset_y100 / 100.0f);
-  drawHSlider(PANEL_SLIDER_X, Y_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-              offset100ToPct(align_offset_y100), "Y OFF", buf, TFT_CYAN, enabled, "-", "+");
+  drawCompactSlider(PANEL_SLIDER_X, ADV_Y_Y, PANEL_SLIDER_W, 16,
+                    offset100ToPct(align_offset_y100), "Y OFF", buf, TFT_CYAN, true);
   snprintf(buf, sizeof(buf), "%+d%%", align_zoom_x_offset);
-  drawHSlider(PANEL_SLIDER_X, Z_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-              zoomOffsetToPct(align_zoom_x_offset), "ZX OFF", buf, TFT_GREEN, enabled, "-", "+");
+  drawCompactSlider(PANEL_SLIDER_X, ADV_ZX_Y, PANEL_SLIDER_W, 16,
+                    zoomOffsetToPct(align_zoom_x_offset), "ZX OFF", buf, TFT_GREEN, true);
   snprintf(buf, sizeof(buf), "%+d%%", align_zoom_y_offset);
-  drawHSlider(PANEL_SLIDER_X, TINT_SLIDER_Y - 2, PANEL_SLIDER_W, PANEL_SLIDER_H,
-              zoomOffsetToPct(align_zoom_y_offset), "ZY OFF", buf, TFT_GREEN, enabled, "-", "+");
+  drawCompactSlider(PANEL_SLIDER_X, ADV_ZY_Y, PANEL_SLIDER_W, 16,
+                    zoomOffsetToPct(align_zoom_y_offset), "ZY OFF", buf, TFT_GREEN, true);
+  drawPanelBrightness();
+  drawAdvancedResetButton();
+}
+
+void drawTunePanel() {
+  char buf[18];
+  clearPanelContent();
+  snprintf(buf, sizeof(buf), "%d%%", tint_pct);
+  drawHSlider(PANEL_SLIDER_X, TINT_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
+              tint_pct, "TINT", buf, TFT_CYAN, true, "-", "+");
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  lcd.setCursor(PANEL_SLIDER_X, Y_SLIDER_Y);
+  lcd.print("BRT is in ADV");
+  lcd.setCursor(PANEL_SLIDER_X, Y_SLIDER_Y + 14);
+  lcd.print("VIEW/RANGE");
+  lcd.setCursor(PANEL_SLIDER_X, Y_SLIDER_Y + 28);
+  lcd.print("change modes");
+}
+
+void drawRangePanel() {
+  char buf[18];
+  bool enabled = (range_mode == RANGE_MANUAL);
+  clearPanelContent();
+  snprintf(buf, sizeof(buf), "%.1fC", manual_lo);
+  drawHSlider(PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
+              manualTempToPct(manual_lo), "LO", buf, TFT_BLUE, enabled, "-", "+");
+  snprintf(buf, sizeof(buf), "%.1fC", manual_hi);
+  drawHSlider(PANEL_SLIDER_X, Y_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
+              manualTempToPct(manual_hi), "HI", buf, TFT_RED, enabled, "-", "+");
+  if (!enabled) {
+    lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    lcd.setTextSize(1);
+    lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y);
+    lcd.print("Use RANGE until");
+    lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y + 14);
+    lcd.print("MAN is active.");
+  }
 }
 
 void drawAdjustSliders() {
-  char buf[18];
   if (panel_tab == PANEL_TAB_PRESET) {
     drawPresetPanel();
   } else if (panel_tab == PANEL_TAB_ADVANCED) {
     drawAdvancedAlignmentPanel();
+  } else if (panel_tab == PANEL_TAB_TUNE) {
+    drawTunePanel();
   } else {
-    // Manual range sliders; values are previewed even outside MAN mode.
-    bool enabled = (range_mode == RANGE_MANUAL);
-    lcd.fillRect(PANEL_SLIDER_X, X_SLIDER_Y - 13,
-                 PANEL_SLIDER_W, 172, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "%.1fC", manual_lo);
-    drawHSlider(PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-                manualTempToPct(manual_lo), "LO", buf, TFT_BLUE, enabled, "-", "+");
-
-    snprintf(buf, sizeof(buf), "%.1fC", manual_hi);
-    drawHSlider(PANEL_SLIDER_X, Y_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H,
-                manualTempToPct(manual_hi), "HI", buf, TFT_RED, enabled, "-", "+");
-
-    // Clear the inactive third slider slot.
-    lcd.fillRect(PANEL_SLIDER_X, Z_SLIDER_Y - 13,
-                 PANEL_SLIDER_W, PANEL_SLIDER_H + 17, TFT_BLACK);
-    if (!enabled) {
-      lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      lcd.setTextSize(1);
-      lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y);
-      lcd.print("Cycle to MAN");
-      lcd.setCursor(PANEL_SLIDER_X, Z_SLIDER_Y + 10);
-      lcd.print("to drag.");
-    }
+    drawRangePanel();
   }
-}
-
-void drawBrightnessSlider() {
-  // Clear only the brightness band; leave x<40 alone (that's where the
-  // side-palette t_min label lives) and stop before the bottom-right reset
-  // button.
-  lcd.fillRect(BRT_CLEAR_X, BRT_BAR_Y - 4,
-               BRT_CLEAR_R - BRT_CLEAR_X, BRT_CELL_H + 8, TFT_BLACK);
-  lcd.setTextSize(1);
-
-  for (int i = 0; i < BRT_NUM_CELLS; i++) {
-    int v   = i - 2;                                  // -2..+2
-    int x   = BRT_BAR_X + i * BRT_CELL_W;
-    bool on = (v == cam_brightness);
-    uint16_t bg = on ? TFT_CYAN     : TFT_DARKGREY;
-    uint16_t fg = on ? TFT_BLACK    : TFT_WHITE;
-    lcd.fillRect(x, BRT_BAR_Y, BRT_CELL_W - 4, BRT_CELL_H, bg);
-    lcd.drawRect(x, BRT_BAR_Y, BRT_CELL_W - 4, BRT_CELL_H, TFT_WHITE);
-    lcd.setTextColor(fg, bg);
-    char lbl[5];
-    snprintf(lbl, sizeof(lbl), "%+d", v);
-    lcd.setCursor(x + (BRT_CELL_W - 4)/2 - 6, BRT_BAR_Y + BRT_CELL_H/2 - 4);
-    lcd.print(lbl);
-  }
-  // "BRT" label to the RIGHT of the cells, so it doesn't collide with the
-  // side-palette t_min readout on the left.
-  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  lcd.setCursor(BRT_BAR_X + BRT_NUM_CELLS * BRT_CELL_W + 4,
-                BRT_BAR_Y + BRT_CELL_H/2 - 4);
-  lcd.print("BRT");
 }
 
 uint32_t last_touch_ms = 0;
@@ -2093,7 +2178,6 @@ bool nudgeReady(uint32_t now) {
 }
 
 bool handlePresetTouch(uint16_t tx, uint16_t ty) {
-  if (!adjust_unlocked) return false;
   int chip_gap = 3;
   int chip_w = (PANEL_SLIDER_W - chip_gap * 2) / 3;
   int chip_h = 18;
@@ -2126,15 +2210,62 @@ bool handlePresetTouch(uint16_t tx, uint16_t ty) {
   return true;
 }
 
+bool handleTuneTouch(uint16_t tx, uint16_t ty) {
+  if (!sliderRowHit(tx, ty, PANEL_SLIDER_X, TINT_SLIDER_Y,
+                    PANEL_SLIDER_W, PANEL_SLIDER_H)) {
+    return false;
+  }
+  int dir = sliderNudgeDir(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
+  if (dir) {
+    if (nudgeReady(millis())) {
+      setDirtyU8(tint_pct, (uint8_t)constrain((int)tint_pct + dir * TINT_NUDGE_PCT, 0, 100));
+      drawAdjustSliders();
+    }
+    return true;
+  }
+  if (sliderTrackHit(tx, PANEL_SLIDER_X, PANEL_SLIDER_W)) {
+    setDirtyU8(tint_pct, (uint8_t)sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W));
+    drawAdjustSliders();
+    return true;
+  }
+  return false;
+}
+
 bool handleAdvancedAlignmentTouch(uint16_t tx, uint16_t ty) {
-  if (!adjust_unlocked) return false;
+  if (tx >= PANEL_X && tx < PANEL_X + PANEL_W &&
+      ty >= ADV_RESET_Y && ty < ADV_RESET_Y + 28) {
+    btnReset();
+    drawButtons();
+    drawAdjustSliders();
+    return true;
+  }
+
+  if (ty >= ADV_BRT_Y && ty < ADV_BRT_Y + 18 &&
+      tx >= PANEL_SLIDER_X && tx < PANEL_SLIDER_X + PANEL_SLIDER_W) {
+    const int gap = 2;
+    int cell_w = (PANEL_SLIDER_W - gap * (BRT_NUM_CELLS - 1)) / BRT_NUM_CELLS;
+    for (int i = 0; i < BRT_NUM_CELLS; i++) {
+      int x = PANEL_SLIDER_X + i * (cell_w + gap);
+      if (tx >= x && tx < x + cell_w) {
+        int8_t new_brt = (int8_t)(i - 2);
+        if (new_brt != cam_brightness) {
+          cam_brightness = new_brt;
+          brightness_apply_pending = true;
+          markDirty();
+        }
+        drawAdjustSliders();
+        return true;
+      }
+    }
+  }
+
   if (tx < PANEL_SLIDER_X || tx >= PANEL_SLIDER_X + PANEL_SLIDER_W) return false;
 
   uint32_t now = millis();
   int dir = sliderNudgeDir(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
   bool track_hit = sliderTrackHit(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
 
-  if (sliderRowHit(tx, ty, PANEL_SLIDER_X, X_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H)) {
+  if (compactSliderRowHit(tx, ty, PANEL_SLIDER_X, ADV_X_Y, PANEL_SLIDER_W, 16)) {
     int v = align_offset_x100;
     if (dir && nudgeReady(now)) v += dir * ALIGN_OFFSET_NUDGE100;
     else if (track_hit) v = pctToOffset100(sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W));
@@ -2143,7 +2274,7 @@ bool handleAdvancedAlignmentTouch(uint16_t tx, uint16_t ty) {
     drawAdjustSliders();
     return true;
   }
-  if (sliderRowHit(tx, ty, PANEL_SLIDER_X, Y_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H)) {
+  if (compactSliderRowHit(tx, ty, PANEL_SLIDER_X, ADV_Y_Y, PANEL_SLIDER_W, 16)) {
     int v = align_offset_y100;
     if (dir && nudgeReady(now)) v += dir * ALIGN_OFFSET_NUDGE100;
     else if (track_hit) v = pctToOffset100(sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W));
@@ -2152,7 +2283,7 @@ bool handleAdvancedAlignmentTouch(uint16_t tx, uint16_t ty) {
     drawAdjustSliders();
     return true;
   }
-  if (sliderRowHit(tx, ty, PANEL_SLIDER_X, Z_SLIDER_Y, PANEL_SLIDER_W, PANEL_SLIDER_H)) {
+  if (compactSliderRowHit(tx, ty, PANEL_SLIDER_X, ADV_ZX_Y, PANEL_SLIDER_W, 16)) {
     int v = align_zoom_x_offset;
     if (dir && nudgeReady(now)) v += dir * ALIGN_ZOOM_NUDGE_PCT;
     else if (track_hit) v = pctToZoomOffset(sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W));
@@ -2161,7 +2292,7 @@ bool handleAdvancedAlignmentTouch(uint16_t tx, uint16_t ty) {
     drawAdjustSliders();
     return true;
   }
-  if (sliderRowHit(tx, ty, PANEL_SLIDER_X, TINT_SLIDER_Y - 2, PANEL_SLIDER_W, PANEL_SLIDER_H)) {
+  if (compactSliderRowHit(tx, ty, PANEL_SLIDER_X, ADV_ZY_Y, PANEL_SLIDER_W, 16)) {
     int v = align_zoom_y_offset;
     if (dir && nudgeReady(now)) v += dir * ALIGN_ZOOM_NUDGE_PCT;
     else if (track_hit) v = pctToZoomOffset(sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W));
@@ -2178,36 +2309,11 @@ void handleTouch() {
   if (!gt911_read_touch(&tx, &ty)) return;
   uint32_t now = millis();
 
-  if (adjust_unlocked && now > adjust_unlock_until_ms) {
-    adjust_unlocked = false;
-    drawButtons();
-    drawAdjustSliders();
-    if (panel_tab != PANEL_TAB_ADVANCED) drawSlider();
-  }
-
-  // Tint slider has no rate limit so it tracks finger movement. It is hidden
-  // while the advanced alignment page uses the lower panel row.
-  if (panel_tab != PANEL_TAB_ADVANCED &&
-      sliderRowHit(tx, ty, SLIDER_X, SLIDER_Y, SLIDER_W, SLIDER_H)) {
-    int dir = sliderNudgeDir(tx, SLIDER_X, SLIDER_W);
-    if (dir) {
-      if (nudgeReady(now)) {
-        setDirtyU8(tint_pct, (uint8_t)constrain((int)tint_pct + dir * TINT_NUDGE_PCT, 0, 100));
-        drawSlider();
-      }
-      return;
-    }
-    if (sliderTrackHit(tx, SLIDER_X, SLIDER_W)) {
-      setDirtyU8(tint_pct, (uint8_t)sliderPctFromTrack(tx, SLIDER_X, SLIDER_W));
-      drawSlider();
-    }
-    return;
-  }
-
   if (panel_tab == PANEL_TAB_PRESET && handlePresetTouch(tx, ty)) return;
   if (panel_tab == PANEL_TAB_ADVANCED && handleAdvancedAlignmentTouch(tx, ty)) return;
+  if (panel_tab == PANEL_TAB_TUNE && handleTuneTouch(tx, ty)) return;
 
-  // Side-panel sliders: DIST controls alignment, RANGE controls manual LO/HI.
+  // Manual range sliders.
   if (tx >= PANEL_SLIDER_X && tx < PANEL_SLIDER_X + PANEL_SLIDER_W) {
     int dir = sliderNudgeDir(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
     bool track_hit = sliderTrackHit(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
@@ -2249,22 +2355,6 @@ void handleTouch() {
     return;
   }
 
-  // Brightness cells are rate-limited so one tap does not fire repeatedly.
-  if (now - last_touch_ms >= 250 &&
-      ty >= BRT_BAR_Y && ty < BRT_BAR_Y + BRT_CELL_H &&
-      tx >= BRT_BAR_X && tx < BRT_BAR_X + BRT_NUM_CELLS * BRT_CELL_W) {
-    int cell = (tx - BRT_BAR_X) / BRT_CELL_W;        // 0..4
-    if (cell < 0) cell = 0; else if (cell >= BRT_NUM_CELLS) cell = BRT_NUM_CELLS - 1;
-    int8_t new_brt = (int8_t)(cell - 2);             // -2..+2
-    if (new_brt != cam_brightness) {
-      cam_brightness = new_brt;
-      brightness_apply_pending = true;
-      markDirty();
-      drawBrightnessSlider();
-    }
-    last_touch_ms = now;
-    return;
-  }
   if (now - last_touch_ms < 350) return;
   for (int i = 0; i < NUM_BUTTONS; i++) {
     auto &b = buttons[i];
@@ -2272,7 +2362,6 @@ void handleTouch() {
       b.action(); last_touch_ms = now;
       lcd.fillRoundRect(b.x, b.y, b.w, b.h, 4, TFT_WHITE);
       delay(40); drawButtons(); drawAdjustSliders();
-      if (panel_tab != PANEL_TAB_ADVANCED) drawSlider();
       return;
     }
   }
@@ -2343,6 +2432,7 @@ uint8_t therm_idx_prev[768];
 uint8_t therm_idx_target[768];
 float   therm_build_src[768];
 bool     therm_idx_valid = false;
+bool     therm_idx_cold = false;
 uint32_t therm_idx_seq = 0;
 float    therm_idx_lo = 0.0f, therm_idx_hi = 0.0f;
 uint32_t therm_idx_transition_ms = 0;
@@ -2371,10 +2461,12 @@ void updateThermalBlend(uint32_t now) {
 void buildThermalPaletteFrame(float lo, float hi) {
   uint32_t seq = thermal_frame_seq;
   uint32_t now = millis();
+  bool cold_palette = rangeUsesColdPalette(range_mode);
   bool same_target = therm_idx_valid &&
                      therm_idx_seq == seq &&
                      therm_idx_lo == lo &&
-                     therm_idx_hi == hi;
+                     therm_idx_hi == hi &&
+                     therm_idx_cold == cold_palette;
 
   if (same_target) {
     updateThermalBlend(now);
@@ -2394,7 +2486,7 @@ void buildThermalPaletteFrame(float lo, float hi) {
   for (int row = 0; row < 24; row++) {
     for (int col = 0; col < 32; col++) {
       float t = therm_build_src[row * 32 + (31 - col)];
-      float f = (t - lo) / denom;
+      float f = cold_palette ? (hi - t) / denom : (t - lo) / denom;
       // Clamp, catching NaN before palette indexing.
       if (!(f >= 0.0f)) f = 0.0f;
       else if (f > 1.0f) f = 1.0f;
@@ -2414,6 +2506,7 @@ void buildThermalPaletteFrame(float lo, float hi) {
 
   therm_idx_valid = true;
   therm_idx_seq = seq;
+  therm_idx_cold = cold_palette;
   therm_idx_lo = lo;
   therm_idx_hi = hi;
   therm_idx_transition_ms = now;
@@ -2524,6 +2617,29 @@ void updateScreenMarkerTemp() {
 
 // Camera crop parameters for zoom and parallax. Output parameters avoid
 // Arduino's generated-prototype edge cases with local struct types.
+static inline void cameraCropRectFor(int zx, int zy, int px100, int py100,
+                                     int &x0, int &y0, int &cw, int &ch) {
+  zx = clampZoomPct(zx);
+  zy = clampZoomPct(zy);
+  px100 = clampParallax100(px100);
+  py100 = clampParallax100(py100);
+
+  cw = (IMG_W * 100 + zx / 2) / zx;
+  ch = (IMG_H * 100 + zy / 2) / zy;
+  if (cw < 1) cw = 1; else if (cw > IMG_W) cw = IMG_W;
+  if (ch < 1) ch = 1; else if (ch > IMG_H) ch = IMG_H;
+
+  int shift_x = (int)(((int64_t)px100 * cw) / (PARALLAX_SCALE * IMG_W));
+  int shift_y = (int)(((int64_t)py100 * ch) / (PARALLAX_SCALE * IMG_H));
+  x0 = (IMG_W - cw) / 2 - shift_x;
+  y0 = (IMG_H - ch) / 2 - shift_y;
+
+  int max_x0 = IMG_W - cw;
+  int max_y0 = IMG_H - ch;
+  if (x0 < 0) x0 = 0; else if (x0 > max_x0) x0 = max_x0;
+  if (y0 < 0) y0 = 0; else if (y0 > max_y0) y0 = max_y0;
+}
+
 static inline void cameraCropParamsFor(int zx, int zy, int px100, int py100,
                                        int32_t &src_x0_q, int32_t &src_y0_q,
                                        int32_t &step_x_q, int32_t &step_y_q)
@@ -2590,9 +2706,7 @@ static inline void drawMarkerRow(uint16_t *row, int y) {
     if (x < 0 || x >= IMG_W) continue;
     int d2 = dx * dx + dy * dy;
     bool ring = d2 >= 34 && d2 <= 58;
-    bool cross = (dy == 0 && abs(dx) <= MARKER_R + 2) ||
-                 (dx == 0 && abs(dy) <= MARKER_R + 2);
-    if (ring || cross) row[x] = TFT_GREEN;
+    if (ring) row[x] = TFT_GREEN;
   }
 }
 
@@ -2740,7 +2854,7 @@ void renderCameraOnly() {
   }
 
   uint16_t *cam = (uint16_t*)cam_snapshot;
-  if (!adjust_unlocked) {
+  if (panel_tab != PANEL_TAB_ADVANCED) {
     lcd.setSwapBytes(false);
     lcd.startWrite();
     for (int y0 = 0; y0 < IMG_H; y0 += CHUNK_H) {
@@ -2798,6 +2912,7 @@ bool share_routes_configured = false;
 char share_ap_ssid[32] = "ThermalCam";
 uint32_t freeze_capture_ms = 0;
 float freeze_range_lo = 20.0f, freeze_range_hi = 30.0f;
+RangeMode freeze_range_mode = RANGE_AUTO;
 int freeze_zoom_x_pct = ALIGN_BASE_ZX;
 int freeze_zoom_y_pct = ALIGN_BASE_ZY;
 int freeze_parallax_x100 = 0, freeze_parallax_y100 = 0;
@@ -2832,6 +2947,11 @@ bool stream_portal_transition_pending = false;
 bool stream_cam_cache_valid = false;
 uint8_t *stream_cam_jpeg = nullptr;
 size_t stream_cam_jpeg_len = 0;
+uint8_t *stream_cam_crop_buf = nullptr;
+size_t stream_cam_crop_buf_len = 0;
+uint16_t stream_cam_encode_w = IMG_W;
+uint16_t stream_cam_encode_h = IMG_H;
+bool stream_cam_pre_cropped = false;
 uint32_t stream_cam_cache_ms = 0;
 uint32_t stream_cam_cache_seq = 0;
 uint32_t stream_cam_cache_count = 0;
@@ -2928,14 +3048,39 @@ void releaseStreamCameraCache() {
     free(stream_cam_jpeg);
     stream_cam_jpeg = nullptr;
   }
+  if (stream_cam_crop_buf) {
+    heap_caps_free(stream_cam_crop_buf);
+    stream_cam_crop_buf = nullptr;
+  }
+  stream_cam_crop_buf_len = 0;
   stream_cam_jpeg_len = 0;
+  stream_cam_encode_w = IMG_W;
+  stream_cam_encode_h = IMG_H;
+  stream_cam_pre_cropped = false;
   stream_cam_cache_valid = false;
   stream_cam_cache_ms = 0;
   stream_cam_cache_seq = 0;
 }
 
+bool ensureStreamCropBuffer(size_t bytes) {
+  if (stream_cam_crop_buf && stream_cam_crop_buf_len >= bytes) return true;
+  if (stream_cam_crop_buf) {
+    heap_caps_free(stream_cam_crop_buf);
+    stream_cam_crop_buf = nullptr;
+    stream_cam_crop_buf_len = 0;
+  }
+  stream_cam_crop_buf = (uint8_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!stream_cam_crop_buf) {
+    Serial.printf("Stream crop: PSRAM alloc failed (%u bytes)\n", (unsigned)bytes);
+    return false;
+  }
+  stream_cam_crop_buf_len = bytes;
+  return true;
+}
+
 bool updateStreamCameraCache(bool force) {
   if (!stream_mode || !cam_ok || stream_native_jpeg_active) return false;
+  if (stream_view_mode == STREAM_VIEW_THERMAL) return stream_cam_cache_valid;
   uint32_t now = millis();
   if (!force && stream_next_cam_capture_ms &&
       (int32_t)(now - stream_next_cam_capture_ms) < 0) {
@@ -2952,9 +3097,34 @@ bool updateStreamCameraCache(bool force) {
   uint8_t *jpg = nullptr;
   size_t jpg_len = 0;
   uint8_t jpeg_quality = stream_jpeg_quality;
+  uint8_t *encode_src = cam_snapshot;
+  size_t encode_len = cam_snapshot_len;
+  int crop_x = 0, crop_y = 0, crop_w = IMG_W, crop_h = IMG_H;
+  cameraCropRectFor(zoom_x_pct, zoom_y_pct, parallax_x100, parallax_y100,
+                    crop_x, crop_y, crop_w, crop_h);
+  bool pre_crop = crop_x != 0 || crop_y != 0 || crop_w != IMG_W || crop_h != IMG_H;
+  if (pre_crop) {
+    size_t crop_len = (size_t)crop_w * crop_h * 2;
+    if (ensureStreamCropBuffer(crop_len)) {
+      uint16_t *dst = (uint16_t*)stream_cam_crop_buf;
+      uint16_t *src = (uint16_t*)cam_snapshot;
+      for (int y = 0; y < crop_h; y++) {
+        memcpy(&dst[y * crop_w], &src[(crop_y + y) * IMG_W + crop_x],
+               (size_t)crop_w * sizeof(uint16_t));
+      }
+      encode_src = stream_cam_crop_buf;
+      encode_len = crop_len;
+    } else {
+      pre_crop = false;
+    }
+  }
+  stream_cam_encode_w = pre_crop ? crop_w : IMG_W;
+  stream_cam_encode_h = pre_crop ? crop_h : IMG_H;
+  stream_cam_pre_cropped = pre_crop;
+
   uint32_t total_start_us = micros();
   uint32_t encode_start_us = micros();
-  bool ok = fmt2jpg(cam_snapshot, cam_snapshot_len, IMG_W, IMG_H,
+  bool ok = fmt2jpg(encode_src, encode_len, stream_cam_encode_w, stream_cam_encode_h,
                     PIXFORMAT_RGB565, jpeg_quality, &jpg, &jpg_len);
   uint32_t encode_us = micros() - encode_start_us;
   if (!ok || !jpg || !jpg_len) {
@@ -3038,13 +3208,16 @@ static const char PORTAL_INDEX_HTML[] PROGMEM = R"PORTALINDEX(
 <section class="grid"><div class="video"><canvas id="view" width="320" height="240"></canvas><canvas id="recCanvas" width="320" height="240" hidden></canvas><div class="actions recActions"><button id="recBtn">Record</button><label class="check"><input type="checkbox" id="recHud" checked> Record temp overlay</label><button id="stopPortal">Stop portal</button></div><p id="saveMsg">Recording is stored in browser memory until stopped.</p></div>
 <div class="panel">
 <label>View<select id="viewMode"><option value="0">Overlay</option><option value="1">Camera only</option><option value="2">Thermal only</option></select></label>
-<label>Range<select id="rangeMode"><option value="0">AUTO</option><option value="1">DET</option><option value="2">HOT</option><option value="3">SKIN</option><option value="4">PCB</option><option value="5">HIGH</option><option value="6">WIDE</option><option value="7">COLD</option><option value="8">MAN</option></select></label>
+<label>Range<select id="rangeMode"><option value="0">AUTO</option><option value="1">INV</option><option value="2">AUT2</option><option value="3">AUT3</option><option value="4">DET</option><option value="5">HOT</option><option value="6">SKIN</option><option value="7">PCB</option><option value="8">HIGH</option><option value="9">WIDE</option><option value="10">COLD</option><option value="11">MAN</option></select></label>
 <div class="field"><div>Distance <span id="distv"></span></div><div><div class="chips" id="distPresets"></div><div class="distCtl"><button id="distMinus">-5</button><input id="dist" type="range" min="5" max="500" step="1"><button id="distPlus">+5</button></div></div></div>
 <p id="alignInfo">Alignment --</p>
 <label>Tint <span id="tintv"></span><input id="tint" type="range" min="0" max="100" step="1"></label>
-<label>Manual LO <span id="mlov"></span><input id="mlo" type="range" min="-20" max="300" step="0.1"></label>
-<label>Manual HI <span id="mhiv"></span><input id="mhi" type="range" min="-20" max="300" step="0.1"></label>
 <label>Brightness <span id="brtv"></span><input id="brt" type="range" min="-2" max="2" step="1"></label>
+<details id="manualBox"><summary>Manual range</summary>
+<label>LO <span id="mlov"></span><input id="mlo" type="range" min="-20" max="120" step="0.1"></label>
+<label>HI <span id="mhiv"></span><input id="mhi" type="range" min="-20" max="120" step="0.1"></label>
+<p>Use HIGH or PCB for hotter scenes.</p>
+</details>
 <details id="alignBox"><summary>Advanced alignment</summary>
 <label>X offset <span id="offxv"></span><input id="offx100" type="range" min="-4000" max="4000" step="25"></label>
 <label>Y offset <span id="offyv"></span><input id="offy100" type="range" min="-4000" max="4000" step="25"></label>
@@ -3058,7 +3231,7 @@ static const char PORTAL_INDEX_HTML[] PROGMEM = R"PORTALINDEX(
 <label>Denoise <span id="denv"></span><input id="den" type="range" min="0" max="1" step="1"></label>
 <label>JPEG Q<select id="jpgq"><option value="35">35 fastest</option><option value="45">45 fast</option><option value="55">55 balanced</option><option value="65">65 detail</option><option value="75">75 high</option></select></label>
 </details>
-<div class="actions"><button id="resetAlign">Reset 100 cm</button><button id="rotBtn">Rotate</button><button id="snap">Snapshot</button></div>
+<div class="actions"><button id="resetAlign">Reset 30 cm</button><button id="rotBtn">Rotate</button><button id="snap">Snapshot</button></div>
 <label class="check"><input type="checkbox" id="crosshair" checked> Crosshair</label>
 </div></section>
 <details id="diagBox"><summary>Diagnostics</summary><section id="diag" class="diag"></section></details>
@@ -3066,14 +3239,14 @@ static const char PORTAL_INDEX_HTML[] PROGMEM = R"PORTALINDEX(
 )PORTALINDEX";
 
 static const char PORTAL_CSS[] PROGMEM = R"PORTALCSS(
-body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:10px}header{display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap}h1{font-size:34px;margin:0}p{color:#9aa8b3;margin:.25rem 0}.topStats{display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:8px;margin:8px 0}.topStats div{background:#10161b;border:1px solid #26343e;border-radius:8px;padding:8px;color:#cbd6dd}.topStats b{color:#9fe870;font-variant-numeric:tabular-nums}.grid{display:grid;grid-template-columns:minmax(280px,640px) minmax(290px,1fr);gap:10px}.video,.panel,details{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:9px}.panel details{background:transparent;border:0;padding:0;margin:8px 0}canvas{width:100%;height:auto;background:#000;image-rendering:auto;border-radius:6px}label,.field{display:grid;grid-template-columns:96px 1fr;gap:8px;align-items:center;margin:7px 0}label span,.field span{justify-self:end;color:#9fe870;font-variant-numeric:tabular-nums}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:7px}button{cursor:pointer}.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:8px;margin-top:8px}.recActions{align-items:center}.check{display:block;color:#d9e4eb}.chips{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:7px}.chips button{padding:6px 4px;font-size:13px}.chips button.active{background:#315d35;border-color:#9fe870;color:#fff}.distCtl{display:grid;grid-template-columns:48px 1fr 48px;gap:7px;align-items:center}.diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px;margin-top:10px}.diag div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}summary{cursor:pointer;color:#dbe6ed;font-weight:700}#connState{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px}.bad{background:#3a1b20!important;border-color:#8a2630!important;color:#ffd1d1!important}@media(max-width:760px){.grid{grid-template-columns:1fr}label,.field{grid-template-columns:86px 1fr}.topStats{grid-template-columns:1fr 1fr 1fr}.chips{grid-template-columns:repeat(3,1fr)}}
+body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:auto;padding:10px}header{display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap}h1{font-size:34px;margin:0}p{color:#9aa8b3;margin:.25rem 0}.topStats{display:grid;grid-template-columns:repeat(3,minmax(90px,1fr));gap:8px;margin:8px 0}.topStats div{background:#10161b;border:1px solid #26343e;border-radius:8px;padding:8px;color:#cbd6dd}.topStats b{color:#9fe870;font-variant-numeric:tabular-nums}.grid{display:grid;grid-template-columns:minmax(280px,640px) minmax(290px,1fr);gap:10px}.video,.panel,details{background:#12171c;border:1px solid #28343d;border-radius:8px;padding:9px}.panel details{background:transparent;border:0;padding:0;margin:8px 0}canvas{width:100%;height:auto;background:#000;image-rendering:auto;border-radius:6px}label{display:grid;grid-template-columns:1fr auto;gap:6px 10px;align-items:center;margin:10px 0}.field{display:grid;grid-template-columns:96px 1fr;gap:8px;align-items:center;margin:8px 0}label span,.field span{justify-self:end;color:#9fe870;font-variant-numeric:tabular-nums}label input[type=range]{grid-column:1/-1;width:100%;min-width:0}label select{grid-column:1/-1;width:100%}input[type=range]{accent-color:#1683ff}button,select,input{font:inherit}button,select{background:#20303b;color:#fff;border:1px solid #425564;border-radius:6px;padding:7px}button{cursor:pointer}.actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:8px;margin-top:8px}.recActions{align-items:center}.check{display:block;color:#d9e4eb}.chips{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:7px}.chips button{padding:6px 4px;font-size:13px}.chips button.active{background:#315d35;border-color:#9fe870;color:#fff}.distCtl{display:grid;grid-template-columns:48px 1fr 48px;gap:7px;align-items:center}.diag{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px;margin-top:10px}.diag div{background:#0d1115;border:1px solid #26323b;border-radius:6px;padding:6px;color:#c9d5dd}summary{cursor:pointer;color:#dbe6ed;font-weight:700}#connState{background:#1c252d;border:1px solid #384652;border-radius:6px;padding:5px 8px}.bad{background:#3a1b20!important;border-color:#8a2630!important;color:#ffd1d1!important}@media(max-width:760px){.grid{grid-template-columns:1fr}.field{grid-template-columns:86px 1fr}.topStats{grid-template-columns:1fr 1fr 1fr}.chips{grid-template-columns:repeat(3,1fr)}}
 )PORTALCSS";
 
 static const char PORTAL_JS[] PROGMEM = R"PORTALJS(
 const W=320,H=240,$=id=>document.getElementById(id),canvas=$('view'),ctx=canvas.getContext('2d'),recCanvas=$('recCanvas'),recCtx=recCanvas.getContext('2d');
 const scene=document.createElement('canvas');scene.width=W;scene.height=H;const sctx=scene.getContext('2d');const th=document.createElement('canvas');th.width=W;th.height=H;const thx=th.getContext('2d');
-let S={view:0,range:0,px:0,py:0,px100:356,py100:0,offx100:0,offy100:0,offzx:0,offzy:0,zx:101,zy:125,basePx100:356,baseZx:101,baseZy:125,alignDistanceCm:100,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--'},thermal=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,sceneDirty=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,diagBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
-const PRESETS=[['Macro',5],['Close',15],['Desk',30],['Room',100],['Far',500]],PARA_COEFF=35654;
+let S={view:0,range:0,px:0,py:0,px100:-732,py100:-1120,offx100:0,offy100:0,offzx:0,offzy:0,zx:126,zy:126,basePx100:-732,basePy100:-1120,baseZx:126,baseZy:126,alignDistanceCm:30,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--',camPreCropped:1,camStreamW:320,camStreamH:240},thermal=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,sceneDirty=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,diagBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
+const PRESETS=[['Macro',5],['Close',15],['Desk',30],['Room',100],['Far',500]],PARA_COEFF=35654,BASE_PX100=-1920,BASE_PY100=-1120,BASE_ZX=126,BASE_ZY=126;
 const PAL=Array.from({length:256},(_,i)=>{let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]});
 const thImg=thx.createImageData(W,H),xMap=[],yMap=[];for(let x=0;x<W;x++){let tx=x*32/W,x0=clamp(Math.floor(tx),0,31),x1=clamp(x0+1,0,31),fx=tx-x0;xMap[x]=[31-x0,31-x1,fx]}for(let y=0;y<H;y++){let ty=y*24/H,y0=clamp(Math.floor(ty),0,23),y1=clamp(y0+1,0,23),fy=ty-y0;yMap[y]=[y0,y1,fy]}
 let mjpegImg=new Image(),mjpegActive=false;mjpegImg.crossOrigin='anonymous';
@@ -3083,31 +3256,32 @@ function setCanvasRotation(){rot=((rot%4)+4)%4;let rw=rot%2?H:W,rh=rot%2?W:H;can
 function drawRot(out,src){out.setTransform(1,0,0,1,0,0);out.clearRect(0,0,out.canvas.width,out.canvas.height);out.save();if(rot===1){out.translate(H,0);out.rotate(Math.PI/2)}else if(rot===2){out.translate(W,H);out.rotate(Math.PI)}else if(rot===3){out.translate(0,W);out.rotate(-Math.PI/2)}out.drawImage(src,0,0);out.restore()}
 function viewToScene(x,y){let p=rot===1?{x:y,y:H-x}:rot===2?{x:W-x,y:H-y}:rot===3?{x:W-y,y:x}:{x,y};p.x=clamp(p.x,0,W-1);p.y=clamp(p.y,0,H-1);return p}
 function rawTempAt(x,y,src=thermal){if(!src)return null;let tx=x*32/W,ty=y*24/H,x0=clamp(Math.floor(tx),0,31),y0=clamp(Math.floor(ty),0,23),x1=clamp(x0+1,0,31),y1=clamp(y0+1,0,23),fx=tx-x0,fy=ty-y0;let t=(r,c)=>src[r*32+(31-c)],a=t(y0,x0),b=t(y0,x1),c=t(y1,x0),d=t(y1,x1);return(a*(1-fx)+b*fx)*(1-fy)+(c*(1-fx)+d*fx)*fy}
-function rebuildThermal(){if(!thermal)return;let d=thImg.data,lo=+S.lo||20,den=(+S.hi-lo)||1;for(let y=0;y<H;y++){let ym=yMap[y],y0=ym[0],y1=ym[1],fy=ym[2],ify=1-fy;for(let x=0;x<W;x++){let xm=xMap[x],x0=xm[0],x1=xm[1],fx=xm[2],ifx=1-fx,a=thermal[y0*32+x0],b=thermal[y0*32+x1],c=thermal[y1*32+x0],e=thermal[y1*32+x1],t=(a*ifx+b*fx)*ify+(c*ifx+e*fx)*fy,p=PAL[clamp(Math.round((t-lo)/den*255),0,255)],o=(y*W+x)*4;d[o]=p[0];d[o+1]=p[1];d[o+2]=p[2];d[o+3]=255}}thx.putImageData(thImg,0,0);dirtyThermal=false}
-function drawCamera(c){let img=(mjpegActive&&mjpegImg.naturalWidth)?mjpegImg:camImg,iw=img&&(img.naturalWidth||img.width),ih=img&&(img.naturalHeight||img.height);if(!img||!iw||!ih)return;let zx=clamp(+S.zx||101,100,250),zy=clamp(+S.zy||125,100,250),cw=W*100/zx,ch=H*100/zy,px=(+S.px100||0)/100,py=(+S.py100||0)/100,sx=(W-cw)/2-px*cw/W,sy=(H-ch)/2-py*ch/H;sx=clamp(sx,0,W-cw);sy=clamp(sy,0,H-ch);try{c.drawImage(img,sx*iw/W,sy*ih/H,cw*iw/W,ch*ih/H,0,0,W,H)}catch(e){mjpegActive=false;camStatus='poll fallback';getCam()}}
+function coldRange(){return +S.range===1||+S.range===3||S.rangeName==='INV'||S.rangeName==='AUT3'}function rebuildThermal(){if(!thermal)return;let d=thImg.data,lo=+S.lo||20,hi=+S.hi||30,den=(hi-lo)||1,cold=coldRange();for(let y=0;y<H;y++){let ym=yMap[y],y0=ym[0],y1=ym[1],fy=ym[2],ify=1-fy;for(let x=0;x<W;x++){let xm=xMap[x],x0=xm[0],x1=xm[1],fx=xm[2],ifx=1-fx,a=thermal[y0*32+x0],b=thermal[y0*32+x1],c=thermal[y1*32+x0],e=thermal[y1*32+x1],t=(a*ifx+b*fx)*ify+(c*ifx+e*fx)*fy,p=PAL[clamp(Math.round((cold?(hi-t):(t-lo))/den*255),0,255)],o=(y*W+x)*4;d[o]=p[0];d[o+1]=p[1];d[o+2]=p[2];d[o+3]=255}}thx.putImageData(thImg,0,0);dirtyThermal=false}
+function drawCamera(c){let img=(mjpegActive&&mjpegImg.naturalWidth)?mjpegImg:camImg,iw=img&&(img.naturalWidth||img.width),ih=img&&(img.naturalHeight||img.height);if(!img||!iw||!ih)return;try{if(+S.camPreCropped){c.drawImage(img,0,0,iw,ih,0,0,W,H);return}let zx=clamp(+S.zx||BASE_ZX,100,250),zy=clamp(+S.zy||BASE_ZY,100,250),cw=W*100/zx,ch=H*100/zy,px=(+S.px100||0)/100,py=(+S.py100||0)/100,sx=(W-cw)/2-px*cw/W,sy=(H-ch)/2-py*ch/H;sx=clamp(sx,0,W-cw);sy=clamp(sy,0,H-ch);c.drawImage(img,sx*iw/W,sy*ih/H,cw*iw/W,ch*ih/H,0,0,W,H)}catch(e){mjpegActive=false;camStatus='poll fallback';getCam()}}
 function drawCross(c){if(!S.crosshair)return;c.save();c.strokeStyle='#fff';c.lineWidth=1;c.beginPath();c.moveTo(W/2-10,H/2);c.lineTo(W/2+10,H/2);c.moveTo(W/2,H/2-10);c.lineTo(W/2,H/2+10);c.rect(W/2-10,H/2-10,20,20);c.stroke();c.restore()}
 function drawScene(){sctx.clearRect(0,0,W,H);sctx.fillStyle='#000';sctx.fillRect(0,0,W,H);if(+S.view!==2)drawCamera(sctx);if(+S.view!==1&&thermal){if(dirtyThermal)rebuildThermal();sctx.save();if(+S.view===0){sctx.globalCompositeOperation='lighter';sctx.globalAlpha=(+S.tint||0)/100}sctx.drawImage(th,0,0);sctx.restore()}if(marker){sctx.strokeStyle='#9fe870';sctx.beginPath();sctx.arc(marker.x,marker.y,6,0,Math.PI*2);sctx.stroke()}drawCross(sctx)}
-function hudPanel(c,x,y,lines,anchor='left'){c.save();c.font='12px system-ui,-apple-system,Segoe UI,sans-serif';let pad=7,lh=15,w=0;for(let l of lines)w=Math.max(w,c.measureText(l).width);w+=pad*2;let h=lines.length*lh+pad*2;if(anchor.includes('right'))x-=w;if(anchor.includes('bottom'))y-=h;c.fillStyle='rgba(7,10,13,.72)';c.strokeStyle='rgba(159,232,112,.75)';c.lineWidth=1;c.fillRect(x,y,w,h);c.strokeRect(x+.5,y+.5,w-1,h-1);c.fillStyle='#eef6fb';for(let i=0;i<lines.length;i++)c.fillText(lines[i],x+pad,y+pad+11+i*lh);c.restore()}
-function drawRecHud(c){if(!recHud)return;let w=c.canvas.width,h=c.canvas.height,mt=markerTemp==null?'--':fmt(markerTemp);hudPanel(c,8,8,[`Center ${fmt(S.tCenter)}C`,`Range ${S.rangeName||S.range||'--'}`]);hudPanel(c,w-8,8,[`REC ${mmss(Date.now()-recStarted)}`,`Cam ${fmt(S.camCacheFps??S.camFps)}fps  MLX ${fmt(S.mlxFps)}fps`],'right');if(marker)hudPanel(c,8,h-8,[`Marker ${mt}C`],'bottom');hudPanel(c,w-8,h-8,[`Scene ${fmt(S.tMin)}-${fmt(S.tMax)}C`,`Palette ${fmt(S.lo)}-${fmt(S.hi)}C`],'right bottom')}
+function hudPanel(c,x,y,lines,anchor='left'){c.save();c.font='10px system-ui,-apple-system,Segoe UI,sans-serif';let pad=5,lh=12,w=0;for(let l of lines)w=Math.max(w,c.measureText(l).width);w+=pad*2;let h=lines.length*lh+pad*2;if(anchor.includes('right'))x-=w;if(anchor.includes('bottom'))y-=h;c.fillStyle='rgba(7,10,13,.68)';c.strokeStyle='rgba(159,232,112,.7)';c.lineWidth=1;c.fillRect(x,y,w,h);c.strokeRect(x+.5,y+.5,w-1,h-1);c.fillStyle='#eef6fb';for(let i=0;i<lines.length;i++)c.fillText(lines[i],x+pad,y+pad+9+i*lh);c.restore()}
+function drawRecHud(c){if(!recHud)return;let h=c.canvas.height,mt=markerTemp==null?'--':fmt(markerTemp),lines=[`Center ${fmt(S.tCenter)}C`,`Marker ${mt}C`,`Scene ${fmt(S.tMin)}-${fmt(S.tMax)}C`,`Palette ${fmt(S.lo)}-${fmt(S.hi)}C`];hudPanel(c,8,h-8,lines,'bottom')}
 function render(){if(mjpegActive&&+S.view!==2)sceneDirty=true;if(sceneDirty||rec){drawScene();drawRot(ctx,scene);sceneDirty=false;if(rec){drawRot(recCtx,scene);drawRecHud(recCtx)}}requestAnimationFrame(render)}
-function labels(){let px=(S.px100/100).toFixed(2);txt('tCenter',fmt(S.tCenter));txt('tSpan',`${fmt(S.tMin)}-${fmt(S.tMax)}`);txt('tRange',`${fmt(S.lo)}-${fmt(S.hi)}`);txt('markerTemp',markerTemp==null?'--':fmt(markerTemp));txt('statCam',fmt(S.camCacheFps??S.camFps));txt('statMlx',fmt(S.mlxFps));txt('statLoop',fmt(S.loopFps));txt('distv',(S.alignDistanceCm||100)+'cm');txt('alignInfo',`RGB shift ${px}px right - crop ${S.zx}/${S.zy}% - selected distance plane only`);txt('tintv',S.tint+'%');txt('mlov',fmt(S.mlo)+'C');txt('mhiv',fmt(S.mhi)+'C');txt('brtv',S.brt);txt('conv',S.con);txt('satv',S.sat);txt('shpv',S.shp);txt('denv',S.den);txt('offxv',fmt((S.offx100||0)/100,2)+'px');txt('offyv',fmt((S.offy100||0)/100,2)+'px');txt('offzxv',(S.offzx||0)+'%');txt('offzyv',(S.offzy||0)+'%');document.querySelectorAll('#distPresets button').forEach(b=>b.classList.toggle('active',+b.dataset.cm===+S.alignDistanceCm));if(!$('diagBox').open)return;let items=[['Cam',S.camCacheFps??S.camFps,'fps'],['MLX',S.mlxFps,'fps'],['Loop',S.loopFps,'fps'],['Transport',mjpegActive?'mjpeg-cache':S.camTransport,''],['Stage',S.portalStage||'--',''],['Cache age',S.camCacheAgeMs,'ms'],['JPEG Q',S.jpegQuality,''],['Cam Enc',S.camEncodeMs,'ms'],['Cam Size',bytes(S.camJpegBytes||camBytes),''],['Fetch',fmt(camFetchMs),'ms'],['Decode',fmt(camDecodeMs),'ms'],['Cam Req',S.camReqFps,'fps'],['Therm Req',S.thermalReqFps,'fps'],['API',S.apiFps,'fps'],['Grab',fmt(S.grabMs),'ms'],['Render',fmt(S.renderMs),'ms'],['Heap',kb(S.heap),''],['PSRAM',kb(S.psram),''],['Seq',S.seq||'--',''],['Uptime',mmss(S.portalMs),''],['Reset',S.resetReason??'--',''],['ESP32',S.arduinoEsp32Version??'--',''],['MJPEG',S.mjpegRunning?'on':'off',''],['Cam',camStatus,'']];$('diag').innerHTML=items.map(i=>`<div>${i[0]} <b>${i[1]??'--'}</b>${i[2]}</div>`).join('')}
-function sync(){for(let id of ['rangeMode','viewMode','tint','mlo','mhi','brt','con','sat','shp','den','jpgq','offx100','offy100','offzx','offzy'])if($(id))$(id).value=S[id==='rangeMode'?'range':id==='viewMode'?'view':id==='jpgq'?'jpegQuality':id];$('dist').value=S.alignDistanceCm||100;$('crosshair').checked=!!S.crosshair;$('recHud').checked=!!recHud;labels()}
+function labels(){let px=(S.px100/100).toFixed(2);txt('tCenter',fmt(S.tCenter));txt('tSpan',`${fmt(S.tMin)}-${fmt(S.tMax)}`);txt('tRange',`${fmt(S.lo)}-${fmt(S.hi)}`);txt('markerTemp',markerTemp==null?'--':fmt(markerTemp));txt('statCam',fmt(S.camCacheFps??S.camFps));txt('statMlx',fmt(S.mlxFps));txt('statLoop',fmt(S.loopFps));txt('distv',(S.alignDistanceCm||30)+'cm');txt('alignInfo',`RGB shift ${px}px right - zoom ${S.zx}/${S.zy}% - selected distance plane only`);txt('tintv',S.tint+'%');txt('mlov',fmt(S.mlo)+'C');txt('mhiv',fmt(S.mhi)+'C');txt('brtv',S.brt);txt('conv',S.con);txt('satv',S.sat);txt('shpv',S.shp);txt('denv',S.den);txt('offxv',fmt((S.offx100||0)/100,2)+'px');txt('offyv',fmt((S.offy100||0)/100,2)+'px');txt('offzxv',(S.offzx||0)+'%');txt('offzyv',(S.offzy||0)+'%');document.querySelectorAll('#distPresets button').forEach(b=>b.classList.toggle('active',+b.dataset.cm===+S.alignDistanceCm));if(!$('diagBox').open)return;let items=[['Cam',S.camCacheFps??S.camFps,'fps'],['MLX',S.mlxFps,'fps'],['Loop',S.loopFps,'fps'],['Transport',mjpegActive?'mjpeg-cache':S.camTransport,''],['Stage',S.portalStage||'--',''],['Cache age',S.camCacheAgeMs,'ms'],['JPEG Q',S.jpegQuality,''],['Cam Enc',S.camEncodeMs,'ms'],['Cam Size',bytes(S.camJpegBytes||camBytes),''],['Fetch',fmt(camFetchMs),'ms'],['Decode',fmt(camDecodeMs),'ms'],['Cam Req',S.camReqFps,'fps'],['Therm Req',S.thermalReqFps,'fps'],['API',S.apiFps,'fps'],['Grab',fmt(S.grabMs),'ms'],['Render',fmt(S.renderMs),'ms'],['Heap',kb(S.heap),''],['PSRAM',kb(S.psram),''],['Seq',S.seq||'--',''],['Uptime',mmss(S.portalMs),''],['Reset',S.resetReason??'--',''],['ESP32',S.arduinoEsp32Version??'--',''],['MJPEG',S.mjpegRunning?'on':'off',''],['Cam',camStatus,'']];$('diag').innerHTML=items.map(i=>`<div>${i[0]} <b>${i[1]??'--'}</b>${i[2]}</div>`).join('')}
+function manualBounds(){let hi=Math.max(120,+S.mhi||0,+S.tMax||0),max=clamp(Math.ceil((hi+10)/10)*10,120,300);for(let id of ['mlo','mhi'])if($(id)){$(id).min=-20;$(id).max=max}}
+function sync(){manualBounds();for(let id of ['rangeMode','viewMode','tint','mlo','mhi','brt','con','sat','shp','den','jpgq','offx100','offy100','offzx','offzy'])if($(id))$(id).value=S[id==='rangeMode'?'range':id==='viewMode'?'view':id==='jpgq'?'jpegQuality':id];$('dist').value=S.alignDistanceCm||30;if($('manualBox')&&+S.range===11)$('manualBox').open=true;$('crosshair').checked=!!S.crosshair;$('recHud').checked=!!recHud;labels()}
 function applyState(s){Object.assign(S,s);S.lo=s.rangeLo;S.hi=s.rangeHi;sync();dirtyThermal=true;sceneDirty=true;conn('online',false)}
 async function getState(){if(stateBusy||!running)return;stateBusy=true;try{let r=await fetchTimeout('/api/state',{cache:'no-store'},1500);if(!r.ok)throw 0;applyState(await r.json())}catch(e){conn('state retry',true)}finally{stateBusy=false;setTimeout(getState,1000)}}
 async function getDiag(){if(diagBusy||!running||!$('diagBox').open)return;diagBusy=true;try{let r=await fetchTimeout('/api/diag',{cache:'no-store'},1500);if(!r.ok)throw 0;Object.assign(S,await r.json());labels()}catch(e){}finally{diagBusy=false;if(running&&$('diagBox').open)setTimeout(getDiag,1000)}}
 async function getThermal(){if(thermBusy||!running)return;thermBusy=true;try{let r=await fetchTimeout('/thermal.bin',{cache:'no-store'},1500);if(!r.ok)throw 0;let b=await r.arrayBuffer(),dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;thermal=a;let h=r.headers;S.seq=+(h.get('X-Frame-Seq')||S.seq);S.lo=+(h.get('X-Range-Lo')||S.lo);S.hi=+(h.get('X-Range-Hi')||S.hi);S.tCenter=+(h.get('X-Temp-Center')||S.tCenter);S.tMin=+(h.get('X-Temp-Min')||S.tMin);S.tMax=+(h.get('X-Temp-Max')||S.tMax);if(marker)markerTemp=rawTempAt(marker.x,marker.y);dirtyThermal=true;sceneDirty=true;labels()}catch(e){conn('thermal retry',true)}finally{thermBusy=false;setTimeout(getThermal,+S.view===1?750:(+S.view===2?125:250))}}
 function loadImg(url){return new Promise((res,rej)=>{let i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=url})}
 async function setCam(blob){let t=performance.now(),url=URL.createObjectURL(blob);try{let img=await loadImg(url);if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img;camDecodeMs=performance.now()-t;camStatus='ok';sceneDirty=true}catch(e){URL.revokeObjectURL(url);camStatus='decode failed';throw e}}
-async function getCam(){if(camBusy||!running||+S.view===2||mjpegActive)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1800);if(!r.ok)throw 0;let h=r.headers;S.camEncodeMs=+(h.get('X-Cam-Encode-Ms')||S.camEncodeMs);S.camSendMs=+(h.get('X-Cam-Send-Ms')||S.camSendMs);S.camTotalMs=+(h.get('X-Cam-Total-Ms')||S.camTotalMs);S.camJpegBytes=+(h.get('X-Cam-Bytes')||S.camJpegBytes);S.jpegQuality=+(h.get('X-JPEG-Quality')||S.jpegQuality);S.camTransport=h.get('X-Cam-Transport')||S.camTransport;let blob=await r.blob();camFetchMs=performance.now()-t;camBytes=blob.size;await setCam(blob);labels()}catch(e){camStatus='retry';conn('cam retry',true)}finally{camBusy=false;if(!mjpegActive)setTimeout(getCam,+S.view===1?125:160)}}
+async function getCam(){if(camBusy||!running||+S.view===2||mjpegActive)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1800);if(!r.ok)throw 0;let h=r.headers;S.camEncodeMs=+(h.get('X-Cam-Encode-Ms')||S.camEncodeMs);S.camSendMs=+(h.get('X-Cam-Send-Ms')||S.camSendMs);S.camTotalMs=+(h.get('X-Cam-Total-Ms')||S.camTotalMs);S.camJpegBytes=+(h.get('X-Cam-Bytes')||S.camJpegBytes);S.jpegQuality=+(h.get('X-JPEG-Quality')||S.jpegQuality);S.camPreCropped=+(h.get('X-Cam-Precropped')||S.camPreCropped);S.camStreamW=+(h.get('X-Cam-Width')||S.camStreamW);S.camStreamH=+(h.get('X-Cam-Height')||S.camStreamH);S.camTransport=h.get('X-Cam-Transport')||S.camTransport;let blob=await r.blob();camFetchMs=performance.now()-t;camBytes=blob.size;await setCam(blob);labels()}catch(e){camStatus='retry';conn('cam retry',true)}finally{camBusy=false;if(!mjpegActive)setTimeout(getCam,+S.view===1?125:160)}}
 function post(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(()=>{let p=new URLSearchParams(pending);pending={};fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p},1800).catch(()=>conn('control retry',true))},160)}
-function recomputeLocalAlign(){let base=Math.round(PARA_COEFF/(+S.alignDistanceCm||100));S.basePx100=base;S.baseZx=S.baseZx||101;S.baseZy=S.baseZy||125;S.px100=base+(+S.offx100||0);S.py100=+S.offy100||0;S.zx=clamp((+S.baseZx||101)+(+S.offzx||0),100,250);S.zy=clamp((+S.baseZy||125)+(+S.offzy||0),100,250)}
+function recomputeLocalAlign(){let base=BASE_PX100+Math.round(PARA_COEFF/(+S.alignDistanceCm||30));S.basePx100=base;S.basePy100=BASE_PY100;S.baseZx=S.baseZx||BASE_ZX;S.baseZy=S.baseZy||BASE_ZY;S.px100=base+(+S.offx100||0);S.py100=BASE_PY100+(+S.offy100||0);S.zx=clamp((+S.baseZx||BASE_ZX)+(+S.offzx||0),100,250);S.zy=clamp((+S.baseZy||BASE_ZY)+(+S.offzy||0),100,250)}
 function setDistance(v){v=clamp(Math.round(v),5,500);S.alignDistanceCm=v;recomputeLocalAlign();$('dist').value=v;post({dist:v});sceneDirty=true;labels()}
 function setOffset(id,v){S[id]=+v;recomputeLocalAlign();post({[id]:v});sceneDirty=true;labels()}
 for(let id of ['dist','tint','mlo','mhi','brt','con','sat','shp','den'])$(id).oninput=e=>{let v=+e.target.value;if(id==='dist'){setDistance(v)}else{S[id]=v;post({[id]:v});labels()}dirtyThermal=true;sceneDirty=true};
 for(let id of ['offx100','offy100','offzx','offzy'])$(id).oninput=e=>setOffset(id,+e.target.value);
-$('distMinus').onclick=()=>setDistance((+S.alignDistanceCm||100)-5);$('distPlus').onclick=()=>setDistance((+S.alignDistanceCm||100)+5);
+$('distMinus').onclick=()=>setDistance((+S.alignDistanceCm||30)-5);$('distPlus').onclick=()=>setDistance((+S.alignDistanceCm||30)+5);
 $('distPresets').innerHTML=PRESETS.map(p=>`<button data-cm="${p[1]}">${p[0]}<br>${p[1]}</button>`).join('');$('distPresets').onclick=e=>{let b=e.target.closest('button');if(b)setDistance(+b.dataset.cm)};
-$('viewMode').onchange=e=>{S.view=+e.target.value;sceneDirty=true;post({view:S.view});getCam();getThermal()};$('rangeMode').onchange=e=>{S.range=+e.target.value;dirtyThermal=true;sceneDirty=true;post({range:S.range})};$('jpgq').onchange=e=>{S.jpegQuality=+e.target.value;post({jpgq:S.jpegQuality})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;sceneDirty=true;post({crosshair:S.crosshair})};$('recHud').onchange=e=>{recHud=e.target.checked?1:0;localStorage.recHud=recHud};$('diagBox').ontoggle=()=>{labels();if($('diagBox').open)getDiag()};$('resetAlign').onclick=()=>{S.offx100=S.offy100=S.offzx=S.offzy=0;for(let id of ['offx100','offy100','offzx','offzy'])$(id).value=0;setDistance(100);post({reset_alignment:1})};$('rotBtn').onclick=()=>{rot=(rot+1)%4;setCanvasRotation()};$('snap').onclick=()=>{try{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()}catch(e){$('saveMsg').textContent='Snapshot unavailable with this camera transport.'}};canvas.onclick=e=>{let r=canvas.getBoundingClientRect(),p=viewToScene((e.clientX-r.left)*canvas.width/r.width,(e.clientY-r.top)*canvas.height/r.height);marker=p;markerTemp=rawTempAt(p.x,p.y);sceneDirty=true;labels()};
+$('viewMode').onchange=e=>{S.view=+e.target.value;sceneDirty=true;post({view:S.view});getCam();getThermal()};$('rangeMode').onchange=e=>{S.range=+e.target.value;dirtyThermal=true;sceneDirty=true;post({range:S.range})};$('jpgq').onchange=e=>{S.jpegQuality=+e.target.value;post({jpgq:S.jpegQuality})};$('crosshair').onchange=e=>{S.crosshair=e.target.checked?1:0;sceneDirty=true;post({crosshair:S.crosshair})};$('recHud').onchange=e=>{recHud=e.target.checked?1:0;localStorage.recHud=recHud};$('diagBox').ontoggle=()=>{labels();if($('diagBox').open)getDiag()};$('resetAlign').onclick=()=>{S.offx100=S.offy100=S.offzx=S.offzy=0;for(let id of ['offx100','offy100','offzx','offzy'])$(id).value=0;setDistance(30);post({reset_alignment:1})};$('rotBtn').onclick=()=>{rot=(rot+1)%4;setCanvasRotation()};$('snap').onclick=()=>{try{let a=document.createElement('a');a.download='thermal-frame.png';a.href=canvas.toDataURL('image/png');a.click()}catch(e){$('saveMsg').textContent='Snapshot unavailable with this camera transport.'}};canvas.onclick=e=>{let r=canvas.getBoundingClientRect(),p=viewToScene((e.clientX-r.left)*canvas.width/r.width,(e.clientY-r.top)*canvas.height/r.height);marker=p;markerTemp=rawTempAt(p.x,p.y);sceneDirty=true;labels()};
 function recType(){return['video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'].find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t))||''}function stopRec(){if(rec)rec.stop()}$('recBtn').onclick=()=>{if(rec){stopRec();return}if(!recCanvas.captureStream||!window.MediaRecorder){$('saveMsg').textContent='Recording unavailable; use screen recording.';return}chunks=[];let type=recType();rec=new MediaRecorder(recCanvas.captureStream(15),type?{mimeType:type}:undefined);rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};rec.onstop=()=>{clearInterval(recTimer);let blob=new Blob(chunks,{type:type||'video/webm'});if(recUrl)URL.revokeObjectURL(recUrl);recUrl=URL.createObjectURL(blob);$('saveMsg').innerHTML=`<a href="${recUrl}" download="thermal-stream.${type.includes('mp4')?'mp4':'webm'}">Download recording</a>`;$('recBtn').textContent='Record';rec=null};rec.start(1000);recStarted=Date.now();recTimer=setInterval(()=>{$('saveMsg').textContent='Recording '+mmss(Date.now()-recStarted)},500);$('recBtn').textContent='Stop'};
 $('stopPortal').onclick=async()=>{$('saveMsg').textContent='Stopping portal...';try{let r=await fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({stop_stream:1})},1200);running=false;$('saveMsg').textContent=r.ok?'Stop requested.':'Stop request failed; hold button 3s.'}catch(e){$('saveMsg').textContent='Stop failed; hold button 3s.'}};
 function startMjpeg(){mjpegImg.onload=()=>{mjpegActive=true;camStatus='mjpeg';sceneDirty=true;labels()};mjpegImg.onerror=()=>{mjpegActive=false;camStatus='poll fallback';getCam()};mjpegImg.src=`http://${location.hostname}:81/stream?${Date.now()}`;setTimeout(()=>{if(!mjpegActive)getCam()},2500);setInterval(()=>{if(!mjpegActive&&mjpegImg.naturalWidth){mjpegActive=true;camStatus='mjpeg';labels()}if(mjpegActive)sceneDirty=true},150)}
@@ -3141,6 +3315,7 @@ void captureFreezeShareSnapshot() {
   freeze_parallax_x100 = parallax_x100;
   freeze_parallax_y100 = parallax_y100;
   freeze_tint_pct = tint_pct;
+  freeze_range_mode = range_mode;
   getThermalRange(freeze_range_lo, freeze_range_hi);
 
   freeze_cam_valid = false;
@@ -3239,7 +3414,8 @@ uint8_t freezeThermalPaletteIndexAt(int x, int y, bool &inside) {
 #else
   float temp = freezeThermalCell(ty0, tx0);
 #endif
-  return tempToPaletteIndex(temp, freeze_range_lo, freeze_range_hi);
+  return tempToPaletteIndexForMode(temp, freeze_range_lo, freeze_range_hi,
+                                   rangeUsesColdPalette(freeze_range_mode));
 }
 
 void sendFreezeBmp(uint8_t mode, const char *filename) {
@@ -3415,6 +3591,9 @@ void addStreamJpegTimingHeaders(size_t jpg_len, uint32_t encode_us) {
   share_server.sendHeader("X-Cam-Send-Ms", String(stream_cam_send_ms, 1));
   share_server.sendHeader("X-Cam-Total-Ms", String(stream_cam_total_ms, 1));
   share_server.sendHeader("X-Cam-Bytes", String((unsigned)jpg_len));
+  share_server.sendHeader("X-Cam-Precropped", stream_cam_pre_cropped ? "1" : "0");
+  share_server.sendHeader("X-Cam-Width", String((unsigned)stream_cam_encode_w));
+  share_server.sendHeader("X-Cam-Height", String((unsigned)stream_cam_encode_h));
   share_server.sendHeader("X-Cam-Seq", String((unsigned long)thermal_frame_seq));
   share_server.sendHeader("X-JPEG-Quality", String((int)stream_jpeg_quality));
   share_server.sendHeader("X-Cam-Cache-Age-Ms", String((unsigned long)(millis() - stream_cam_cache_ms)));
@@ -3560,11 +3739,11 @@ void handleStreamControl() {
     if (share_server.hasArg("offx100")) offx100 = argPx100Clamped("offx100", "offx", offx100);
     else if (share_server.hasArg("px100") || share_server.hasArg("px")) {
       offx100 = argPx100Clamped("px100", "px", parallax_x100) -
-                parallaxX100ForDistance(align_distance_cm);
+                baseParallaxX100ForDistance(align_distance_cm);
     }
     if (share_server.hasArg("offy100")) offy100 = argPx100Clamped("offy100", "offy", offy100);
     else if (share_server.hasArg("py100") || share_server.hasArg("py")) {
-      offy100 = argPx100Clamped("py100", "py", parallax_y100);
+      offy100 = argPx100Clamped("py100", "py", parallax_y100) - baseParallaxY100();
     }
     if (share_server.hasArg("offzx")) offzx = argZoomOffsetClamped("offzx", offzx);
     else if (share_server.hasArg("zx")) offzx = argIntClamped("zx", zoom_x_pct, ZOOM_MIN, ZOOM_MAX) - baseZoomXPct();
@@ -3687,7 +3866,8 @@ void handleStreamState() {
   json += F(",\"zoom\":"); json += zoom_y_pct;
   json += F(",\"zx\":"); json += zoom_x_pct;
   json += F(",\"zy\":"); json += zoom_y_pct;
-  json += F(",\"basePx100\":"); json += parallaxX100ForDistance(align_distance_cm);
+  json += F(",\"basePx100\":"); json += baseParallaxX100ForDistance(align_distance_cm);
+  json += F(",\"basePy100\":"); json += baseParallaxY100();
   json += F(",\"baseZx\":"); json += baseZoomXPct();
   json += F(",\"baseZy\":"); json += baseZoomYPct();
   json += F(",\"alignPresetCm\":"); json += align_distance_cm;
@@ -3717,6 +3897,9 @@ void handleStreamState() {
   json += F(",\"camTransport\":\"");
   json += F("rgb565-cache\"");
   json += F(",\"jpegQuality\":"); json += (int)stream_jpeg_quality;
+  json += F(",\"camPreCropped\":"); json += stream_cam_pre_cropped ? 1 : 0;
+  json += F(",\"camStreamW\":"); json += stream_cam_encode_w;
+  json += F(",\"camStreamH\":"); json += stream_cam_encode_h;
   json += F(",\"camCacheFps\":"); json += String(stream_cam_cache_fps, 1);
   json += F(",\"camCacheAgeMs\":"); json += stream_cam_cache_ms ? (now - stream_cam_cache_ms) : 0;
   json += F(",\"mjpegPort\":81");
@@ -3750,6 +3933,9 @@ void handleStreamDiagnostics() {
   json += F(",\"camTransport\":\"");
   json += F("rgb565-cache\"");
   json += F(",\"jpegQuality\":"); json += (int)stream_jpeg_quality;
+  json += F(",\"camPreCropped\":"); json += stream_cam_pre_cropped ? 1 : 0;
+  json += F(",\"camStreamW\":"); json += stream_cam_encode_w;
+  json += F(",\"camStreamH\":"); json += stream_cam_encode_h;
   json += F(",\"camEncodeMs\":"); json += String(stream_cam_encode_ms, 1);
   json += F(",\"camSendMs\":"); json += String(stream_cam_send_ms, 1);
   json += F(",\"camTotalMs\":"); json += String(stream_cam_total_ms, 1);
@@ -4004,6 +4190,18 @@ static inline void noteLoopTiming(float &dst, uint32_t elapsed_us) {
   else dst += (ms - dst) * 0.20f;
 }
 
+void drawStatusBadge(int x, int y, int w, int h,
+                     const char *text, uint16_t bg, uint16_t fg) {
+  lcd.fillRoundRect(x, y, w, h, 3, bg);
+  lcd.drawRoundRect(x, y, w, h, 3, TFT_DARKGREY);
+  lcd.setTextSize(1);
+  lcd.setTextColor(fg, bg);
+  int tx = x + (w - (int)strlen(text) * 6) / 2;
+  if (tx < x + 2) tx = x + 2;
+  lcd.setCursor(tx, y + (h - 8) / 2);
+  lcd.print(text);
+}
+
 void drawStaticUI() {
   layoutUi();
   if (PALETTE_W > 0) {
@@ -4015,88 +4213,59 @@ void drawStaticUI() {
                         palette_native[palette_i]);
     }
   }
-  lcd.drawFastVLine(PANEL_X - 3, 22, 296, TFT_DARKGREY);
+  lcd.drawFastVLine(PANEL_X - 3, 2, 316, TFT_DARKGREY);
   drawButtons(); drawAdjustSliders();
-  if (panel_tab != PANEL_TAB_ADVANCED) drawSlider();
-  drawBrightnessSlider();
 }
 
 void drawDynamicUI() {
   lcd.setTextColor(TFT_WHITE, TFT_BLACK); lcd.setTextSize(1);
   char buf[40];
 
-  // Side palette labels.
-  lcd.fillRect(TMAX_LABEL_X, TMAX_LABEL_Y, 38, 12, TFT_BLACK);
-  snprintf(buf, sizeof(buf), "%4.1fC", t_max);
-  lcd.setCursor(TB_TMAX, TMAX_LABEL_Y); lcd.print(buf);
-  lcd.fillRect(TMIN_LABEL_X, TMIN_LABEL_Y, 38, 12, TFT_BLACK);
-  snprintf(buf, sizeof(buf), "%4.1fC", t_min);
-  lcd.setCursor(TMIN_LABEL_X, TMIN_LABEL_Y); lcd.print(buf);
+  const char *event_text = nullptr;
+  uint16_t event_bg = TFT_BLACK;
+  if (share_ap_running) {
+    event_text = "AP"; event_bg = TFT_RED;
+  } else if (freeze_mode) {
+    event_text = "FRZ"; event_bg = TFT_RED;
+  } else if (millis() < save_indicator_until_ms) {
+    event_text = "SAV"; event_bg = TFT_DARKGREEN;
+  }
+  drawStatusBadge(STATUS_BADGE_X, STATUS_MODE_Y, STATUS_BADGE_W, STATUS_BADGE_H,
+                  MODE_NAMES[display_mode], MODE_BG[display_mode],
+                  display_mode == MODE_TINT ? TFT_BLACK : TFT_WHITE);
+  drawStatusBadge(STATUS_BADGE_X, STATUS_RANGE_Y, STATUS_BADGE_W, STATUS_BADGE_H,
+                  RANGE_NAMES[range_mode], TFT_PURPLE, TFT_WHITE);
+  lcd.fillRect(STATUS_EVENT_X, STATUS_EVENT_Y, STATUS_EVENT_W, STATUS_EVENT_H, TFT_BLACK);
+  if (event_text) {
+    drawStatusBadge(STATUS_EVENT_X, STATUS_EVENT_Y, STATUS_EVENT_W, STATUS_EVENT_H,
+                    event_text, event_bg, TFT_WHITE);
+  }
 
-  // Top bar: full-width clear so battery on the right doesn't leave a gap.
-  lcd.fillRect(TOPBAR_CLEAR_X, 0, TOPBAR_CLEAR_W, 18, TFT_BLACK);
+  // Centre temperature, or selected probe temperature once the image is tapped.
+  bool marker_readout = screen_marker_active && !isnan(screen_marker_temp);
+  const uint16_t temp_bg = 0x0841;
+  lcd.fillRect(TEMP_CLEAR_X, TEMP_CLEAR_Y, TEMP_CLEAR_W, TEMP_CLEAR_H, TFT_BLACK);
+  lcd.fillRoundRect(TEMP_CLEAR_X + 4, TEMP_CLEAR_Y + 1,
+                    TEMP_CLEAR_W - 8, TEMP_CLEAR_H - 3, 6, temp_bg);
+  lcd.setTextSize(3);
+  if (marker_readout) {
+    snprintf(buf, sizeof(buf), "M%.1fC", screen_marker_temp);
+  } else {
+    snprintf(buf, sizeof(buf), "%.1fC", t_center);
+  }
+  int tw = (int)strlen(buf) * 18;
+  int tx = IMG_X + (IMG_W - tw) / 2;
+  if (tx < TEMP_CLEAR_X) tx = TEMP_CLEAR_X;
+  lcd.setTextColor(marker_readout ? TFT_YELLOW : TFT_WHITE, temp_bg);
+  lcd.setCursor(tx, 5);
+  lcd.print(buf);
 
-  // Centre temperature, large.
-  lcd.setTextSize(2);
-  snprintf(buf, sizeof(buf), "%.1fC", t_center);
-  lcd.setCursor(TB_CTR, 1); lcd.print(buf);
-
-  // Smaller fields with a spacer column between each so they read clearly.
+  lcd.fillRect(FPS_X, FPS_Y, FPS_W, FPS_H, TFT_BLACK);
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
-  snprintf(buf, sizeof(buf), "%.1ffps", current_fps);
-  lcd.setCursor(TB_FPS, 5); lcd.print(buf);
-  lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-  snprintf(buf, sizeof(buf), "D%d", align_distance_cm);
-  lcd.setCursor(TB_ZOOM, 5); lcd.print(buf);
-  snprintf(buf, sizeof(buf), "X%+d.%01d", parallax_x100 / 100, abs(parallax_x100 % 100) / 10);
-  lcd.setCursor(TB_PARA, 5); lcd.print(buf);
-
-  // Mode tag.
-  lcd.fillRect(TB_MODE, 2, TB_MODE_W, 14, MODE_BG[display_mode]);
-  lcd.setTextColor(TFT_BLACK, MODE_BG[display_mode]);
-  lcd.setCursor(TB_MODE + 3, 5); lcd.print(MODE_NAMES[display_mode]);
-
-  // Range tag.
-  lcd.fillRect(TB_RNG, 2, TB_RNG_W, 14, TFT_PURPLE);
-  lcd.setTextColor(TFT_WHITE, TFT_PURPLE);
-  lcd.setCursor(TB_RNG + 3, 5); lcd.print(RANGE_NAMES[range_mode]);
-
-  // Status badge: AP implies a frozen frame is being shared.
-  if (share_ap_running) {
-    lcd.fillRect(TB_STAT, 2, TB_STAT_W, 14, TFT_RED);
-    lcd.setTextColor(TFT_WHITE, TFT_RED);
-    lcd.setCursor(TB_STAT + 6, 5); lcd.print("AP");
-  } else if (freeze_mode) {
-    lcd.fillRect(TB_STAT, 2, TB_STAT_W, 14, TFT_RED);
-    lcd.setTextColor(TFT_WHITE, TFT_RED);
-    lcd.setCursor(TB_STAT + 3, 5); lcd.print("FRZ");
-  } else if (millis() < save_indicator_until_ms) {
-    lcd.fillRect(TB_STAT, 2, TB_STAT_W, 14, TFT_DARKGREEN);
-    lcd.setTextColor(TFT_WHITE, TFT_DARKGREEN);
-    lcd.setCursor(TB_STAT + 3, 5); lcd.print("SAV");
-  }
-
-  // Battery. Hidden if BATTERY_ADC_PIN is -1 (default).
-  if (TB_BAT >= 0 && battery_pct >= 0) {
-    uint16_t col = battery_pct < 20 ? TFT_RED
-                 : battery_pct < 50 ? TFT_YELLOW
-                                    : TFT_GREEN;
-    lcd.setTextColor(col, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "%3d%% %.2fV", battery_pct, battery_v);
-    lcd.setCursor(TB_BAT, 5); lcd.print(buf);
-  }
-
-  lcd.fillRect(READOUT_X, READOUT_Y, READOUT_W, READOUT_H, TFT_BLACK);
-  lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-  if (share_ap_running) {
-    snprintf(buf, sizeof(buf), "%s", share_ap_ssid);
-  } else if (screen_marker_active && !isnan(screen_marker_temp)) {
-    snprintf(buf, sizeof(buf), "M %.1fC", screen_marker_temp);
-  } else {
-    snprintf(buf, sizeof(buf), "%dcm", align_distance_cm);
-  }
-  lcd.setCursor(READOUT_X + 2, READOUT_Y); lcd.print(buf);
+  snprintf(buf, sizeof(buf), "FPS %.1f", current_fps);
+  lcd.setCursor(FPS_X, FPS_Y);
+  lcd.print(buf);
 }
 
 // --------------------------------------------------------------- Storage --
@@ -4106,12 +4275,10 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n=== FLIR v16 ===");
-  analogReadResolution(12);
-  
-  // Set the pin to 11dB attenuation so it can read up to ~3.3V.
-#if BATTERY_ADC_PIN >= 0
-  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
-#endif
+  Serial.printf("Clocks: CPU=%uMHz LCD_SPI=%luHz CAM_XCLK=16MHz RGB_FB=%u\n",
+                getCpuFrequencyMhz(),
+                (unsigned long)TFT_WRITE_FREQ_HZ,
+                (unsigned)CAMERA_RGB565_FB_COUNT);
   
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
@@ -4168,12 +4335,11 @@ void setup() {
   }
   last_mlx_ms = millis();
 
-  Serial.println("[7/8] Palette + UI + Battery");
+  Serial.println("[7/8] Palette + UI");
   buildPalette();
   loadSettings();
   layoutUi();
   if (brightness_apply_pending) { applyCameraBrightness(); brightness_apply_pending = false; }
-  readBattery();
   lcd.fillScreen(TFT_BLACK);
   drawStaticUI();
 
@@ -4241,14 +4407,6 @@ void loop() {
       now - last_mlx_ms >= MLX_POLL_MS) {
     last_mlx_ms = now;
     if (readMLXSubpage() == MLX_READ_FULL) analyzeMLX();
-  }
-
-  // Battery roughly twice a second; the divider draws no current to speak
-  // of, but ADC sampling isn't free either, and percentage doesn't change
-  // that fast.
-  if (now - last_bat_ms >= 500) {
-    readBattery();
-    last_bat_ms = now;
   }
 
   if (!freeze_mode && stream_mode) {
