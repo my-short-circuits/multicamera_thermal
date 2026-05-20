@@ -1201,8 +1201,10 @@ static constexpr int ZOOM_MAX = 250;
 // Field calibration from the 20-30 cm overlay test. Distance still changes the
 // X parallax term; these constants correct the fixed optical-center and FOV
 // mismatch so ADV sliders are only extra offsets.
-static constexpr int ALIGN_BASE_PX100 = -1920;
-static constexpr int ALIGN_BASE_PY100 = -1120;
+static constexpr int ALIGN_BASE_PX100 = -720;
+static constexpr int ALIGN_BASE_PY100 = -670;
+static constexpr int ALIGN_LEGACY_OFFSET_PX100 = -1920;
+static constexpr int ALIGN_LEGACY_OFFSET_PY100 = -1120;
 static constexpr int ALIGN_BASE_ZX = 126;
 static constexpr int ALIGN_BASE_ZY = 126;
 static constexpr uint8_t ALIGN_SETTINGS_VERSION = 4;
@@ -1276,6 +1278,12 @@ volatile int8_t cam_denoise = 0;
 volatile bool cam_lenc = true;
 volatile bool cam_raw_gma = true;
 bool             brightness_apply_pending = false;
+
+static constexpr uint8_t LCD_BRIGHTNESS_MIN = 40;
+static constexpr uint8_t LCD_BRIGHTNESS_MAX = 255;
+static constexpr uint8_t LCD_BRIGHTNESS_STEP = 15;
+volatile uint8_t lcd_brightness = LCD_BRIGHTNESS_MAX;
+
 static constexpr uint8_t STREAM_JPEG_QUALITY_DEFAULT = 45;
 static constexpr uint8_t STREAM_JPEG_QUALITY_MIN = 35;
 static constexpr uint8_t STREAM_JPEG_QUALITY_MAX = 85;
@@ -1306,6 +1314,40 @@ static inline void setDirtyInt(volatile int &dst, int value) {
 
 static inline void setDirtyU8(volatile uint8_t &dst, uint8_t value) {
   if (dst != value) { dst = value; markDirty(); }
+}
+
+static inline uint8_t clampLcdBrightness(int value) {
+  if (value < LCD_BRIGHTNESS_MIN) return LCD_BRIGHTNESS_MIN;
+  if (value > LCD_BRIGHTNESS_MAX) return LCD_BRIGHTNESS_MAX;
+  return (uint8_t)value;
+}
+
+static inline int lcdBrightnessToSliderPct(uint8_t value) {
+  uint8_t v = clampLcdBrightness(value);
+  return (int)(v - LCD_BRIGHTNESS_MIN) * 100 /
+         (LCD_BRIGHTNESS_MAX - LCD_BRIGHTNESS_MIN);
+}
+
+static inline uint8_t sliderPctToLcdBrightness(int pct) {
+  if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+  return clampLcdBrightness(LCD_BRIGHTNESS_MIN +
+                            pct * (LCD_BRIGHTNESS_MAX - LCD_BRIGHTNESS_MIN) / 100);
+}
+
+static inline int lcdBrightnessDisplayPct(uint8_t value) {
+  return ((int)clampLcdBrightness(value) * 100 + 127) / 255;
+}
+
+void applyLcdBrightness() {
+  lcd.setBrightness(clampLcdBrightness(lcd_brightness));
+}
+
+void setLcdBrightnessValue(int value, bool dirty) {
+  uint8_t next = clampLcdBrightness(value);
+  if (next == lcd_brightness) return;
+  lcd_brightness = next;
+  applyLcdBrightness();
+  if (dirty) markDirty();
 }
 
 static inline int clampParallax100(int v) {
@@ -1418,6 +1460,7 @@ void loadSettings() {
   cam_denoise = (int8_t)prefs.getChar("den", 0);
   cam_lenc = prefs.getBool("lenc", true);
   cam_raw_gma = prefs.getBool("gma", true);
+  lcd_brightness = clampLcdBrightness(prefs.getUChar("lcdbrt", LCD_BRIGHTNESS_MAX));
   stream_jpeg_quality = clampStreamJpegQuality(prefs.getUChar("jpgq", STREAM_JPEG_QUALITY_DEFAULT));
   manual_lo    = prefs.getFloat("mlo", 22.0f);
   manual_hi    = prefs.getFloat("mhi", 38.0f);
@@ -1432,8 +1475,8 @@ void loadSettings() {
     align_zoom_x_offset = old_zx - ALIGN_BASE_ZX;
     align_zoom_y_offset = old_zy - ALIGN_BASE_ZY;
   } else if (av < ALIGN_SETTINGS_VERSION) {
-    if (abs(align_offset_x100 - ALIGN_BASE_PX100) <= 125 &&
-        abs(align_offset_y100 - ALIGN_BASE_PY100) <= 125 &&
+    if (abs(align_offset_x100 - ALIGN_LEGACY_OFFSET_PX100) <= 125 &&
+        abs(align_offset_y100 - ALIGN_LEGACY_OFFSET_PY100) <= 125 &&
         abs(align_zoom_x_offset - 6) <= 1 &&
         abs(align_zoom_y_offset - 4) <= 1) {
       align_offset_x100 = 0;
@@ -1451,6 +1494,7 @@ void loadSettings() {
   if (cam_saturation < -2) cam_saturation = -2; else if (cam_saturation > 2) cam_saturation = 2;
   if (cam_sharpness < -2) cam_sharpness = -2; else if (cam_sharpness > 2) cam_sharpness = 2;
   if (cam_denoise < 0) cam_denoise = 0; else if (cam_denoise > 1) cam_denoise = 1;
+  lcd_brightness = clampLcdBrightness(lcd_brightness);
   if (manual_lo  < MANUAL_T_MIN) manual_lo = MANUAL_T_MIN;
   if (manual_lo  > MANUAL_T_MAX) manual_lo = MANUAL_T_MAX;
   if (manual_hi  < MANUAL_T_MIN) manual_hi = MANUAL_T_MIN;
@@ -1504,12 +1548,13 @@ void loadSettings() {
   range_mode   = (r < RANGE_COUNT) ? (RangeMode)r   : RANGE_AUTO;
   panel_tab    = (has_panel_tab && pt < PANEL_TAB_COUNT) ? (uint8_t)pt : (uint8_t)PANEL_TAB_TUNE;
   brightness_apply_pending = true;        // push into sensor on first frame
-  Serial.printf("Loaded: PX100=%+d,%+d Off=%+d,%+d Z=%d/%d%% Zoff=%+d/%+d Dist=%dcm Tint=%d%% Brt=%+d JPGQ=%u Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
+  Serial.printf("Loaded: PX100=%+d,%+d Off=%+d,%+d Z=%d/%d%% Zoff=%+d/%+d Dist=%dcm Tint=%d%% Brt=%+d LCD=%u JPGQ=%u Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
                 parallax_x100, parallax_y100,
                 align_offset_x100, align_offset_y100,
                 zoom_x_pct, zoom_y_pct,
                 align_zoom_x_offset, align_zoom_y_offset,
                 align_distance_cm, tint_pct, cam_brightness,
+                (unsigned)lcd_brightness,
                 (unsigned)stream_jpeg_quality, MODE_NAMES[display_mode], RANGE_NAMES[range_mode],
                 manual_lo, manual_hi);
 }
@@ -1541,18 +1586,20 @@ void saveSettings() {
   prefs.putChar ("den",  (int8_t)cam_denoise);
   prefs.putBool ("lenc", cam_lenc);
   prefs.putBool ("gma",  cam_raw_gma);
+  prefs.putUChar("lcdbrt", lcd_brightness);
   prefs.putUChar("jpgq", stream_jpeg_quality);
   prefs.putFloat("mlo",  manual_lo);
   prefs.putFloat("mhi",  manual_hi);
   prefs.putUChar("ptab", panel_tab);
   prefs.end();
   save_indicator_until_ms = millis() + 1500;
-  Serial.printf("Saved: PX100=%+d,%+d Off=%+d,%+d Z=%d/%d%% Zoff=%+d/%+d Dist=%dcm Tint=%d%% Brt=%+d JPGQ=%u Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
+  Serial.printf("Saved: PX100=%+d,%+d Off=%+d,%+d Z=%d/%d%% Zoff=%+d/%+d Dist=%dcm Tint=%d%% Brt=%+d LCD=%u JPGQ=%u Mode=%s Rng=%s Man=[%.1f,%.1f]\n",
                 parallax_x100, parallax_y100,
                 align_offset_x100, align_offset_y100,
                 zoom_x_pct, zoom_y_pct,
                 align_zoom_x_offset, align_zoom_y_offset,
                 align_distance_cm, tint_pct, cam_brightness,
+                (unsigned)lcd_brightness,
                 (unsigned)stream_jpeg_quality, MODE_NAMES[display_mode], RANGE_NAMES[range_mode],
                 manual_lo, manual_hi);
 }
@@ -1702,7 +1749,8 @@ static int ADV_Y_Y       = 148;
 static int ADV_ZX_Y      = 178;
 static int ADV_ZY_Y      = 208;
 static int ADV_BRT_Y     = 238;
-static int ADV_RESET_Y   = 262;
+static int ADV_LCD_BRT_Y = 268;
+static int ADV_RESET_Y   = 292;
 
 void btnCycleMode()  { display_mode = (DisplayMode)((display_mode + 1) % MODE_COUNT);  markDirty(); }
 void btnReset()      { resetAlignmentCalibrated(true); }
@@ -1792,7 +1840,8 @@ void layoutUi() {
   ADV_ZX_Y = 178;
   ADV_ZY_Y = 208;
   ADV_BRT_Y = 238;
-  ADV_RESET_Y = 262;
+  ADV_LCD_BRT_Y = 268;
+  ADV_RESET_Y = 292;
   PALETTE_X = 5;
   PALETTE_Y_TOP = 70;
   PALETTE_Y_BOTTOM = 260;
@@ -2067,7 +2116,7 @@ void drawPanelBrightness() {
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
   lcd.setCursor(PANEL_SLIDER_X, ADV_BRT_Y - 9);
-  lcd.print("BRT");
+  lcd.print("CAM");
   snprintf(buf, sizeof(buf), "%+d", cam_brightness);
   lcd.setCursor(PANEL_SLIDER_X + PANEL_SLIDER_W - (int)strlen(buf) * 6, ADV_BRT_Y - 9);
   lcd.print(buf);
@@ -2084,6 +2133,14 @@ void drawPanelBrightness() {
     lcd.setCursor(x + (cell_w - (int)strlen(buf) * 6) / 2, ADV_BRT_Y + 5);
     lcd.print(buf);
   }
+}
+
+void drawPanelLcdBrightness() {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", lcdBrightnessDisplayPct(lcd_brightness));
+  drawCompactSlider(PANEL_SLIDER_X, ADV_LCD_BRT_Y, PANEL_SLIDER_W, 16,
+                    lcdBrightnessToSliderPct(lcd_brightness), "LCD", buf,
+                    TFT_YELLOW, true);
 }
 
 void drawAdvancedResetButton() {
@@ -2113,6 +2170,7 @@ void drawAdvancedAlignmentPanel() {
   drawCompactSlider(PANEL_SLIDER_X, ADV_ZY_Y, PANEL_SLIDER_W, 16,
                     zoomOffsetToPct(align_zoom_y_offset), "ZY OFF", buf, TFT_GREEN, true);
   drawPanelBrightness();
+  drawPanelLcdBrightness();
   drawAdvancedResetButton();
 }
 
@@ -2125,11 +2183,11 @@ void drawTunePanel() {
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
   lcd.setCursor(PANEL_SLIDER_X, Y_SLIDER_Y);
-  lcd.print("BRT is in ADV");
+  lcd.print("CAM/LCD BRT");
   lcd.setCursor(PANEL_SLIDER_X, Y_SLIDER_Y + 14);
-  lcd.print("VIEW/RANGE");
+  lcd.print("is in ADV");
   lcd.setCursor(PANEL_SLIDER_X, Y_SLIDER_Y + 28);
-  lcd.print("change modes");
+  lcd.print("VIEW/RANGE modes");
 }
 
 void drawRangePanel() {
@@ -2264,6 +2322,16 @@ bool handleAdvancedAlignmentTouch(uint16_t tx, uint16_t ty) {
   uint32_t now = millis();
   int dir = sliderNudgeDir(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
   bool track_hit = sliderTrackHit(tx, PANEL_SLIDER_X, PANEL_SLIDER_W);
+
+  if (compactSliderRowHit(tx, ty, PANEL_SLIDER_X, ADV_LCD_BRT_Y, PANEL_SLIDER_W, 16)) {
+    int v = lcd_brightness;
+    if (dir && nudgeReady(now)) v += dir * LCD_BRIGHTNESS_STEP;
+    else if (track_hit) v = sliderPctToLcdBrightness(sliderPctFromTrack(tx, PANEL_SLIDER_X, PANEL_SLIDER_W));
+    else return false;
+    setLcdBrightnessValue(v, true);
+    drawAdjustSliders();
+    return true;
+  }
 
   if (compactSliderRowHit(tx, ty, PANEL_SLIDER_X, ADV_X_Y, PANEL_SLIDER_W, 16)) {
     int v = align_offset_x100;
@@ -4143,7 +4211,7 @@ void setStreamMode(bool enabled) {
     stream_started_ms = 0;
     releaseStreamCameraCache();
     stream_portal_stage = "idle";
-    lcd.setBrightness(255);
+    applyLcdBrightness();
     lcd.fillScreen(TFT_BLACK);
     drawStaticUI();
     last_ui_ms = millis();
@@ -4338,6 +4406,7 @@ void setup() {
   Serial.println("[7/8] Palette + UI");
   buildPalette();
   loadSettings();
+  applyLcdBrightness();
   layoutUi();
   if (brightness_apply_pending) { applyCameraBrightness(); brightness_apply_pending = false; }
   lcd.fillScreen(TFT_BLACK);

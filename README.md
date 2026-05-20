@@ -92,7 +92,7 @@ The LCD keeps the live image visible and groups controls by page:
 - `ALIGN`: distance preset and distance slider.
 - `TUNE`: tint control.
 - `MAN`: manual low/high temperature range.
-- `ADV`: alignment offsets, camera brightness, and reset alignment.
+- `ADV`: alignment offsets, camera brightness, LCD brightness, and reset alignment.
 
 Settings are saved to ESP32 NVS after a debounce.
 
