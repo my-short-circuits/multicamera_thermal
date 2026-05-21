@@ -2682,29 +2682,6 @@ void updateScreenMarkerTemp() {
 
 // Camera crop parameters for zoom and parallax. Output parameters avoid
 // Arduino's generated-prototype edge cases with local struct types.
-static inline void cameraCropRectFor(int zx, int zy, int px100, int py100,
-                                     int &x0, int &y0, int &cw, int &ch) {
-  zx = clampZoomPct(zx);
-  zy = clampZoomPct(zy);
-  px100 = clampParallax100(px100);
-  py100 = clampParallax100(py100);
-
-  cw = (IMG_W * 100 + zx / 2) / zx;
-  ch = (IMG_H * 100 + zy / 2) / zy;
-  if (cw < 1) cw = 1; else if (cw > IMG_W) cw = IMG_W;
-  if (ch < 1) ch = 1; else if (ch > IMG_H) ch = IMG_H;
-
-  int shift_x = (int)(((int64_t)px100 * cw) / (PARALLAX_SCALE * IMG_W));
-  int shift_y = (int)(((int64_t)py100 * ch) / (PARALLAX_SCALE * IMG_H));
-  x0 = (IMG_W - cw) / 2 - shift_x;
-  y0 = (IMG_H - ch) / 2 - shift_y;
-
-  int max_x0 = IMG_W - cw;
-  int max_y0 = IMG_H - ch;
-  if (x0 < 0) x0 = 0; else if (x0 > max_x0) x0 = max_x0;
-  if (y0 < 0) y0 = 0; else if (y0 > max_y0) y0 = max_y0;
-}
-
 static inline void cameraCropParamsFor(int zx, int zy, int px100, int py100,
                                        int32_t &src_x0_q, int32_t &src_y0_q,
                                        int32_t &step_x_q, int32_t &step_y_q)
@@ -2723,6 +2700,61 @@ static inline void cameraCropParamsFor(int zx, int zy, int px100, int py100,
   src_y0_q = (int32_t)(((int64_t)(IMG_H - ch) << 15) - shift_y_q);
   step_x_q = (int32_t)(((int64_t)cw << 16) / IMG_W);
   step_y_q = (int32_t)(((int64_t)ch << 16) / IMG_H);
+}
+
+static inline int floorQ16(int64_t q) {
+  return q >= 0 ? (int)(q >> 16) : -(int)((-q + 65535) >> 16);
+}
+
+static inline int ceilQ16(int64_t q) {
+  return q >= 0 ? (int)((q + 65535) >> 16) : -(int)((-q) >> 16);
+}
+
+static inline float q16ToFloat(int64_t q) {
+  return (float)((double)q / 65536.0);
+}
+
+static inline void clampSourceRect(float &sx, float &sy, float &sw, float &sh,
+                                   int crop_w, int crop_h) {
+  if (sx < 0.0f) { sw += sx; sx = 0.0f; }
+  if (sy < 0.0f) { sh += sy; sy = 0.0f; }
+  if (sx + sw > crop_w) sw = crop_w - sx;
+  if (sy + sh > crop_h) sh = crop_h - sy;
+  if (sw < 1.0f) sw = crop_w;
+  if (sh < 1.0f) sh = crop_h;
+}
+
+static inline void cameraPortalCropFor(int zx, int zy, int px100, int py100,
+                                       int &crop_x, int &crop_y,
+                                       int &crop_w, int &crop_h,
+                                       float &src_x, float &src_y,
+                                       float &src_w, float &src_h) {
+  int32_t x0_q, y0_q, step_x_q, step_y_q;
+  cameraCropParamsFor(zx, zy, px100, py100, x0_q, y0_q, step_x_q, step_y_q);
+  int64_t x1_q = (int64_t)x0_q + (int64_t)step_x_q * IMG_W;
+  int64_t y1_q = (int64_t)y0_q + (int64_t)step_y_q * IMG_H;
+
+  crop_x = floorQ16(x0_q) - 1;
+  crop_y = floorQ16(y0_q) - 1;
+  int crop_x1 = ceilQ16(x1_q) + 1;
+  int crop_y1 = ceilQ16(y1_q) + 1;
+
+  if (crop_x < 0) crop_x = 0;
+  if (crop_y < 0) crop_y = 0;
+  if (crop_x >= IMG_W) crop_x = IMG_W - 1;
+  if (crop_y >= IMG_H) crop_y = IMG_H - 1;
+  if (crop_x1 > IMG_W) crop_x1 = IMG_W;
+  if (crop_y1 > IMG_H) crop_y1 = IMG_H;
+  if (crop_x1 <= crop_x) crop_x1 = crop_x + 1;
+  if (crop_y1 <= crop_y) crop_y1 = crop_y + 1;
+
+  crop_w = crop_x1 - crop_x;
+  crop_h = crop_y1 - crop_y;
+  src_x = q16ToFloat(x0_q) - crop_x;
+  src_y = q16ToFloat(y0_q) - crop_y;
+  src_w = q16ToFloat((int64_t)step_x_q * IMG_W);
+  src_h = q16ToFloat((int64_t)step_y_q * IMG_H);
+  clampSourceRect(src_x, src_y, src_w, src_h, crop_w, crop_h);
 }
 
 static inline void cameraCropParams(int32_t &src_x0_q, int32_t &src_y0_q,
@@ -3017,6 +3049,10 @@ size_t stream_cam_crop_buf_len = 0;
 uint16_t stream_cam_encode_w = IMG_W;
 uint16_t stream_cam_encode_h = IMG_H;
 bool stream_cam_pre_cropped = false;
+float stream_cam_crop_sx = 0.0f;
+float stream_cam_crop_sy = 0.0f;
+float stream_cam_crop_sw = IMG_W;
+float stream_cam_crop_sh = IMG_H;
 uint32_t stream_cam_cache_ms = 0;
 uint32_t stream_cam_cache_seq = 0;
 uint32_t stream_cam_cache_count = 0;
@@ -3122,6 +3158,10 @@ void releaseStreamCameraCache() {
   stream_cam_encode_w = IMG_W;
   stream_cam_encode_h = IMG_H;
   stream_cam_pre_cropped = false;
+  stream_cam_crop_sx = 0.0f;
+  stream_cam_crop_sy = 0.0f;
+  stream_cam_crop_sw = IMG_W;
+  stream_cam_crop_sh = IMG_H;
   stream_cam_cache_valid = false;
   stream_cam_cache_ms = 0;
   stream_cam_cache_seq = 0;
@@ -3165,8 +3205,10 @@ bool updateStreamCameraCache(bool force) {
   uint8_t *encode_src = cam_snapshot;
   size_t encode_len = cam_snapshot_len;
   int crop_x = 0, crop_y = 0, crop_w = IMG_W, crop_h = IMG_H;
-  cameraCropRectFor(zoom_x_pct, zoom_y_pct, parallax_x100, parallax_y100,
-                    crop_x, crop_y, crop_w, crop_h);
+  float crop_sx = 0.0f, crop_sy = 0.0f, crop_sw = IMG_W, crop_sh = IMG_H;
+  cameraPortalCropFor(zoom_x_pct, zoom_y_pct, parallax_x100, parallax_y100,
+                      crop_x, crop_y, crop_w, crop_h,
+                      crop_sx, crop_sy, crop_sw, crop_sh);
   bool pre_crop = crop_x != 0 || crop_y != 0 || crop_w != IMG_W || crop_h != IMG_H;
   if (pre_crop) {
     size_t crop_len = (size_t)crop_w * crop_h * 2;
@@ -3186,6 +3228,10 @@ bool updateStreamCameraCache(bool force) {
   stream_cam_encode_w = pre_crop ? crop_w : IMG_W;
   stream_cam_encode_h = pre_crop ? crop_h : IMG_H;
   stream_cam_pre_cropped = pre_crop;
+  stream_cam_crop_sx = pre_crop ? crop_sx : 0.0f;
+  stream_cam_crop_sy = pre_crop ? crop_sy : 0.0f;
+  stream_cam_crop_sw = pre_crop ? crop_sw : IMG_W;
+  stream_cam_crop_sh = pre_crop ? crop_sh : IMG_H;
 
   uint32_t total_start_us = micros();
   uint32_t encode_start_us = micros();
@@ -3310,7 +3356,7 @@ body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-syst
 static const char PORTAL_JS[] PROGMEM = R"PORTALJS(
 const W=320,H=240,$=id=>document.getElementById(id),canvas=$('view'),ctx=canvas.getContext('2d'),recCanvas=$('recCanvas'),recCtx=recCanvas.getContext('2d');
 const scene=document.createElement('canvas');scene.width=W;scene.height=H;const sctx=scene.getContext('2d');const th=document.createElement('canvas');th.width=W;th.height=H;const thx=th.getContext('2d');
-let S={view:0,range:0,px:0,py:0,px100:468,py100:-670,offx100:0,offy100:0,offzx:0,offzy:0,zx:126,zy:126,basePx100:468,basePy100:-670,baseZx:126,baseZy:126,alignDistanceCm:30,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--',camPreCropped:1,camStreamW:320,camStreamH:240},thermal=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,sceneDirty=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,diagBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
+let S={view:0,range:0,px:0,py:0,px100:468,py100:-670,offx100:0,offy100:0,offzx:0,offzy:0,zx:126,zy:126,basePx100:468,basePy100:-670,baseZx:126,baseZy:126,alignDistanceCm:30,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--',camPreCropped:1,camStreamW:320,camStreamH:240,camCropSx:0,camCropSy:0,camCropSw:320,camCropSh:240},thermal=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,sceneDirty=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,diagBusy=false,rec=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
 const PRESETS=[['Macro',5],['Close',15],['Desk',30],['Room',100],['Far',500]],PARA_COEFF=35654,BASE_PX100=-720,BASE_PY100=-670,BASE_ZX=126,BASE_ZY=126;
 const PAL=Array.from({length:256},(_,i)=>{let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]});
 const thImg=thx.createImageData(W,H),xMap=[],yMap=[];for(let x=0;x<W;x++){let tx=x*32/W,x0=clamp(Math.floor(tx),0,31),x1=clamp(x0+1,0,31),fx=tx-x0;xMap[x]=[31-x0,31-x1,fx]}for(let y=0;y<H;y++){let ty=y*24/H,y0=clamp(Math.floor(ty),0,23),y1=clamp(y0+1,0,23),fy=ty-y0;yMap[y]=[y0,y1,fy]}
@@ -3322,7 +3368,7 @@ function drawRot(out,src){out.setTransform(1,0,0,1,0,0);out.clearRect(0,0,out.ca
 function viewToScene(x,y){let p=rot===1?{x:y,y:H-x}:rot===2?{x:W-x,y:H-y}:rot===3?{x:W-y,y:x}:{x,y};p.x=clamp(p.x,0,W-1);p.y=clamp(p.y,0,H-1);return p}
 function rawTempAt(x,y,src=thermal){if(!src)return null;let tx=x*32/W,ty=y*24/H,x0=clamp(Math.floor(tx),0,31),y0=clamp(Math.floor(ty),0,23),x1=clamp(x0+1,0,31),y1=clamp(y0+1,0,23),fx=tx-x0,fy=ty-y0;let t=(r,c)=>src[r*32+(31-c)],a=t(y0,x0),b=t(y0,x1),c=t(y1,x0),d=t(y1,x1);return(a*(1-fx)+b*fx)*(1-fy)+(c*(1-fx)+d*fx)*fy}
 function coldRange(){return +S.range===1||+S.range===3||S.rangeName==='INV'||S.rangeName==='AUT3'}function rebuildThermal(){if(!thermal)return;let d=thImg.data,lo=+S.lo||20,hi=+S.hi||30,den=(hi-lo)||1,cold=coldRange();for(let y=0;y<H;y++){let ym=yMap[y],y0=ym[0],y1=ym[1],fy=ym[2],ify=1-fy;for(let x=0;x<W;x++){let xm=xMap[x],x0=xm[0],x1=xm[1],fx=xm[2],ifx=1-fx,a=thermal[y0*32+x0],b=thermal[y0*32+x1],c=thermal[y1*32+x0],e=thermal[y1*32+x1],t=(a*ifx+b*fx)*ify+(c*ifx+e*fx)*fy,p=PAL[clamp(Math.round((cold?(hi-t):(t-lo))/den*255),0,255)],o=(y*W+x)*4;d[o]=p[0];d[o+1]=p[1];d[o+2]=p[2];d[o+3]=255}}thx.putImageData(thImg,0,0);dirtyThermal=false}
-function drawCamera(c){let img=(mjpegActive&&mjpegImg.naturalWidth)?mjpegImg:camImg,iw=img&&(img.naturalWidth||img.width),ih=img&&(img.naturalHeight||img.height);if(!img||!iw||!ih)return;try{if(+S.camPreCropped){c.drawImage(img,0,0,iw,ih,0,0,W,H);return}let zx=clamp(+S.zx||BASE_ZX,100,250),zy=clamp(+S.zy||BASE_ZY,100,250),cw=W*100/zx,ch=H*100/zy,px=(+S.px100||0)/100,py=(+S.py100||0)/100,sx=(W-cw)/2-px*cw/W,sy=(H-ch)/2-py*ch/H;sx=clamp(sx,0,W-cw);sy=clamp(sy,0,H-ch);c.drawImage(img,sx*iw/W,sy*ih/H,cw*iw/W,ch*ih/H,0,0,W,H)}catch(e){mjpegActive=false;camStatus='poll fallback';getCam()}}
+function drawCamera(c){let img=(mjpegActive&&mjpegImg.naturalWidth)?mjpegImg:camImg,iw=img&&(img.naturalWidth||img.width),ih=img&&(img.naturalHeight||img.height);if(!img||!iw||!ih)return;try{if(+S.camPreCropped){let sx=+S.camCropSx||0,sy=+S.camCropSy||0,sw=+S.camCropSw||iw,sh=+S.camCropSh||ih;sx=clamp(sx,0,iw-1);sy=clamp(sy,0,ih-1);sw=clamp(sw,1,iw-sx);sh=clamp(sh,1,ih-sy);c.drawImage(img,sx,sy,sw,sh,0,0,W,H);return}let zx=clamp(+S.zx||BASE_ZX,100,250),zy=clamp(+S.zy||BASE_ZY,100,250),cw=W*100/zx,ch=H*100/zy,px=(+S.px100||0)/100,py=(+S.py100||0)/100,sx=(W-cw)/2-px*cw/W,sy=(H-ch)/2-py*ch/H;sx=clamp(sx,0,W-cw);sy=clamp(sy,0,H-ch);c.drawImage(img,sx*iw/W,sy*ih/H,cw*iw/W,ch*ih/H,0,0,W,H)}catch(e){mjpegActive=false;camStatus='poll fallback';getCam()}}
 function drawCross(c){if(!S.crosshair)return;c.save();c.strokeStyle='#fff';c.lineWidth=1;c.beginPath();c.moveTo(W/2-10,H/2);c.lineTo(W/2+10,H/2);c.moveTo(W/2,H/2-10);c.lineTo(W/2,H/2+10);c.rect(W/2-10,H/2-10,20,20);c.stroke();c.restore()}
 function drawScene(){sctx.clearRect(0,0,W,H);sctx.fillStyle='#000';sctx.fillRect(0,0,W,H);if(+S.view!==2)drawCamera(sctx);if(+S.view!==1&&thermal){if(dirtyThermal)rebuildThermal();sctx.save();if(+S.view===0){sctx.globalCompositeOperation='lighter';sctx.globalAlpha=(+S.tint||0)/100}sctx.drawImage(th,0,0);sctx.restore()}if(marker){sctx.strokeStyle='#9fe870';sctx.beginPath();sctx.arc(marker.x,marker.y,6,0,Math.PI*2);sctx.stroke()}drawCross(sctx)}
 function hudPanel(c,x,y,lines,anchor='left'){c.save();c.font='10px system-ui,-apple-system,Segoe UI,sans-serif';let pad=5,lh=12,w=0;for(let l of lines)w=Math.max(w,c.measureText(l).width);w+=pad*2;let h=lines.length*lh+pad*2;if(anchor.includes('right'))x-=w;if(anchor.includes('bottom'))y-=h;c.fillStyle='rgba(7,10,13,.68)';c.strokeStyle='rgba(159,232,112,.7)';c.lineWidth=1;c.fillRect(x,y,w,h);c.strokeRect(x+.5,y+.5,w-1,h-1);c.fillStyle='#eef6fb';for(let i=0;i<lines.length;i++)c.fillText(lines[i],x+pad,y+pad+9+i*lh);c.restore()}
@@ -3338,7 +3384,7 @@ async function getDiag(){if(diagBusy||!running||!$('diagBox').open)return;diagBu
 async function getThermal(){if(thermBusy||!running)return;thermBusy=true;try{let r=await fetchTimeout('/thermal.bin',{cache:'no-store'},1500);if(!r.ok)throw 0;let b=await r.arrayBuffer(),dv=new DataView(b),a=new Float32Array(768);for(let i=0;i<768;i++)a[i]=dv.getInt16(i*2,true)/100;thermal=a;let h=r.headers;S.seq=+(h.get('X-Frame-Seq')||S.seq);S.lo=+(h.get('X-Range-Lo')||S.lo);S.hi=+(h.get('X-Range-Hi')||S.hi);S.tCenter=+(h.get('X-Temp-Center')||S.tCenter);S.tMin=+(h.get('X-Temp-Min')||S.tMin);S.tMax=+(h.get('X-Temp-Max')||S.tMax);if(marker)markerTemp=rawTempAt(marker.x,marker.y);dirtyThermal=true;sceneDirty=true;labels()}catch(e){conn('thermal retry',true)}finally{thermBusy=false;setTimeout(getThermal,+S.view===1?750:(+S.view===2?125:250))}}
 function loadImg(url){return new Promise((res,rej)=>{let i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=url})}
 async function setCam(blob){let t=performance.now(),url=URL.createObjectURL(blob);try{let img=await loadImg(url);if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;camImg=img;camDecodeMs=performance.now()-t;camStatus='ok';sceneDirty=true}catch(e){URL.revokeObjectURL(url);camStatus='decode failed';throw e}}
-async function getCam(){if(camBusy||!running||+S.view===2||mjpegActive)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1800);if(!r.ok)throw 0;let h=r.headers;S.camEncodeMs=+(h.get('X-Cam-Encode-Ms')||S.camEncodeMs);S.camSendMs=+(h.get('X-Cam-Send-Ms')||S.camSendMs);S.camTotalMs=+(h.get('X-Cam-Total-Ms')||S.camTotalMs);S.camJpegBytes=+(h.get('X-Cam-Bytes')||S.camJpegBytes);S.jpegQuality=+(h.get('X-JPEG-Quality')||S.jpegQuality);S.camPreCropped=+(h.get('X-Cam-Precropped')||S.camPreCropped);S.camStreamW=+(h.get('X-Cam-Width')||S.camStreamW);S.camStreamH=+(h.get('X-Cam-Height')||S.camStreamH);S.camTransport=h.get('X-Cam-Transport')||S.camTransport;let blob=await r.blob();camFetchMs=performance.now()-t;camBytes=blob.size;await setCam(blob);labels()}catch(e){camStatus='retry';conn('cam retry',true)}finally{camBusy=false;if(!mjpegActive)setTimeout(getCam,+S.view===1?125:160)}}
+async function getCam(){if(camBusy||!running||+S.view===2||mjpegActive)return;let t=performance.now();camBusy=true;try{let r=await fetchTimeout('/cam.jpg',{cache:'no-store'},1800);if(!r.ok)throw 0;let h=r.headers;S.camEncodeMs=+(h.get('X-Cam-Encode-Ms')||S.camEncodeMs);S.camSendMs=+(h.get('X-Cam-Send-Ms')||S.camSendMs);S.camTotalMs=+(h.get('X-Cam-Total-Ms')||S.camTotalMs);S.camJpegBytes=+(h.get('X-Cam-Bytes')||S.camJpegBytes);S.jpegQuality=+(h.get('X-JPEG-Quality')||S.jpegQuality);S.camPreCropped=+(h.get('X-Cam-Precropped')||S.camPreCropped);S.camStreamW=+(h.get('X-Cam-Width')||S.camStreamW);S.camStreamH=+(h.get('X-Cam-Height')||S.camStreamH);S.camCropSx=+(h.get('X-Cam-Crop-Sx')||S.camCropSx||0);S.camCropSy=+(h.get('X-Cam-Crop-Sy')||S.camCropSy||0);S.camCropSw=+(h.get('X-Cam-Crop-Sw')||S.camCropSw||S.camStreamW||W);S.camCropSh=+(h.get('X-Cam-Crop-Sh')||S.camCropSh||S.camStreamH||H);S.camTransport=h.get('X-Cam-Transport')||S.camTransport;let blob=await r.blob();camFetchMs=performance.now()-t;camBytes=blob.size;await setCam(blob);labels()}catch(e){camStatus='retry';conn('cam retry',true)}finally{camBusy=false;if(!mjpegActive)setTimeout(getCam,+S.view===1?125:160)}}
 function post(o){Object.assign(pending,o);clearTimeout(sendTimer);sendTimer=setTimeout(()=>{let p=new URLSearchParams(pending);pending={};fetchTimeout('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p},1800).catch(()=>conn('control retry',true))},160)}
 function recomputeLocalAlign(){let base=BASE_PX100+Math.round(PARA_COEFF/(+S.alignDistanceCm||30));S.basePx100=base;S.basePy100=BASE_PY100;S.baseZx=S.baseZx||BASE_ZX;S.baseZy=S.baseZy||BASE_ZY;S.px100=base+(+S.offx100||0);S.py100=BASE_PY100+(+S.offy100||0);S.zx=clamp((+S.baseZx||BASE_ZX)+(+S.offzx||0),100,250);S.zy=clamp((+S.baseZy||BASE_ZY)+(+S.offzy||0),100,250)}
 function setDistance(v){v=clamp(Math.round(v),5,500);S.alignDistanceCm=v;recomputeLocalAlign();$('dist').value=v;post({dist:v});sceneDirty=true;labels()}
@@ -3660,6 +3706,10 @@ void addStreamJpegTimingHeaders(size_t jpg_len, uint32_t encode_us) {
   share_server.sendHeader("X-Cam-Precropped", stream_cam_pre_cropped ? "1" : "0");
   share_server.sendHeader("X-Cam-Width", String((unsigned)stream_cam_encode_w));
   share_server.sendHeader("X-Cam-Height", String((unsigned)stream_cam_encode_h));
+  share_server.sendHeader("X-Cam-Crop-Sx", String(stream_cam_crop_sx, 3));
+  share_server.sendHeader("X-Cam-Crop-Sy", String(stream_cam_crop_sy, 3));
+  share_server.sendHeader("X-Cam-Crop-Sw", String(stream_cam_crop_sw, 3));
+  share_server.sendHeader("X-Cam-Crop-Sh", String(stream_cam_crop_sh, 3));
   share_server.sendHeader("X-Cam-Seq", String((unsigned long)thermal_frame_seq));
   share_server.sendHeader("X-JPEG-Quality", String((int)stream_jpeg_quality));
   share_server.sendHeader("X-Cam-Cache-Age-Ms", String((unsigned long)(millis() - stream_cam_cache_ms)));
@@ -3966,6 +4016,10 @@ void handleStreamState() {
   json += F(",\"camPreCropped\":"); json += stream_cam_pre_cropped ? 1 : 0;
   json += F(",\"camStreamW\":"); json += stream_cam_encode_w;
   json += F(",\"camStreamH\":"); json += stream_cam_encode_h;
+  json += F(",\"camCropSx\":"); json += String(stream_cam_crop_sx, 3);
+  json += F(",\"camCropSy\":"); json += String(stream_cam_crop_sy, 3);
+  json += F(",\"camCropSw\":"); json += String(stream_cam_crop_sw, 3);
+  json += F(",\"camCropSh\":"); json += String(stream_cam_crop_sh, 3);
   json += F(",\"camCacheFps\":"); json += String(stream_cam_cache_fps, 1);
   json += F(",\"camCacheAgeMs\":"); json += stream_cam_cache_ms ? (now - stream_cam_cache_ms) : 0;
   json += F(",\"mjpegPort\":81");
@@ -4002,6 +4056,10 @@ void handleStreamDiagnostics() {
   json += F(",\"camPreCropped\":"); json += stream_cam_pre_cropped ? 1 : 0;
   json += F(",\"camStreamW\":"); json += stream_cam_encode_w;
   json += F(",\"camStreamH\":"); json += stream_cam_encode_h;
+  json += F(",\"camCropSx\":"); json += String(stream_cam_crop_sx, 3);
+  json += F(",\"camCropSy\":"); json += String(stream_cam_crop_sy, 3);
+  json += F(",\"camCropSw\":"); json += String(stream_cam_crop_sw, 3);
+  json += F(",\"camCropSh\":"); json += String(stream_cam_crop_sh, 3);
   json += F(",\"camEncodeMs\":"); json += String(stream_cam_encode_ms, 1);
   json += F(",\"camSendMs\":"); json += String(stream_cam_send_ms, 1);
   json += F(",\"camTotalMs\":"); json += String(stream_cam_total_ms, 1);
