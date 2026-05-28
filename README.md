@@ -1,9 +1,7 @@
 # Multicamera Thermal
 
 Handheld ESP32-S3 thermal camera with a visible camera overlay, LCD controls,
-freeze-frame WiFi export, and a browser portal for live preview and recording.
-
-No photos are included in this repository.
+freeze-frame WiFi export, and a browser portal for live preview and recording. For pictures/videos see: https://www.instagram.com/p/DY12QflxQjW/
 
 ## Hardware
 
@@ -13,7 +11,8 @@ No photos are included in this repository.
 | DFRobot/Fermion 3.5 inch ILI9488 + GT911 display | LCD and touch UI |
 | OV3660 or OV2640 camera | Visible-light camera |
 | MLX90640 32x24 thermal sensor, standard FOV | Thermal data |
-| Momentary pushbutton | Freeze / portal control |
+| 6×6×8mm Momentary Push Button with Cap| Freeze / portal control |
+| ​Toggle Switch (S12F15 SS12F15VG4) | on and off|
 
 PSRAM is required. SD card storage is not used; saving is done through WiFi
 export or browser-side recording.
@@ -35,8 +34,7 @@ export or browser-side recording.
 | GT911 SCL | 2 |
 | GT911 INT | 13 |
 
-LCD writes run at 50 MHz. If your panel shows non-camera display artifacts,
-lower `TFT_WRITE_FREQ_HZ`.
+LCD can be connected via included ribbon cables so you don't have to make a ton of connections manually (unless you use cheaper parts!)
 
 ### Visible camera
 
@@ -56,7 +54,7 @@ lower `TFT_WRITE_FREQ_HZ`.
 | VSYNC | 6 |
 | HREF | 42 |
 | PCLK | 5 |
-
+Same deal - camera can be plugged in with ribbon cable. 
 The camera runs QVGA RGB565 for the LCD path, with 16 MHz XCLK and two frame
 buffers. SCCB shares the main I2C bus on GPIO1/GPIO2.
 
@@ -161,18 +159,15 @@ Known-good local build:
 Required Arduino libraries:
 
 - LovyanGFX
-- DFRobot_AXP313A
+- DFRobot_AXP313A (don't forget this! You may have to manually install it)
 
 The MLX90640 API files are included in this repository.
 
 ## Notes
 
-- Arduino-ESP32 2.0.11 is the tested baseline.
+**- Arduino-ESP32 2.0.11 is the tested baseline.**
 - Arduino-ESP32 3.x may work, but camera reconfiguration behavior has differed
   during testing.
 - Alignment is plane-specific. A hand and the background will not align at the
-  same time because they are at different distances.
-- Horizontal lines that appear only inside the camera image are likely camera
-  capture/sensor artifacts, not LCD SPI artifacts. The firmware enables the
-  camera AEC2 exposure path to reduce indoor banding where the sensor supports
-  it.
+  same time because they are at different distances. You need to adjust based on your build. 
+
