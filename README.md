@@ -171,3 +171,5 @@ The MLX90640 API files are included in this repository.
 - Alignment is plane-specific. A hand and the background will not align at the
   same time because they are at different distances. You need to adjust based on your build. 
 
+## Wiring Chart
+<img width="2757" height="1224" alt="multicamera_thermal" src="https://github.com/user-attachments/assets/b7f439ad-66ad-4cbe-a60c-c14a33156dde" />
