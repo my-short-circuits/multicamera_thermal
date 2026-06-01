@@ -104,6 +104,9 @@
 // LCD SPI write clock. Camera-only artifacts have been traced to camera pixels,
 // not panel writes, so keep the faster 50 MHz display path.
 static constexpr uint32_t TFT_WRITE_FREQ_HZ = 50000000UL;
+// Panel is mounted upside down in the enclosure; rotation 3 is the installed
+// landscape orientation for the local LCD UI.
+static constexpr uint8_t LCD_ROTATION = 3;
 
 #define XCLK_GPIO_NUM 45
 #define SIOD_GPIO_NUM  1
@@ -1201,11 +1204,12 @@ static constexpr int ZOOM_MAX = 250;
 // Field calibration from the 20-30 cm overlay test. Distance still changes the
 // X parallax term; these constants correct the fixed optical-center and FOV
 // mismatch so ADV sliders are only extra offsets.
-static constexpr int ALIGN_BASE_PX100 = -720;
+static constexpr int ALIGN_BASE_PX100 = 125;
 static constexpr int ALIGN_BASE_PY100 = -670;
 static constexpr int ALIGN_BASE_ZX = 126;
 static constexpr int ALIGN_BASE_ZY = 126;
-static constexpr uint8_t ALIGN_SETTINGS_VERSION = 5;
+static constexpr uint8_t ALIGN_SETTINGS_VERSION = 6;
+static constexpr int ALIGN_BASE_PX100_V5_REBASE = 845;
 static constexpr int ALIGN_DEFAULT_CM = 30;
 static constexpr int ALIGN_MIN_CM = 5;
 static constexpr int ALIGN_MAX_CM = 500;
@@ -1474,11 +1478,14 @@ void loadSettings() {
     align_zoom_x_offset = old_zx - ALIGN_BASE_ZX;
     align_zoom_y_offset = old_zy - ALIGN_BASE_ZY;
   }
-  if (av < ALIGN_SETTINGS_VERSION) {
+  if (av < 5) {
     align_offset_x100 = 0;
     align_offset_y100 = 0;
     align_zoom_x_offset = 0;
     align_zoom_y_offset = 0;
+    migrated_alignment = true;
+  } else if (av < ALIGN_SETTINGS_VERSION) {
+    align_offset_x100 = clampParallax100(align_offset_x100 - ALIGN_BASE_PX100_V5_REBASE);
     migrated_alignment = true;
   }
   setAlignmentOffsets(align_offset_x100, align_offset_y100,
@@ -1698,9 +1705,9 @@ bool gt911_read_touch(uint16_t *tx, uint16_t *ty) {
   Wire.beginTransmission(gt911_addr);
   Wire.write(0x81); Wire.write(0x4E); Wire.write(0x00);
   Wire.endTransmission();
-  // Map GT911 native 320x480 coordinates to LCD rotation 1.
-  *tx = ry;
-  *ty = 319 - rx;
+  // Map GT911 native 320x480 coordinates to LCD_ROTATION.
+  *tx = 479 - ry;
+  *ty = rx;
   return true;
 }
 
@@ -3356,8 +3363,8 @@ body{margin:0;background:#0b0d0f;color:#e8edf2;font-family:system-ui,-apple-syst
 static const char PORTAL_JS[] PROGMEM = R"PORTALJS(
 const W=320,H=240,$=id=>document.getElementById(id),canvas=$('view'),ctx=canvas.getContext('2d'),recCanvas=$('recCanvas'),recCtx=recCanvas.getContext('2d');
 const scene=document.createElement('canvas');scene.width=W;scene.height=H;const sctx=scene.getContext('2d');const th=document.createElement('canvas');th.width=W;th.height=H;const thx=th.getContext('2d');
-let S={view:0,range:0,px:0,py:0,px100:468,py100:-670,offx100:0,offy100:0,offzx:0,offzy:0,zx:126,zy:126,basePx100:468,basePy100:-670,baseZx:126,baseZy:126,alignDistanceCm:30,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--',camPreCropped:1,camStreamW:320,camStreamH:240,camCropSx:0,camCropSy:0,camCropSw:320,camCropSh:240},thermal=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,sceneDirty=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,diagBusy=false,rec=null,recStream=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
-const PRESETS=[['Macro',5],['Close',15],['Desk',30],['Room',100],['Far',500]],PARA_COEFF=35654,BASE_PX100=-720,BASE_PY100=-670,BASE_ZX=126,BASE_ZY=126;
+let S={view:0,range:0,px:0,py:0,px100:1313,py100:-670,offx100:0,offy100:0,offzx:0,offzy:0,zx:126,zy:126,basePx100:1313,basePy100:-670,baseZx:126,baseZy:126,alignDistanceCm:30,tint:70,mlo:22,mhi:38,brt:0,con:0,sat:0,shp:0,den:0,crosshair:1,lo:20,hi:30,tCenter:0,tMin:0,tMax:0,seq:0,camTransport:'--',camPreCropped:1,camStreamW:320,camStreamH:240,camCropSx:0,camCropSy:0,camCropSw:320,camCropSh:240},thermal=null,camImg=null,camUrl=null,marker=null,markerTemp=null,dirtyThermal=true,sceneDirty=true,rot=+(localStorage.thermalRotate||0),running=true,camBusy=false,thermBusy=false,stateBusy=false,diagBusy=false,rec=null,recStream=null,chunks=[],recUrl=null,recStarted=0,recTimer=0,sendTimer=0,pending={},camFetchMs=0,camDecodeMs=0,camBytes=0,camStatus='idle',recHud=localStorage.recHud==null?1:+localStorage.recHud;
+const PRESETS=[['Macro',5],['Close',15],['Desk',30],['Room',100],['Far',500]],PARA_COEFF=35654,BASE_PX100=125,BASE_PY100=-670,BASE_ZX=126,BASE_ZY=126;
 const PAL=Array.from({length:256},(_,i)=>{let j=i*180/255,R,G,B;if(j<30){R=0;G=0;B=20+120*j/30}else if(j<60){R=120*(j-30)/30;G=0;B=140-60*(j-30)/30}else if(j<90){R=120+135*(j-60)/30;G=0;B=80-70*(j-60)/30}else if(j<120){R=255;G=60*(j-90)/30;B=10-10*(j-90)/30}else if(j<150){R=255;G=60+175*(j-120)/30;B=0}else{R=255;G=235+20*(j-150)/30;B=255*(j-150)/30}return[R|0,G|0,B|0]});
 const thImg=thx.createImageData(W,H),xMap=[],yMap=[];for(let x=0;x<W;x++){let tx=x*32/W,x0=clamp(Math.floor(tx),0,31),x1=clamp(x0+1,0,31),fx=tx-x0;xMap[x]=[31-x0,31-x1,fx]}for(let y=0;y<H;y++){let ty=y*24/H,y0=clamp(Math.floor(ty),0,23),y1=clamp(y0+1,0,23),fy=ty-y0;yMap[y]=[y0,y1,fy]}
 let mjpegImg=new Image(),mjpegActive=false;mjpegImg.crossOrigin='anonymous';
@@ -4427,7 +4434,7 @@ void setup() {
 
   Serial.println("[5/8] LCD");
   lcd.init();
-  lcd.setRotation(1);
+  lcd.setRotation(LCD_ROTATION);
   lcd.setBrightness(255);
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_WHITE); lcd.setTextSize(2);
