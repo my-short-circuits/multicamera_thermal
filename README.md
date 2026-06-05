@@ -4,7 +4,6 @@ Handheld ESP32-S3 thermal camera with a visible camera overlay, LCD controls,
 freeze-frame WiFi export, and a browser portal for live preview and recording. For pictures/videos see: https://www.instagram.com/p/DY12QflxQjW/ (and others on that page)
 
 ## Hardware
-Note: Not tested on ESP 3.XX so may need some tweaks if you use latest ESP32 board library . 
 
 | Part | Purpose |
 | --- | --- |
@@ -70,6 +69,8 @@ The camera runs QVGA RGB565 for the LCD path, with 16 MHz XCLK and two frame buf
 | MLX90640 GND | GND |
 | MLX90640 PS | GND 
 
+| Signal | GPIO |
+| --- | ---: |
 | Button | 10 |
 | Button GND | GND |
 
@@ -123,7 +124,6 @@ Recording is done in the browser with `canvas.captureStream()` and
 `MediaRecorder`; the ESP32 does not store video. The recorded overlay only
 includes center, marker, scene, and palette temperatures.
 
-NOTE: If you just press the button, it will open a different web portal for simple image capture - it lays out all three images (thermal, RGB, and combined)
 Main portal endpoints:
 
 | Endpoint | Purpose |
@@ -147,8 +147,10 @@ Freeze export includes:
 - `thermal.bmp`
 - `camera.bmp`
 - `thermal.csv`
+i.e., it lays out all three images (thermal, RGB, and combined)
 
 Short-press again to exit freeze mode.
+
 
 ## Build
 
