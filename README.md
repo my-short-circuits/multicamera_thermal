@@ -1,7 +1,7 @@
 # Multicamera Thermal
 
 Handheld ESP32-S3 thermal camera with a visible camera overlay, LCD controls,
-freeze-frame WiFi export, and a browser portal for live preview and recording. For pictures/videos see: https://www.instagram.com/p/DY12QflxQjW/
+freeze-frame WiFi export, and a browser portal for live preview and recording. For pictures/videos see: https://www.instagram.com/p/DY12QflxQjW/ (and others on that page)
 
 ## Hardware
 
@@ -64,7 +64,14 @@ buffers. SCCB shares the main I2C bus on GPIO1/GPIO2.
 | --- | ---: |
 | MLX90640 SDA | 11 |
 | MLX90640 SCL | 14 |
+| MLX90640 SCL | 14 |
+| MLX90640 VIN | 3.3v |
+| MLX90640 GND | GND |
+| MLX90640 PS | GND 
+
 | Button | 10 |
+| Button GND | GND |
+
 
 The MLX90640 uses `Wire1` at 1 MHz. The included MLX90640 I2C driver is patched
 to use `Wire1`.
@@ -115,6 +122,7 @@ Recording is done in the browser with `canvas.captureStream()` and
 `MediaRecorder`; the ESP32 does not store video. The recorded overlay only
 includes center, marker, scene, and palette temperatures.
 
+NOTE: If you just press the button, it will open a different web portal for simple image capture - it lays out all three images (thermal, RGB, and combined)
 Main portal endpoints:
 
 | Endpoint | Purpose |
@@ -172,4 +180,4 @@ The MLX90640 API files are included in this repository.
   same time because they are at different distances. You need to adjust based on your build. 
 
 ## Wiring Chart
-<img width="2757" height="1224" alt="multicamera_thermal" src="https://github.com/user-attachments/assets/b7f439ad-66ad-4cbe-a60c-c14a33156dde" />
+<img width="1051" height="967" alt="hybrid (3)" src="https://github.com/user-attachments/assets/f2235096-e8e3-47cd-85f9-6e66230412da" />
