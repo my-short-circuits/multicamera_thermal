@@ -4,6 +4,7 @@ Handheld ESP32-S3 thermal camera with a visible camera overlay, LCD controls,
 freeze-frame WiFi export, and a browser portal for live preview and recording. For pictures/videos see: https://www.instagram.com/p/DY12QflxQjW/ (and others on that page)
 
 ## Hardware
+Note: Not tested on ESP 3.XX so may need some tweaks if you use latest ESP32 board library . 
 
 | Part | Purpose |
 | --- | --- |
@@ -54,9 +55,9 @@ LCD can be connected via included ribbon cables so you don't have to make a ton 
 | VSYNC | 6 |
 | HREF | 42 |
 | PCLK | 5 |
+
 Same deal - camera can be plugged in with ribbon cable. 
-The camera runs QVGA RGB565 for the LCD path, with 16 MHz XCLK and two frame
-buffers. SCCB shares the main I2C bus on GPIO1/GPIO2.
+The camera runs QVGA RGB565 for the LCD path, with 16 MHz XCLK and two frame buffers. SCCB shares the main I2C bus on GPIO1/GPIO2.
 
 ### Thermal sensor and button
 
